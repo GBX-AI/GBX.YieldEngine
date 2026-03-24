@@ -82,14 +82,14 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Configure GHCR registry on backend
+      - name: Set GHCR registry on backend
         run: |
           az containerapp registry set \
             --name ${{ env.BACKEND_APP }} \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --server ghcr.io \
             --username gbx-ai \
-            --password ${{ secrets.GHCR_PAT }}
+            --password "${{ secrets.GHCR_PAT }}"
 
       - name: Deploy backend
         run: |
@@ -98,14 +98,14 @@ jobs:
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --image ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
 
-      - name: Configure GHCR registry on frontend
+      - name: Set GHCR registry on frontend
         run: |
           az containerapp registry set \
             --name ${{ env.FRONTEND_APP }} \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --server ghcr.io \
             --username gbx-ai \
-            --password ${{ secrets.GHCR_PAT }}
+            --password "${{ secrets.GHCR_PAT }}"
 
       - name: Deploy frontend
         run: |
