@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { NavLink } from 'react-router-dom';
-import { Bell, Shield, ShieldAlert, Activity, BarChart3, Settings, Wallet, Search, TrendingUp, BookOpen } from 'lucide-react';
-import { getUnreadCount, getNotifications, markAllRead } from '../api';
+import { Bell, Shield, ShieldAlert, Activity, BarChart3, Settings, Wallet, Search, TrendingUp, BookOpen, Zap } from 'lucide-react';
+import { getUnreadCount, getNotifications, markAllRead, getStatus } from '../api';
 
 const navItems = [
   { to: '/', label: 'Dashboard', icon: Activity },
@@ -212,7 +212,12 @@ export default function Header({ permission = 'READONLY' }) {
   const [notifications, setNotifications] = useState([]);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [bellHover, setBellHover] = useState(false);
+  const [simulationMode, setSimulationMode] = useState(true);
   const dropdownRef = useRef(null);
+
+  useEffect(() => {
+    getStatus().then((s) => setSimulationMode(s?.simulation_mode ?? true)).catch(() => {});
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -270,6 +275,14 @@ export default function Header({ permission = 'READONLY' }) {
         <Activity size={20} color="#6ee7b7" />
         <span style={styles.logoText}>YIELD ENGINE</span>
         <span style={styles.versionBadge}>v3</span>
+        {simulationMode && (
+          <span style={{
+            fontSize: 10, fontWeight: 600, color: '#fcd34d',
+            background: 'rgba(252,211,77,0.12)', borderRadius: 6,
+            padding: '2px 6px', letterSpacing: '0.04em',
+            fontFamily: "'IBM Plex Mono', monospace",
+          }}>SIM</span>
+        )}
       </div>
 
       <nav style={styles.nav}>

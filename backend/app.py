@@ -766,7 +766,14 @@ def create_app():
     @app.route("/api/kite/login", methods=["GET"])
     def api_kite_login():
         login_url = kite_service.get_login_url()
-        return jsonify({"login_url": login_url, "authenticated": kite_service.is_authenticated()})
+        authenticated = kite_service.is_authenticated()
+        return jsonify({
+            "login_url": login_url,
+            "authenticated": authenticated,
+            "simulation_mode": not authenticated,
+            "kite_configured": bool(login_url),
+            "message": "Kite API not configured. Running in simulation mode." if not login_url else None,
+        })
 
     @app.route("/api/callback", methods=["GET"])
     def api_kite_callback():
@@ -787,8 +794,11 @@ def create_app():
             if kite_service.is_authenticated():
                 state["access_token"] = "active"
                 return jsonify({"status": "authenticated", "message": "Auto-login successful"})
+            login_url = kite_service.get_login_url()
+            if not login_url:
+                return jsonify({"status": "simulation", "message": "No Kite API key configured. Running in simulation mode."}), 200
             return jsonify({"status": "failed", "message": "Auto-login failed, use manual login",
-                          "login_url": kite_service.get_login_url()}), 401
+                          "login_url": login_url}), 401
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
@@ -906,11 +916,13 @@ def create_app():
                 # Live execution via Kite
                 kite_order_ids = []
                 for leg in order_legs:
-                    order_id = kite_service.place_order(leg)
-                    kite_order_ids.append(order_id)
+                    result = kite_service.place_order(**leg)
+                    if not result.get("success"):
+                        return jsonify({"error": f"Order failed: {result.get('error', 'unknown')}"}), 500
+                    kite_order_ids.append(result["order_id"])
 
                     # Post-order reconciliation
-                    recon = reconcile_order(leg, order_id, kite_service)
+                    recon = reconcile_order(leg, result["order_id"], kite_service)
                     if recon["alert"]:
                         state["permission"] = "READONLY"
                         return jsonify({"error": recon["message"], "reconciliation": recon}), 500

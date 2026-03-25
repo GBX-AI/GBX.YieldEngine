@@ -154,7 +154,7 @@ class KiteService:
                 return result
 
         # 3. Fallback: return manual login URL (or simulation mode)
-        login_url = self._get_login_url()
+        login_url = self.get_login_url()
         if login_url:
             msg = "Auto-login unavailable. Use manual login URL."
             _log_notification("WARNING", "Manual Login Required", msg)
@@ -402,7 +402,7 @@ class KiteService:
     def status(self) -> dict:
         """Current connection status for the frontend."""
         return self._status_dict(
-            login_url=self._get_login_url() if not self.is_authenticated() else None,
+            login_url=self.get_login_url() if not self.is_authenticated() else None,
             message="Connected" if self.is_authenticated() else "Simulation mode",
         )
 
@@ -421,7 +421,7 @@ class KiteService:
                 raise
         return self._kite
 
-    def _get_login_url(self) -> str | None:
+    def get_login_url(self) -> str | None:
         """Return the Kite login URL for manual browser-based auth."""
         if not KITE_API_KEY:
             return None
@@ -462,7 +462,7 @@ class KiteService:
         if not user_id or not password:
             msg = "Auto-login skipped: user_id or password not available."
             logger.info(msg)
-            return self._status_dict(login_url=self._get_login_url(), message=msg)
+            return self._status_dict(login_url=self.get_login_url(), message=msg)
 
         try:
             import pyotp
@@ -470,7 +470,7 @@ class KiteService:
             msg = "pyotp not installed. Cannot auto-login."
             logger.error(msg)
             _log_notification("ERROR", "Auto-login Failed", msg)
-            return self._status_dict(login_url=self._get_login_url(), message=msg)
+            return self._status_dict(login_url=self.get_login_url(), message=msg)
 
         session = requests.Session()
         login_url = "https://kite.zerodha.com/api/login"
@@ -489,7 +489,7 @@ class KiteService:
                 msg = f"Login step 1 failed: {login_data.get('message', 'Unknown error')}"
                 logger.error(msg)
                 _log_notification("ERROR", "Auto-login Failed", msg)
-                return self._status_dict(login_url=self._get_login_url(), message=msg)
+                return self._status_dict(login_url=self.get_login_url(), message=msg)
 
             request_id = login_data["data"]["request_id"]
 
@@ -513,7 +513,7 @@ class KiteService:
                 msg = f"TOTP 2FA failed: {twofa_data.get('message', 'Unknown error')}"
                 logger.error(msg)
                 _log_notification("ERROR", "Auto-login Failed", msg)
-                return self._status_dict(login_url=self._get_login_url(), message=msg)
+                return self._status_dict(login_url=self.get_login_url(), message=msg)
 
             # Step 3: Extract request_token from redirect or response
             # Kite returns a redirect URL with the request_token
@@ -528,7 +528,7 @@ class KiteService:
                 msg = "Auto-login: could not extract request_token from 2FA response."
                 logger.error(msg)
                 _log_notification("ERROR", "Auto-login Failed", msg)
-                return self._status_dict(login_url=self._get_login_url(), message=msg)
+                return self._status_dict(login_url=self.get_login_url(), message=msg)
 
             # Step 4: Generate session with KiteConnect
             kite = self._get_kite_instance()
@@ -546,12 +546,12 @@ class KiteService:
             msg = f"Auto-login network error: {exc}"
             logger.error(msg)
             _log_notification("ERROR", "Auto-login Failed", msg)
-            return self._status_dict(login_url=self._get_login_url(), message=msg)
+            return self._status_dict(login_url=self.get_login_url(), message=msg)
         except Exception as exc:
             msg = f"Auto-login unexpected error: {exc}"
             logger.error(msg)
             _log_notification("ERROR", "Auto-login Failed", msg)
-            return self._status_dict(login_url=self._get_login_url(), message=msg)
+            return self._status_dict(login_url=self.get_login_url(), message=msg)
 
     def _try_set_token(self, token: str) -> bool:
         """Set token on the Kite instance and verify it works."""

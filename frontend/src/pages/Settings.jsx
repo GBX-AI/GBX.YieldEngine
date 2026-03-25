@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { getSettings, updateSettings, getRiskProfile, setRiskProfile, kiteLogin, kiteAutoLogin, setCircuitBreaker } from '../api';
+import { getSettings, updateSettings, getRiskProfile, setRiskProfile, kiteLogin, kiteAutoLogin, setCircuitBreaker, getStatus } from '../api';
 
 const c = {
   bg: '#0a0f1a',
@@ -312,6 +312,8 @@ export default function Settings() {
   const [saving, setSaving] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [kiteConnected, setKiteConnected] = useState(false);
+  const [kiteConfigured, setKiteConfigured] = useState(false);
+  const [simulationMode, setSimulationMode] = useState(true);
   const [kiteLoading, setKiteLoading] = useState(false);
 
   // Local form state
@@ -336,10 +338,21 @@ export default function Settings() {
   const [notifications, setNotifications] = useState({});
 
   useEffect(() => {
+    // Check simulation mode
+    getStatus().then((st) => {
+      setSimulationMode(st?.simulation_mode ?? true);
+      setKiteConnected(st?.kite_connected ?? false);
+    }).catch(() => {});
+
     Promise.all([
       getSettings().catch(() => null),
       getRiskProfile().catch(() => null),
-    ]).then(([sett, rp]) => {
+      kiteLogin().catch(() => null),
+    ]).then(([sett, rp, kiteStatus]) => {
+      if (kiteStatus) {
+        setKiteConfigured(!!kiteStatus.kite_configured);
+        setKiteConnected(kiteStatus.authenticated ?? false);
+      }
       if (sett) {
         setSettings(sett);
         setKiteConnected(sett.kite_connected ?? false);
@@ -479,53 +492,84 @@ export default function Settings() {
     <div style={s.page}>
       <div style={s.header}>Settings</div>
 
-      {/* Kite Connection */}
+      {/* Mode & Broker Connection */}
       <div style={s.card}>
-        <div style={s.sectionTitle}>Kite Connection</div>
-        <div style={s.sectionSub}>Manage your Zerodha Kite brokerage connection</div>
+        <div style={s.sectionTitle}>Broker Connection</div>
+        <div style={s.sectionSub}>Connect to Zerodha Kite for live trading, or use simulation mode for recommendations only</div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
           <div style={s.statusDot(kiteConnected)} />
-          <span style={{ fontSize: 13, fontWeight: 600, color: kiteConnected ? c.emerald : c.red }}>
-            {kiteConnected ? 'Connected' : 'Disconnected'}
+          <span style={{ fontSize: 13, fontWeight: 600, color: kiteConnected ? c.emerald : c.amber }}>
+            {kiteConnected ? 'Kite Connected' : simulationMode ? 'Simulation Mode' : 'Disconnected'}
           </span>
-          <div style={{ flex: 1 }} />
-          <button
-            style={{ ...s.btn, ...s.btnPrimary, opacity: kiteLoading ? 0.6 : 1 }}
-            onClick={handleKiteLogin}
-            disabled={kiteLoading}
-          >
-            {kiteLoading ? 'Connecting...' : 'Login to Kite'}
-          </button>
+          {simulationMode && !kiteConnected && (
+            <span style={{
+              fontSize: 11, fontWeight: 600, padding: '3px 10px', borderRadius: 6,
+              background: 'rgba(252,211,77,0.12)', color: c.amber, fontFamily: mono,
+            }}>
+              SIM
+            </span>
+          )}
         </div>
 
+        {simulationMode && !kiteConfigured && (
+          <div style={{
+            padding: '14px 18px', borderRadius: 10, marginBottom: 20,
+            background: 'rgba(56,189,248,0.06)', border: '1px solid rgba(56,189,248,0.15)',
+          }}>
+            <div style={{ fontSize: 13, color: c.blue, fontWeight: 600, marginBottom: 6 }}>Simulation Mode Active</div>
+            <div style={{ fontSize: 12, color: c.muted, lineHeight: 1.6 }}>
+              No Kite API key configured. The engine uses simulated market data to generate strategy recommendations,
+              risk alerts, and notifications. Import your holdings via CSV or manual entry to get personalized recommendations.
+              To enable live trading, configure your Kite API credentials below.
+            </div>
+          </div>
+        )}
+
+        {(kiteConfigured || kiteConnected) && (
+          <>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
+              <div style={{ flex: 1 }} />
+              <button
+                style={{ ...s.btn, ...s.btnPrimary, opacity: kiteLoading ? 0.6 : 1 }}
+                onClick={handleKiteLogin}
+                disabled={kiteLoading}
+              >
+                {kiteLoading ? 'Connecting...' : kiteConnected ? 'Reconnect' : 'Login to Kite'}
+              </button>
+            </div>
+          </>
+        )}
+
         <div style={s.inputRow}>
+          <Field label="Kite API Key">
+            <input
+              style={s.input}
+              value={userId}
+              onChange={(e) => setUserId(e.target.value)}
+              placeholder="Not configured (optional)"
+            />
+          </Field>
           <Field label="TOTP Secret">
             <input
               style={s.input}
               type="password"
               value={totp}
               onChange={(e) => setTotp(e.target.value)}
-              placeholder="••••••••••••"
-            />
-          </Field>
-          <Field label="User ID">
-            <input
-              style={s.input}
-              value={userId}
-              onChange={(e) => setUserId(e.target.value)}
-              placeholder="e.g. AB1234"
+              placeholder="Not configured (optional)"
             />
           </Field>
         </div>
 
-        <div style={s.flexBetween}>
-          <div>
-            <div style={{ fontSize: 13, color: c.text, fontWeight: 500 }}>Auto-Login</div>
-            <div style={{ fontSize: 11, color: c.muted }}>Automatically login to Kite on system startup</div>
+        {(kiteConfigured || userId || totp) && (
+          <div style={s.flexBetween}>
+            <div>
+              <div style={{ fontSize: 13, color: c.text, fontWeight: 500 }}>Auto-Login</div>
+              <div style={{ fontSize: 11, color: c.muted }}>Automatically login to Kite on system startup</div>
+            </div>
+            <Toggle on={autoLogin} onToggle={() => setAutoLogin(!autoLogin)} />
           </div>
-          <Toggle on={autoLogin} onToggle={() => setAutoLogin(!autoLogin)} />
-        </div>
+        )}
       </div>
 
       {/* Risk Profile */}
