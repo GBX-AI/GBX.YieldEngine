@@ -215,6 +215,14 @@ def init_db():
             reason TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS holdings (
+            symbol TEXT PRIMARY KEY,
+            qty INTEGER NOT NULL,
+            avg_price REAL NOT NULL,
+            ltp REAL,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
     """)
 
     # Insert default settings if not present
@@ -250,3 +258,64 @@ def get_all_settings():
     rows = conn.execute("SELECT key, value FROM settings").fetchall()
     conn.close()
     return {row["key"]: row["value"] for row in rows}
+
+
+# ─── Holdings persistence ────────────────────────────────────────────────────
+
+def get_all_holdings():
+    """Load all holdings from the database."""
+    conn = get_db()
+    rows = conn.execute("SELECT symbol, qty, avg_price, ltp FROM holdings ORDER BY symbol").fetchall()
+    conn.close()
+    return [{"symbol": r["symbol"], "qty": r["qty"], "avgPrice": r["avg_price"],
+             "ltp": r["ltp"] or r["avg_price"]} for r in rows]
+
+
+def save_holdings(holdings):
+    """Replace all holdings in the database."""
+    conn = get_db()
+    conn.execute("DELETE FROM holdings")
+    for h in holdings:
+        conn.execute(
+            "INSERT INTO holdings (symbol, qty, avg_price, ltp, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (h["symbol"], h["qty"], h["avgPrice"], h.get("ltp", h["avgPrice"]), now_iso())
+        )
+    conn.commit()
+    conn.close()
+
+
+def upsert_holding(holding):
+    """Insert or update a single holding."""
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO holdings (symbol, qty, avg_price, ltp, updated_at) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(symbol) DO UPDATE SET qty=?, avg_price=?, ltp=?, updated_at=?",
+        (holding["symbol"], holding["qty"], holding["avgPrice"],
+         holding.get("ltp", holding["avgPrice"]), now_iso(),
+         holding["qty"], holding["avgPrice"],
+         holding.get("ltp", holding["avgPrice"]), now_iso())
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_holding(symbol):
+    """Delete a holding by symbol."""
+    conn = get_db()
+    conn.execute("DELETE FROM holdings WHERE symbol = ?", (symbol,))
+    conn.commit()
+    conn.close()
+
+
+def get_cash_balance():
+    """Get persisted cash balance from settings."""
+    val = get_setting("cash_balance")
+    try:
+        return float(val) if val else 0
+    except (ValueError, TypeError):
+        return 0
+
+
+def save_cash_balance(amount):
+    """Persist cash balance to settings."""
+    set_setting("cash_balance", str(amount))

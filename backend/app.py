@@ -15,6 +15,8 @@ from flask_cors import CORS
 from models import (
     init_db, get_db, generate_id, now_iso,
     get_setting, set_setting, get_all_settings,
+    get_all_holdings, save_holdings, upsert_holding, delete_holding as db_delete_holding,
+    get_cash_balance, save_cash_balance,
     SAFETY_HARD_CAPS, SIMULATION_STOCKS, SIMULATION_INDICES,
 )
 from fee_calculator import calculate_fees, calculate_trade_fees, format_fee_breakdown
@@ -31,13 +33,11 @@ from dry_run_validator import validate_order
 from reconciliation import reconcile_order
 from kite_service import kite_service
 
-# In-memory state
+# In-memory state (transient session data only — holdings/cash persisted in SQLite)
 state = {
     "permission": "READONLY",
     "kite": None,
     "access_token": None,
-    "holdings": [],
-    "cash_balance": 0,
     "last_scan": None,
     "recommendations": [],
     "arbitrage_opportunities": [],
@@ -63,7 +63,7 @@ def create_app():
             "version": "3.0.0",
             "permission": state["permission"],
             "kite_connected": state["access_token"] is not None,
-            "holdings_count": len(state["holdings"]),
+            "holdings_count": len(get_all_holdings()),
             "simulation_mode": state["access_token"] is None,
             "timestamp": now_iso(),
         })
@@ -135,8 +135,8 @@ def create_app():
     @app.route("/api/holdings", methods=["GET"])
     def api_holdings():
         return jsonify({
-            "holdings": state["holdings"],
-            "cash_balance": state["cash_balance"],
+            "holdings": get_all_holdings(),
+            "cash_balance": get_cash_balance(),
             "summary": _compute_portfolio_summary(),
         })
 
@@ -144,10 +144,10 @@ def create_app():
     def api_import_json():
         data = request.json or {}
         holdings = data.get("holdings", [])
-        cash = data.get("cash_balance", state["cash_balance"])
+        cash = data.get("cash_balance", get_cash_balance())
 
-        state["holdings"] = holdings
-        state["cash_balance"] = cash
+        save_holdings(holdings)
+        save_cash_balance(cash)
         return jsonify({
             "imported": len(holdings),
             "cash_balance": cash,
@@ -384,11 +384,11 @@ def create_app():
         # Append or replace
         mode = request.form.get("mode", "replace")
         if mode == "append":
-            existing_map = {h["symbol"]: h for h in state["holdings"]}
+            existing = get_all_holdings()
+            existing_map = {h["symbol"]: h for h in existing}
             for h in holdings:
                 if h["symbol"] in existing_map:
                     old = existing_map[h["symbol"]]
-                    # Merge: combine quantities, recompute weighted avg
                     total_qty = old["qty"] + h["qty"]
                     if total_qty > 0:
                         old["avgPrice"] = round(
@@ -396,11 +396,11 @@ def create_app():
                         )
                         old["qty"] = total_qty
                         old["ltp"] = h.get("ltp", old.get("ltp", old["avgPrice"]))
+                    upsert_holding(old)
                 else:
-                    state["holdings"].append(h)
-                    existing_map[h["symbol"]] = h
+                    upsert_holding(h)
         else:
-            state["holdings"] = holdings
+            save_holdings(holdings)
 
         return jsonify({
             "imported": len(holdings),
@@ -429,23 +429,20 @@ def create_app():
             "ltp": float(ltp_val),
         }
 
-        # Check if symbol already exists, update if so
-        existing = next((h for h in state["holdings"] if h["symbol"] == holding["symbol"]), None)
-        if existing:
-            existing.update(holding)
-        else:
-            state["holdings"].append(holding)
+        # Upsert into DB
+        upsert_holding(holding)
 
         return jsonify({
             "holding": holding,
-            "total_holdings": len(state["holdings"]),
+            "total_holdings": len(get_all_holdings()),
         })
 
     @app.route("/api/holdings/<symbol>", methods=["DELETE"])
     def api_delete_holding(symbol):
         symbol = symbol.upper()
-        state["holdings"] = [h for h in state["holdings"] if h["symbol"] != symbol]
-        return jsonify({"deleted": symbol, "remaining": len(state["holdings"])})
+        db_delete_holding(symbol)
+        remaining = len(get_all_holdings())
+        return jsonify({"deleted": symbol, "remaining": remaining})
 
     # ─── PORTFOLIO SNAPSHOTS ─────────────────────────────────────
 
@@ -468,8 +465,8 @@ def create_app():
         conn = get_db()
         conn.execute(
             "INSERT INTO portfolio_snapshots (id, name, holdings, cash_balance, total_value) VALUES (?, ?, ?, ?, ?)",
-            (snapshot_id, name, json.dumps(state["holdings"]),
-             state["cash_balance"], summary["portfolio_value"])
+            (snapshot_id, name, json.dumps(get_all_holdings()),
+             get_cash_balance(), summary["portfolio_value"])
         )
         conn.commit()
         conn.close()
@@ -491,12 +488,14 @@ def create_app():
         if not row:
             return jsonify({"error": "Snapshot not found"}), 404
 
-        state["holdings"] = json.loads(row["holdings"])
-        state["cash_balance"] = row["cash_balance"] or 0
+        loaded_holdings = json.loads(row["holdings"])
+        loaded_cash = row["cash_balance"] or 0
+        save_holdings(loaded_holdings)
+        save_cash_balance(loaded_cash)
         return jsonify({
             "loaded": row["name"],
-            "holdings_count": len(state["holdings"]),
-            "cash_balance": state["cash_balance"],
+            "holdings_count": len(loaded_holdings),
+            "cash_balance": loaded_cash,
         })
 
     # ─── COLLATERAL ──────────────────────────────────────────────
@@ -799,7 +798,7 @@ def create_app():
             return jsonify({"error": "Kite not connected"}), 401
         try:
             holdings = kite_service.get_holdings()
-            state["holdings"] = holdings
+            save_holdings(holdings)
             return jsonify({"imported": len(holdings), "summary": _compute_portfolio_summary()})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
@@ -809,11 +808,11 @@ def create_app():
     @app.route("/api/scan", methods=["POST"])
     def api_scan():
         data = request.json or {}
-        cash = data.get("cash_balance", state["cash_balance"])
-        state["cash_balance"] = cash
+        cash = data.get("cash_balance", get_cash_balance())
+        save_cash_balance(cash)
 
         settings = get_all_settings()
-        recs = scan_strategies(state["holdings"], cash, settings)
+        recs = scan_strategies(get_all_holdings(), cash, settings)
         state["recommendations"] = recs
         state["last_scan"] = now_iso()
 
@@ -1087,8 +1086,8 @@ def create_app():
 
 def _compute_portfolio_summary():
     """Compute collateral and portfolio summary from holdings."""
-    holdings = state["holdings"]
-    cash = state["cash_balance"]
+    holdings = get_all_holdings()
+    cash = get_cash_balance()
 
     total_value = 0
     non_cash_collateral = 0
@@ -1169,6 +1168,7 @@ def _load_persisted_state():
 
     if token and token_date == today:
         state["access_token"] = token
+    # Holdings and cash_balance are now always read from SQLite — no in-memory loading needed
 
 
 # ─── APP ENTRY POINT ─────────────────────────────────────────────
