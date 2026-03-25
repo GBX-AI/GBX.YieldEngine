@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-  getHoldings, importManual, importCsv, importFromKite,
+  getHoldings, importManual, detectCsvColumns, importCsv, importFromKite,
   deleteHolding, savePortfolio, getPortfolios, loadPortfolio, getStatus,
 } from '../api';
 import { Upload, Plus, Save, Trash2, Download, RefreshCw } from 'lucide-react';
@@ -88,6 +88,10 @@ export default function Holdings() {
   const [importMode, setImportMode] = useState(null); // 'manual' | 'csv' | 'saved' | null
   const [manualForm, setManualForm] = useState({ symbol: '', qty: '', avg: '', ltp: '' });
   const [csvFile, setCsvFile] = useState(null);
+  const [csvStep, setCsvStep] = useState(1); // 1=upload, 2=map, 3=preview
+  const [csvDetection, setCsvDetection] = useState(null);
+  const [columnMapping, setColumnMapping] = useState({});
+  const [csvImportMode, setCsvImportMode] = useState('replace');
   const [portfolios, setPortfolios] = useState([]);
   const [snapshotName, setSnapshotName] = useState('');
   const [busy, setBusy] = useState(false);
@@ -141,18 +145,53 @@ export default function Holdings() {
     finally { setBusy(false); }
   };
 
-  const handleCsvUpload = async () => {
+  const handleCsvDetect = async () => {
     if (!csvFile) return;
     setBusy(true);
+    setError(null);
     try {
       const fd = new FormData();
       fd.append('file', csvFile);
-      await importCsv(fd);
+      const result = await detectCsvColumns(fd);
+      if (result.error) { setError(result.error); setBusy(false); return; }
+      setCsvDetection(result);
+      setColumnMapping(result.mapping || {});
+      if (result.confidence === 'high') {
+        setCsvStep(3); // skip mapping, go to preview
+      } else {
+        setCsvStep(2); // show mapping UI
+      }
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const handleCsvImport = async () => {
+    if (!csvFile) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', csvFile);
+      fd.append('column_mapping', JSON.stringify(columnMapping));
+      fd.append('has_header', csvDetection?.has_header !== false ? 'true' : 'false');
+      fd.append('mode', csvImportMode);
+      const result = await importCsv(fd);
+      if (result.error) { setError(result.error); setBusy(false); return; }
       setCsvFile(null);
+      setCsvStep(1);
+      setCsvDetection(null);
+      setColumnMapping({});
       setImportMode(null);
       await fetchHoldings();
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
+  };
+
+  const handleCsvReset = () => {
+    setCsvFile(null);
+    setCsvStep(1);
+    setCsvDetection(null);
+    setColumnMapping({});
   };
 
   const handleDelete = async (symbol) => {
@@ -258,7 +297,10 @@ export default function Holdings() {
               </button>
             )}
             <button
-              onClick={() => setImportMode(importMode === 'csv' ? null : 'csv')}
+              onClick={() => {
+                if (importMode === 'csv') { setImportMode(null); handleCsvReset(); }
+                else { setImportMode('csv'); }
+              }}
               style={{ ...btnBase, background: importMode === 'csv' ? C.blue : 'rgba(56,189,248,0.15)', color: importMode === 'csv' ? '#0a0f1a' : C.blue }}
             >
               <Upload size={16} /> Upload CSV
@@ -303,23 +345,167 @@ export default function Holdings() {
             </div>
           )}
 
-          {/* CSV upload */}
+          {/* CSV upload — multi-step wizard */}
           {importMode === 'csv' && (
             <div>
-              <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 12 }}>
-                <input
-                  type="file"
-                  accept=".csv"
-                  onChange={(e) => setCsvFile(e.target.files?.[0] || null)}
-                  style={{ ...inputStyle, maxWidth: 360, padding: '8px 14px' }}
-                />
-                <button onClick={handleCsvUpload} disabled={busy || !csvFile} style={{ ...btnBase, background: C.blue, color: '#0a0f1a' }}>
-                  <Upload size={16} /> Upload
-                </button>
-              </div>
-              <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.6 }}>
-                CSV format: <span style={{ fontFamily: font.mono, color: C.text }}>symbol, quantity, average_price, ltp</span> — header row optional.
-              </div>
+              {/* Step 1: File picker */}
+              {csvStep === 1 && (
+                <div>
+                  <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 12 }}>
+                    <input
+                      type="file"
+                      accept=".csv"
+                      onChange={(e) => setCsvFile(e.target.files?.[0] || null)}
+                      style={{ ...inputStyle, maxWidth: 360, padding: '8px 14px' }}
+                    />
+                    <button onClick={handleCsvDetect} disabled={busy || !csvFile} style={{ ...btnBase, background: C.blue, color: '#0a0f1a' }}>
+                      <Upload size={16} /> {busy ? 'Detecting...' : 'Detect Columns'}
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.6 }}>
+                    Supports Zerodha tradebooks, holdings exports, or any CSV with symbol/quantity/price columns.
+                  </div>
+                </div>
+              )}
+
+              {/* Step 2: Column mapping */}
+              {csvStep === 2 && csvDetection && (
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, color: C.amber }}>
+                    Could not auto-detect all columns. Please map them manually.
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12, marginBottom: 16 }}>
+                    {[
+                      { key: 'symbol', label: 'Symbol', required: true },
+                      { key: 'quantity', label: 'Quantity', required: true },
+                      { key: 'price', label: 'Price / Avg Price', required: true },
+                      { key: 'trade_type', label: 'Buy/Sell (for tradebooks)', required: false },
+                      { key: 'ltp', label: 'LTP / Last Price', required: false },
+                    ].map((field) => (
+                      <div key={field.key} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                        <label style={{ fontSize: 13, color: field.required ? C.text : C.muted, minWidth: 160 }}>
+                          {field.label}{field.required ? ' *' : ''}
+                        </label>
+                        <select
+                          value={columnMapping[field.key] ?? ''}
+                          onChange={(e) => setColumnMapping((m) => ({
+                            ...m,
+                            [field.key]: e.target.value === '' ? undefined : Number(e.target.value),
+                          }))}
+                          style={{ ...inputStyle, maxWidth: 200, cursor: 'pointer' }}
+                        >
+                          <option value="">— skip —</option>
+                          {csvDetection.headers.map((h, i) => (
+                            <option key={i} value={i}>{h}</option>
+                          ))}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                  {/* Preview raw rows */}
+                  {csvDetection.preview_rows?.length > 0 && (
+                    <div style={{ marginBottom: 16 }}>
+                      <div style={{ fontSize: 12, color: C.muted, marginBottom: 6 }}>Sample data from your CSV:</div>
+                      <div style={{ overflowX: 'auto', maxHeight: 160, fontSize: 12, fontFamily: font.mono, background: 'rgba(0,0,0,0.3)', borderRadius: 8, padding: 12 }}>
+                        <div style={{ color: C.blue, marginBottom: 4 }}>{csvDetection.headers.join(' | ')}</div>
+                        {csvDetection.preview_rows.map((row, i) => (
+                          <div key={i} style={{ color: C.muted }}>{row.join(' | ')}</div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', gap: 12 }}>
+                    <button onClick={handleCsvReset} style={{ ...btnBase, background: 'rgba(148,163,184,0.1)', color: C.muted }}>
+                      Back
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (!columnMapping.symbol && columnMapping.symbol !== 0) { setError('Symbol column is required'); return; }
+                        if (!columnMapping.quantity && columnMapping.quantity !== 0) { setError('Quantity column is required'); return; }
+                        if (!columnMapping.price && columnMapping.price !== 0) { setError('Price column is required'); return; }
+                        setError(null);
+                        setCsvStep(3);
+                      }}
+                      style={{ ...btnBase, background: C.blue, color: '#0a0f1a' }}
+                    >
+                      Continue to Preview
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Step 3: Preview & confirm */}
+              {csvStep === 3 && csvDetection && (
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 12, flexWrap: 'wrap' }}>
+                    <div style={{ fontSize: 14, fontWeight: 600 }}>
+                      Preview — {csvDetection.aggregated_preview?.length || 0} holdings
+                      {csvDetection.detected_format === 'tradebook' && (
+                        <span style={{ fontSize: 12, color: C.amber, fontWeight: 400, marginLeft: 8 }}>
+                          (aggregated from {csvDetection.total_rows} tradebook rows)
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
+                      <label style={{ fontSize: 12, color: C.muted }}>Import mode:</label>
+                      <select
+                        value={csvImportMode}
+                        onChange={(e) => setCsvImportMode(e.target.value)}
+                        style={{ ...inputStyle, maxWidth: 140, padding: '6px 10px', fontSize: 12 }}
+                      >
+                        <option value="replace">Replace all</option>
+                        <option value="append">Append / merge</option>
+                      </select>
+                    </div>
+                  </div>
+                  {/* Preview table */}
+                  {csvDetection.aggregated_preview?.length > 0 && (
+                    <div style={{ overflowX: 'auto', marginBottom: 16 }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                        <thead>
+                          <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                            {['Symbol', 'Net Qty', 'Avg Price', 'LTP'].map((h) => (
+                              <th key={h} style={{ padding: '8px 12px', textAlign: h === 'Symbol' ? 'left' : 'right', fontSize: 11, fontWeight: 600, color: C.muted, textTransform: 'uppercase' }}>
+                                {h}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {csvDetection.aggregated_preview.map((h, i) => (
+                            <tr key={i} style={{ borderBottom: `1px solid ${C.border}` }}>
+                              <td style={{ padding: '8px 12px', fontWeight: 600 }}>{h.symbol}</td>
+                              <td style={{ padding: '8px 12px', textAlign: 'right', fontFamily: font.mono }}>{h.qty}</td>
+                              <td style={{ padding: '8px 12px', textAlign: 'right', fontFamily: font.mono }}>{fmtCur(h.avgPrice)}</td>
+                              <td style={{ padding: '8px 12px', textAlign: 'right', fontFamily: font.mono }}>{fmtCur(h.ltp)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  {(!csvDetection.aggregated_preview || csvDetection.aggregated_preview.length === 0) && (
+                    <div style={{ padding: 24, textAlign: 'center', color: C.amber, fontSize: 13, marginBottom: 16 }}>
+                      No holdings could be parsed. Try adjusting the column mapping.
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', gap: 12 }}>
+                    <button onClick={() => setCsvStep(2)} style={{ ...btnBase, background: 'rgba(148,163,184,0.1)', color: C.muted }}>
+                      Edit Mapping
+                    </button>
+                    <button onClick={handleCsvReset} style={{ ...btnBase, background: 'rgba(148,163,184,0.1)', color: C.muted }}>
+                      Start Over
+                    </button>
+                    <button
+                      onClick={handleCsvImport}
+                      disabled={busy || !csvDetection.aggregated_preview?.length}
+                      style={{ ...btnBase, background: C.emerald, color: '#0a0f1a' }}
+                    >
+                      <Upload size={16} /> {busy ? 'Importing...' : `Import ${csvDetection.aggregated_preview?.length || 0} Holdings`}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 

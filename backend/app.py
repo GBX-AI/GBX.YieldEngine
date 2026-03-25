@@ -3,8 +3,11 @@ Yield Engine v3 — Flask app factory with all API routes.
 Complete implementation with all endpoints from the spec.
 """
 
+import csv
+import io
 import os
 import json
+from collections import defaultdict
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -151,48 +154,279 @@ def create_app():
             "summary": _compute_portfolio_summary(),
         })
 
-    @app.route("/api/import/csv", methods=["POST"])
-    def api_import_csv():
+    # ─── CSV COLUMN AUTO-DETECTION ──────────────────────────────
+
+    # Known column name aliases → canonical field
+    CSV_COLUMN_ALIASES = {
+        "symbol": ["symbol", "tradingsymbol", "trading_symbol", "scrip",
+                    "instrument", "stock", "ticker", "instrument_name"],
+        "quantity": ["quantity", "qty", "net_qty", "net_quantity",
+                     "traded_qty", "filled_qty", "volume"],
+        "price": ["price", "average_price", "avg_price", "avgprice",
+                   "avg", "trade_price", "fill_price", "rate"],
+        "trade_type": ["trade_type", "type", "buy_sell", "side",
+                       "transaction_type", "order_side", "action"],
+        "ltp": ["ltp", "last_price", "close", "closing_price",
+                "market_price", "close_price", "last_traded_price"],
+    }
+
+    # Build reverse lookup: normalized alias → canonical field
+    _ALIAS_LOOKUP = {}
+    for canonical, aliases in CSV_COLUMN_ALIASES.items():
+        for alias in aliases:
+            _ALIAS_LOOKUP[alias] = canonical
+
+    def _detect_csv_columns(headers):
+        """Auto-detect column mapping from CSV headers."""
+        mapping = {}
+        for i, raw_header in enumerate(headers):
+            normalized = raw_header.strip().lower().replace(" ", "_").replace("-", "_")
+            canonical = _ALIAS_LOOKUP.get(normalized)
+            if canonical and canonical not in mapping:
+                mapping[canonical] = i
+        return mapping
+
+    def _aggregate_tradebook(rows, mapping):
+        """Aggregate tradebook rows into net holdings per symbol."""
+        groups = defaultdict(lambda: {"buy_qty": 0.0, "buy_value": 0.0, "sell_qty": 0.0})
+
+        sym_idx = mapping["symbol"]
+        qty_idx = mapping["quantity"]
+        price_idx = mapping["price"]
+        trade_type_idx = mapping.get("trade_type")
+
+        for row in rows:
+            if len(row) <= max(sym_idx, qty_idx, price_idx):
+                continue
+            try:
+                symbol = row[sym_idx].strip().upper()
+                qty = abs(float(row[qty_idx].strip()))
+                price = abs(float(row[price_idx].strip()))
+            except (ValueError, IndexError):
+                continue
+
+            if not symbol or qty == 0:
+                continue
+
+            trade_type = "buy"
+            if trade_type_idx is not None and trade_type_idx < len(row):
+                trade_type = row[trade_type_idx].strip().lower()
+
+            if trade_type in ("buy", "b", "long"):
+                groups[symbol]["buy_qty"] += qty
+                groups[symbol]["buy_value"] += qty * price
+            else:
+                groups[symbol]["sell_qty"] += qty
+
+        holdings = []
+        for sym, g in groups.items():
+            net_qty = g["buy_qty"] - g["sell_qty"]
+            if net_qty > 0:
+                avg_price = g["buy_value"] / g["buy_qty"] if g["buy_qty"] > 0 else 0
+                holdings.append({
+                    "symbol": sym,
+                    "qty": int(net_qty),
+                    "avgPrice": round(avg_price, 2),
+                    "ltp": round(avg_price, 2),
+                })
+        return holdings
+
+    def _parse_holdings_csv(rows, mapping):
+        """Parse a simple holdings-format CSV (not a tradebook)."""
+        sym_idx = mapping["symbol"]
+        qty_idx = mapping["quantity"]
+        price_idx = mapping["price"]
+        ltp_idx = mapping.get("ltp")
+
+        holdings = []
+        for row in rows:
+            if len(row) <= max(sym_idx, qty_idx, price_idx):
+                continue
+            try:
+                symbol = row[sym_idx].strip().upper()
+                qty = int(float(row[qty_idx].strip()))
+                avg_price = float(row[price_idx].strip())
+            except (ValueError, IndexError):
+                continue
+
+            if not symbol or qty <= 0:
+                continue
+
+            ltp = avg_price
+            if ltp_idx is not None and ltp_idx < len(row):
+                try:
+                    ltp = float(row[ltp_idx].strip())
+                except (ValueError, IndexError):
+                    pass
+
+            holdings.append({
+                "symbol": symbol,
+                "qty": qty,
+                "avgPrice": round(avg_price, 2),
+                "ltp": round(ltp, 2),
+            })
+        return holdings
+
+    @app.route("/api/import/csv/detect", methods=["POST"])
+    def api_csv_detect():
+        """Step 1: Upload CSV, auto-detect columns, return mapping + preview."""
         if "file" not in request.files:
             return jsonify({"error": "No file uploaded"}), 400
 
         file = request.files["file"]
-        content = file.read().decode("utf-8")
-        lines = content.strip().split("\n")
+        content = file.read().decode("utf-8-sig")  # handle BOM
+        reader = csv.reader(io.StringIO(content))
+        all_rows = list(reader)
 
-        holdings = []
-        for i, line in enumerate(lines):
-            if i == 0 and "symbol" in line.lower():
-                continue  # skip header
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 3:
-                holding = {
-                    "symbol": parts[0].upper(),
-                    "qty": int(parts[1]),
-                    "avgPrice": float(parts[2]),
-                    "ltp": float(parts[3]) if len(parts) > 3 else float(parts[2]),
-                }
-                holdings.append(holding)
+        if not all_rows:
+            return jsonify({"error": "Empty CSV file"}), 400
 
-        state["holdings"] = holdings
+        # Detect if first row is a header
+        first_row = all_rows[0]
+        has_header = any(
+            cell.strip().lower().replace(" ", "_").replace("-", "_") in _ALIAS_LOOKUP
+            for cell in first_row
+        )
+
+        if has_header:
+            headers = [cell.strip() for cell in first_row]
+            data_rows = all_rows[1:]
+        else:
+            headers = [f"column_{i+1}" for i in range(len(first_row))]
+            data_rows = all_rows
+
+        mapping = _detect_csv_columns(headers)
+
+        # Determine format
+        is_tradebook = "trade_type" in mapping
+        detected_format = "tradebook" if is_tradebook else "holdings"
+
+        # Check required fields
+        unmapped = []
+        for req in ["symbol", "quantity", "price"]:
+            if req not in mapping:
+                unmapped.append(req)
+
+        confidence = "high" if not unmapped else "low"
+
+        # Preview: first 5 data rows
+        preview = data_rows[:5]
+
+        # If confidence is high, also compute aggregated preview
+        aggregated_preview = []
+        if confidence == "high":
+            if is_tradebook:
+                aggregated_preview = _aggregate_tradebook(data_rows, mapping)
+            else:
+                aggregated_preview = _parse_holdings_csv(data_rows, mapping)
+
+        return jsonify({
+            "headers": headers,
+            "mapping": mapping,
+            "confidence": confidence,
+            "detected_format": detected_format,
+            "has_header": has_header,
+            "total_rows": len(data_rows),
+            "preview_rows": preview,
+            "aggregated_preview": aggregated_preview[:20],
+            "unmapped_required": unmapped,
+        })
+
+    @app.route("/api/import/csv", methods=["POST"])
+    def api_import_csv():
+        """Step 2: Import CSV with confirmed column mapping."""
+        if "file" not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+
+        file = request.files["file"]
+        content = file.read().decode("utf-8-sig")
+        reader = csv.reader(io.StringIO(content))
+        all_rows = list(reader)
+
+        if not all_rows:
+            return jsonify({"error": "Empty CSV file"}), 400
+
+        # Get column mapping — either user-provided or auto-detected
+        mapping_json = request.form.get("column_mapping")
+        if mapping_json:
+            mapping = json.loads(mapping_json)
+            # Convert string keys to int values if needed
+            mapping = {k: int(v) for k, v in mapping.items()}
+        else:
+            # Auto-detect from headers
+            first_row = all_rows[0]
+            has_header = any(
+                cell.strip().lower().replace(" ", "_").replace("-", "_") in _ALIAS_LOOKUP
+                for cell in first_row
+            )
+            headers = [cell.strip() for cell in first_row] if has_header else []
+            mapping = _detect_csv_columns(headers) if has_header else {}
+
+        # Validate required fields
+        for req in ["symbol", "quantity", "price"]:
+            if req not in mapping:
+                return jsonify({"error": f"Column mapping missing required field: {req}"}), 400
+
+        # Determine if first row is header
+        has_header_flag = request.form.get("has_header", "true").lower() == "true"
+        data_rows = all_rows[1:] if has_header_flag else all_rows
+
+        # Parse based on format
+        is_tradebook = "trade_type" in mapping
+        if is_tradebook:
+            holdings = _aggregate_tradebook(data_rows, mapping)
+        else:
+            holdings = _parse_holdings_csv(data_rows, mapping)
+
+        if not holdings:
+            return jsonify({"error": "No valid holdings found in CSV. Check column mapping."}), 400
+
+        # Append or replace
+        mode = request.form.get("mode", "replace")
+        if mode == "append":
+            existing_map = {h["symbol"]: h for h in state["holdings"]}
+            for h in holdings:
+                if h["symbol"] in existing_map:
+                    old = existing_map[h["symbol"]]
+                    # Merge: combine quantities, recompute weighted avg
+                    total_qty = old["qty"] + h["qty"]
+                    if total_qty > 0:
+                        old["avgPrice"] = round(
+                            (old["avgPrice"] * old["qty"] + h["avgPrice"] * h["qty"]) / total_qty, 2
+                        )
+                        old["qty"] = total_qty
+                        old["ltp"] = h.get("ltp", old.get("ltp", old["avgPrice"]))
+                else:
+                    state["holdings"].append(h)
+                    existing_map[h["symbol"]] = h
+        else:
+            state["holdings"] = holdings
+
         return jsonify({
             "imported": len(holdings),
+            "mode": mode,
+            "format_detected": "tradebook" if is_tradebook else "holdings",
             "summary": _compute_portfolio_summary(),
         })
 
     @app.route("/api/import/manual", methods=["POST"])
     def api_import_manual():
         data = request.json or {}
-        required = ["symbol", "qty", "avgPrice"]
-        for field in required:
-            if field not in data:
-                return jsonify({"error": f"Missing field: {field}"}), 400
+        # Accept both naming conventions
+        symbol = data.get("symbol", "")
+        qty = data.get("qty") or data.get("quantity")
+        avg_price = data.get("avgPrice") or data.get("average_price")
+
+        if not symbol or qty is None or avg_price is None:
+            return jsonify({"error": "Missing required fields: symbol, qty/quantity, avgPrice/average_price"}), 400
+
+        ltp_val = data.get("ltp", avg_price)
 
         holding = {
-            "symbol": data["symbol"].upper(),
-            "qty": int(data["qty"]),
-            "avgPrice": float(data["avgPrice"]),
-            "ltp": float(data.get("ltp", data["avgPrice"])),
+            "symbol": symbol.upper(),
+            "qty": int(float(qty)),
+            "avgPrice": float(avg_price),
+            "ltp": float(ltp_val),
         }
 
         # Check if symbol already exists, update if so

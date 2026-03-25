@@ -19,10 +19,11 @@ export const setPermission = (data) => request('/api/permission', { method: 'POS
 
 // Holdings
 export const getHoldings = () => request('/api/holdings');
-export const importJson = (data) => request('/api/holdings/import/json', { method: 'POST', body: JSON.stringify(data) });
-export const importCsv = (formData) => fetch(`${BASE}/api/holdings/import/csv`, { method: 'POST', body: formData }).then(r => r.json());
-export const importManual = (data) => request('/api/holdings/import/manual', { method: 'POST', body: JSON.stringify(data) });
-export const importFromKite = () => request('/api/holdings/import/kite', { method: 'POST' });
+export const importJson = (data) => request('/api/import/json', { method: 'POST', body: JSON.stringify(data) });
+export const detectCsvColumns = (formData) => fetch(`${BASE}/api/import/csv/detect`, { method: 'POST', body: formData }).then(r => r.json());
+export const importCsv = (formData) => fetch(`${BASE}/api/import/csv`, { method: 'POST', body: formData }).then(r => r.json());
+export const importManual = (data) => request('/api/import/manual', { method: 'POST', body: JSON.stringify(data) });
+export const importFromKite = () => request('/api/import/kite', { method: 'POST' });
 export const deleteHolding = (symbol) => request(`/api/holdings/${encodeURIComponent(symbol)}`, { method: 'DELETE' });
 
 // Portfolios
