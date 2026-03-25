@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   scan, getRecommendations, getArbitrage,
-  setRiskProfile, getRiskProfile, getPermission,
+  setRiskProfile, getRiskProfile, getPermission, getStatus,
 } from '../api';
 import {
   Search, ChevronDown, ChevronUp, Lock, Unlock,
@@ -98,7 +98,14 @@ export default function Scanner() {
       setArbitrage(arbs);
       setSummary((s) => ({ ...s, arbCount: arbs.length }));
     }).catch(() => {});
-  }, []);
+
+    // Auto-scan if holdings exist and no recommendations loaded yet
+    getStatus().then((st) => {
+      if ((st?.holdings_count ?? 0) > 0) {
+        handleScan();
+      }
+    }).catch(() => {});
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ─── Handlers ─── */
   const handleScan = useCallback(async () => {

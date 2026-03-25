@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { TrendingUp, TrendingDown, Activity, Search, Download, Eye } from 'lucide-react';
-import { getAnalyticsSummary, getAnalyticsMonthly, getPositions, getDailySummary, getNotifications, scan } from '../api';
+import { getAnalyticsSummary, getAnalyticsMonthly, getPositions, getDailySummary, getNotifications, scan, getHoldings } from '../api';
 
 const c = {
   bg: '#0a0f1a',
@@ -140,12 +140,13 @@ const severityColor = {
 };
 
 const formatCurrency = (v) => {
-  if (v == null) return '—';
+  if (v == null || Number.isNaN(Number(v))) return '—';
   const abs = Math.abs(v);
   const prefix = v < 0 ? '-' : '';
-  if (abs >= 1e6) return `${prefix}$${(abs / 1e6).toFixed(2)}M`;
-  if (abs >= 1e3) return `${prefix}$${(abs / 1e3).toFixed(1)}K`;
-  return `${prefix}$${abs.toFixed(2)}`;
+  if (abs >= 1e7) return `${prefix}₹${(abs / 1e7).toFixed(2)}Cr`;
+  if (abs >= 1e5) return `${prefix}₹${(abs / 1e5).toFixed(2)}L`;
+  if (abs >= 1e3) return `${prefix}₹${(abs / 1e3).toFixed(1)}K`;
+  return `${prefix}₹${abs.toFixed(2)}`;
 };
 
 const CustomTooltip = ({ active, payload, label }) => {
@@ -176,6 +177,7 @@ export default function Dashboard() {
   const [positions, setPositions] = useState([]);
   const [daily, setDaily] = useState(null);
   const [notifications, setNotifications] = useState([]);
+  const [portfolio, setPortfolio] = useState(null);
   const [scanning, setScanning] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -183,12 +185,13 @@ export default function Dashboard() {
     let mounted = true;
     const load = async () => {
       try {
-        const [sumRes, monthRes, posRes, dailyRes, notifRes] = await Promise.allSettled([
+        const [sumRes, monthRes, posRes, dailyRes, notifRes, holdRes] = await Promise.allSettled([
           getAnalyticsSummary(),
           getAnalyticsMonthly(),
           getPositions(),
           getDailySummary(),
           getNotifications(),
+          getHoldings(),
         ]);
         if (!mounted) return;
         if (sumRes.status === 'fulfilled') setSummary(sumRes.value);
@@ -205,6 +208,7 @@ export default function Dashboard() {
           const n = Array.isArray(notifRes.value) ? notifRes.value : notifRes.value?.notifications ?? [];
           setNotifications(n.slice(0, 5));
         }
+        if (holdRes.status === 'fulfilled') setPortfolio(holdRes.value?.summary ?? null);
       } catch { /* silent */ }
       if (mounted) setLoading(false);
     };
@@ -226,6 +230,13 @@ export default function Dashboard() {
   const winRate = summary?.winRate ?? 0;
   const openCount = positions.filter((p) => p.status === 'open' || !p.closedAt).length || positions.length;
   const unrealizedPnl = positions.reduce((acc, p) => acc + (p.unrealizedPnl ?? p.pnl ?? 0), 0);
+
+  const portfolioCards = portfolio ? [
+    { label: 'Portfolio Value', value: formatCurrency(portfolio.portfolio_value), color: c.blue },
+    { label: 'Unrealized P&L', value: formatCurrency(portfolio.unrealized_pnl), color: (portfolio.unrealized_pnl ?? 0) >= 0 ? c.emerald : c.red },
+    { label: 'Usable Margin', value: formatCurrency(portfolio.usable_margin), color: c.purple },
+    { label: 'Holdings', value: `${portfolio.holdings?.length ?? 0} stocks`, color: c.text },
+  ] : [];
 
   const statCards = [
     { label: 'Total Income', value: formatCurrency(totalIncome), color: c.emerald, icon: TrendingUp },
@@ -255,7 +266,23 @@ export default function Dashboard() {
 
   return (
     <div style={s.page}>
-      {/* Summary Cards */}
+      {/* Portfolio Overview */}
+      {portfolioCards.length > 0 && (
+        <>
+          <div style={{ ...s.sectionTitle, marginBottom: 12 }}>Portfolio Overview</div>
+          <div style={s.grid4}>
+            {portfolioCards.map(({ label, value, color }) => (
+              <div key={label} style={s.card}>
+                <div style={s.cardLabel}>{label}</div>
+                <div style={{ ...s.cardValue, color }}>{value}</div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* Trading Performance */}
+      <div style={{ ...s.sectionTitle, marginBottom: 12 }}>Trading Performance</div>
       <div style={s.grid4}>
         {statCards.map(({ label, value, color, icon: Icon }) => (
           <div key={label} style={s.card}>
