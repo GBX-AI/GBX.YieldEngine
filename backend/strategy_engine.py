@@ -27,6 +27,7 @@ from black_scholes import (
 )
 from strike_selector import select_strike, select_strike_price, generate_alternatives, generate_strike_alternatives
 from fee_calculator import calculate_fees, calculate_trade_fees
+import live_price_service
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -190,6 +191,123 @@ def _resolve_settings(settings: dict | None) -> dict:
     return base
 
 
+# ─── Live Data Resolution ────────────────────────────────────────────────────
+
+# NSE F&O lot sizes for common stocks (updated periodically by NSE)
+# Fallback: if a stock is not here and not in SIMULATION_STOCKS, assume not F&O eligible
+_FNO_LOT_SIZES = {
+    "ABB": 250, "ADANIGREEN": 500, "ADANIPORTS": 625, "APOLLOHOSP": 125,
+    "ASHOKLEY": 5000, "ASIANPAINT": 300, "AUBANK": 1000, "AUROPHARMA": 650,
+    "AXISBANK": 600, "BAJAJ-AUTO": 250, "BAJAJFINSV": 500, "BAJFINANCE": 125,
+    "BALKRISIND": 400, "BANDHANBNK": 1800, "BANKBARODA": 5850, "BEL": 1500,
+    "BHARATFORG": 500, "BHARTIARTL": 475, "BHEL": 3750, "BIOCON": 2300,
+    "BOSCHLTD": 50, "BPCL": 2100, "BRITANNIA": 200, "BSOFT": 1000,
+    "CANBK": 7500, "CHAMBLFERT": 1500, "CHOLAFIN": 625, "CIPLA": 650,
+    "COALINDIA": 2100, "COFORGE": 200, "COLPAL": 350, "CONCOR": 1000,
+    "COROMANDEL": 500, "CUB": 5500, "CUMMINSIND": 300, "DABUR": 1250,
+    "DALBHARAT": 500, "DEEPAKNTR": 250, "DIVISLAB": 200, "DIXON": 125,
+    "DLF": 1375, "DRREDDY": 125, "EICHERMOT": 175, "ESCORTS": 250,
+    "EXIDEIND": 1800, "FEDERALBNK": 5000, "GAIL": 5850, "GLENMARK": 500,
+    "GMRAIRPORT": 10000, "GNFC": 1600, "GODREJCP": 500, "GODREJPROP": 325,
+    "GRANULES": 2000, "GRASIM": 350, "GUJGASLTD": 1250, "HAL": 150,
+    "HCLTECH": 350, "HDFCAMC": 150, "HDFCBANK": 550, "HDFCLIFE": 1100,
+    "HEROMOTOCO": 150, "HINDALCO": 1075, "HINDCOPPER": 2300, "HINDPETRO": 1350,
+    "HINDUNILVR": 300, "ICICIBANK": 700, "ICICIGI": 400, "ICICIPRULI": 1500,
+    "IDEA": 50000, "IDFC": 5000, "IDFCFIRSTB": 7500, "IEX": 3750,
+    "IGL": 2875, "INDHOTEL": 1250, "INDIAMART": 150, "INDIGO": 300,
+    "INDUSINDBK": 500, "INFY": 400, "IOC": 4350, "IPCALAB": 550,
+    "IRCTC": 750, "ITC": 1600, "JINDALSTEL": 750, "JKCEMENT": 125,
+    "JSWSTEEL": 675, "JUBLFOOD": 1000, "KOTAKBANK": 400, "LALPATHLAB": 250,
+    "LAURUSLABS": 1750, "LICHSGFIN": 1500, "LICI": 700, "LT": 150,
+    "LTIM": 150, "LTTS": 150, "LUPIN": 550, "M&M": 350,
+    "M&MFIN": 2000, "MANAPPURAM": 4000, "MARICO": 1200, "MARUTI": 100,
+    "MCDOWELL-N": 625, "MCX": 200, "METROPOLIS": 400, "MFSL": 650,
+    "MGL": 575, "MPHASIS": 350, "MRF": 10, "MUTHOOTFIN": 375,
+    "NATIONALUM": 2500, "NAUKRI": 125, "NAVINFLUOR": 175, "NESTLEIND": 50,
+    "NMDC": 3400, "NTPC": 2850, "OBEROIRLTY": 375, "OFSS": 100,
+    "ONGC": 3075, "PAGEIND": 15, "PEL": 550, "PERSISTENT": 150,
+    "PETRONET": 3000, "PFC": 2500, "PIDILITIND": 250, "PIIND": 250,
+    "PNB": 8000, "POLYCAB": 125, "POWERGRID": 2700, "PVRINOX": 500,
+    "RAMCOCEM": 600, "RBLBANK": 5000, "RECLTD": 1500, "RELIANCE": 250,
+    "SAIL": 4750, "SBICARD": 800, "SBILIFE": 750, "SBIN": 1500,
+    "SHREECEM": 25, "SHRIRAMFIN": 200, "SIEMENS": 150, "SRF": 375,
+    "SUNPHARMA": 700, "SUNTV": 1000, "SYNGENE": 1000, "TATACHEM": 500,
+    "TATACOMM": 500, "TATACONSUM": 900, "TATAELXSI": 125, "TATAMOTORS": 550,
+    "TATAPOWER": 1875, "TATASTEEL": 5500, "TCS": 175, "TECHM": 600,
+    "TITAN": 250, "TORNTPHARM": 250, "TRENT": 175, "TVSMOTOR": 175,
+    "UBL": 350, "ULTRACEMCO": 100, "UNIONBANK": 7500, "UNITDSPR": 700,
+    "UPL": 1300, "VEDL": 1550, "VOLTAS": 500, "WIPRO": 1500,
+    "ZEEL": 5000, "ZYDUSLIFE": 650,
+}
+
+# Default IV estimate by market cap tier (rough approximation)
+_DEFAULT_IV = 0.30  # 30% — conservative default for mid/small cap
+
+# Default haircut by tier
+_DEFAULT_HAIRCUT = 0.25
+
+
+def _resolve_stock_info(symbol: str, holding: dict | None = None) -> dict | None:
+    """
+    Resolve spot price, IV, lot size, and haircut for any stock.
+    Tries: 1) SIMULATION_STOCKS 2) Live Yahoo price + FNO lot size lookup.
+    Returns dict with ltp, iv, lotSize, haircut — or None if not F&O eligible.
+    """
+    # Check if in the hardcoded simulation data first
+    sim = SIMULATION_STOCKS.get(symbol)
+    if sim:
+        # Try live price, fall back to hardcoded
+        live_spot = live_price_service.get_live_spot(symbol)
+        return {
+            "ltp": live_spot if live_spot else sim["ltp"],
+            "iv": sim["iv"],
+            "lotSize": sim["lotSize"],
+            "haircut": sim["haircut"],
+            "source": "yahoo" if live_spot else "simulated",
+        }
+
+    # Check if F&O eligible via lot size table
+    lot_size = _FNO_LOT_SIZES.get(symbol)
+    if not lot_size:
+        return None  # Not F&O eligible — skip
+
+    # Get live price
+    live_spot = live_price_service.get_live_spot(symbol)
+    if not live_spot and holding:
+        live_spot = holding.get("ltp") or holding.get("avgPrice")
+    if not live_spot:
+        return None
+
+    return {
+        "ltp": live_spot,
+        "iv": _DEFAULT_IV,
+        "lotSize": lot_size,
+        "haircut": _DEFAULT_HAIRCUT,
+        "source": "yahoo" if live_price_service.get_live_spot(symbol) else "holding",
+    }
+
+
+def _resolve_index_info(index_name: str) -> dict:
+    """Resolve live spot price for indices, falling back to hardcoded."""
+    sim = SIMULATION_INDICES.get(index_name, {})
+    live_spot = live_price_service.get_live_spot(index_name)
+    return {
+        "spot": live_spot if live_spot else sim.get("spot", 23000),
+        "iv": sim.get("iv", 0.15),
+        "lotSize": sim.get("lotSize", 25),
+        "source": "yahoo" if live_spot else "simulated",
+    }
+
+
+def _add_frontend_aliases(rec: dict) -> dict:
+    """Add frontend-compatible field aliases to a recommendation."""
+    rec["premium"] = rec.get("premium_income", 0)
+    rec["safety"] = rec.get("safety_tag", "MODERATE")
+    rec["strategy"] = rec.get("strategy_type", "")
+    rec["margin"] = rec.get("margin_needed", 0)
+    return rec
+
+
 # ─── Strategy Scanners ───────────────────────────────────────────────────────
 
 def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
@@ -205,9 +323,9 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
 
     for holding in holdings:
         symbol = holding.get("symbol", holding.get("tradingsymbol", ""))
-        qty = holding.get("quantity", 0)
+        qty = holding.get("qty", holding.get("quantity", 0))
 
-        stock_info = SIMULATION_STOCKS.get(symbol)
+        stock_info = _resolve_stock_info(symbol, holding)
         if not stock_info:
             continue
 
@@ -217,20 +335,23 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
 
         spot = stock_info["ltp"]
         iv = stock_info["iv"]
-        avg_cost = holding.get("average_price", spot)
+        avg_cost = holding.get("average_price", holding.get("avgPrice", spot))
 
         # Select strike via strike_selector
+        step = max(5, _round_to_step(spot * 0.01, 5))  # ~1% of spot, min 5
+        if spot > 2000:
+            step = STOCK_STRIKE_STEP
         strike = select_strike_price(
             spot=spot,
             option_type="CE",
             target_delta=target_delta,
             iv=iv,
             dte=dte,
-            step=STOCK_STRIKE_STEP,
+            step=step,
         )
         if strike <= spot:
             # Ensure the call strike is OTM
-            strike = _round_to_step(spot * (1 + 0.02), STOCK_STRIKE_STEP)
+            strike = _round_to_step(spot * (1 + 0.02), step)
 
         greeks = compute_greeks(spot, strike, T, RISK_FREE_RATE, iv, "CE")
         premium = greeks["price"]
@@ -263,10 +384,10 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
             option_type="CE",
             iv=iv,
             dte=dte,
-            step=STOCK_STRIKE_STEP,
+            step=step,
         )
 
-        recs.append({
+        recs.append(_add_frontend_aliases({
             "id": generate_id(),
             "rank": 0,
             "symbol": symbol,
@@ -276,7 +397,7 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
             "legs": legs,
             "premium_income": round(total_premium, 2),
             "margin_needed": 0,
-            "max_loss": round((spot - avg_cost) * trade_qty, 2),  # downside risk from stock
+            "max_loss": round((spot - avg_cost) * trade_qty, 2),
             "prob_otm": round(prob_otm, 4),
             "delta": round(delta_val, 4),
             "annualized_return": round(ann_return, 4),
@@ -288,7 +409,7 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
             "dte": dte,
             "lots": lots,
             "spot": spot,
-        })
+        }))
 
     return recs
 
@@ -304,10 +425,11 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int) -> li
     T = _time_to_expiry(dte)
     target_delta = float(settings.get("manual_target_delta_puts", 0.20))
 
-    for index_name, index_info in SIMULATION_INDICES.items():
-        spot = index_info["spot"]
-        iv = index_info["iv"]
-        lot_size = index_info["lotSize"]
+    for index_name in SIMULATION_INDICES:
+        idx = _resolve_index_info(index_name)
+        spot = idx["spot"]
+        iv = idx["iv"]
+        lot_size = idx["lotSize"]
         step = INDEX_STRIKE_STEP.get(index_name, 50)
 
         strike = select_strike_price(
@@ -361,7 +483,7 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int) -> li
             step=step,
         )
 
-        recs.append({
+        recs.append(_add_frontend_aliases({
             "id": generate_id(),
             "rank": 0,
             "symbol": index_name,
@@ -383,7 +505,7 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int) -> li
             "dte": dte,
             "lots": lots,
             "spot": spot,
-        })
+        }))
 
     return recs
 
@@ -401,10 +523,11 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int) -> l
     max_loss_limit = float(settings.get("max_loss_per_trade", 10000))
     target_delta = float(settings.get("manual_target_delta_puts", 0.20))
 
-    for index_name, index_info in SIMULATION_INDICES.items():
-        spot = index_info["spot"]
-        iv = index_info["iv"]
-        lot_size = index_info["lotSize"]
+    for index_name in SIMULATION_INDICES:
+        idx = _resolve_index_info(index_name)
+        spot = idx["spot"]
+        iv = idx["iv"]
+        lot_size = idx["lotSize"]
         step = INDEX_STRIKE_STEP.get(index_name, 50)
 
         # Sell put (higher strike, closer to spot)
@@ -483,7 +606,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int) -> l
                 step=step,
             )
 
-            recs.append({
+            recs.append(_add_frontend_aliases({
                 "id": generate_id(),
                 "rank": 0,
                 "symbol": index_name,
@@ -508,7 +631,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int) -> l
                 "lots": lots,
                 "spot": spot,
                 "spread_width": actual_width,
-            })
+            }))
 
             # Only take the first valid width per index
             break
@@ -530,10 +653,10 @@ def _scan_collars(holdings: list, settings: dict, dte: int) -> list:
 
     for holding in holdings:
         symbol = holding.get("symbol", holding.get("tradingsymbol", ""))
-        qty = holding.get("quantity", 0)
-        avg_cost = holding.get("average_price", 0)
+        qty = holding.get("qty", holding.get("quantity", 0))
+        avg_cost = holding.get("average_price", holding.get("avgPrice", 0))
 
-        stock_info = SIMULATION_STOCKS.get(symbol)
+        stock_info = _resolve_stock_info(symbol, holding)
         if not stock_info:
             continue
 
@@ -551,6 +674,10 @@ def _scan_collars(holdings: list, settings: dict, dte: int) -> list:
         if gain_pct < COLLAR_MIN_GAIN_PCT:
             continue
 
+        step = max(5, _round_to_step(spot * 0.01, 5))
+        if spot > 2000:
+            step = STOCK_STRIKE_STEP
+
         # Sell OTM call
         call_strike = select_strike_price(
             spot=spot,
@@ -558,10 +685,10 @@ def _scan_collars(holdings: list, settings: dict, dte: int) -> list:
             target_delta=target_delta_call,
             iv=iv,
             dte=dte,
-            step=STOCK_STRIKE_STEP,
+            step=step,
         )
         if call_strike <= spot:
-            call_strike = _round_to_step(spot * (1 + 0.03), STOCK_STRIKE_STEP)
+            call_strike = _round_to_step(spot * (1 + 0.03), step)
 
         # Buy OTM put
         put_strike = select_strike_price(
@@ -570,10 +697,10 @@ def _scan_collars(holdings: list, settings: dict, dte: int) -> list:
             target_delta=target_delta_put,
             iv=iv,
             dte=dte,
-            step=STOCK_STRIKE_STEP,
+            step=step,
         )
         if put_strike >= spot:
-            put_strike = _round_to_step(spot * (1 - 0.03), STOCK_STRIKE_STEP)
+            put_strike = _round_to_step(spot * (1 - 0.03), step)
 
         call_greeks = compute_greeks(spot, call_strike, T, RISK_FREE_RATE, iv, "CE")
         put_greeks = compute_greeks(spot, put_strike, T, RISK_FREE_RATE, iv, "PE")
@@ -614,10 +741,10 @@ def _scan_collars(holdings: list, settings: dict, dte: int) -> list:
             option_type="CE",
             iv=iv,
             dte=dte,
-            step=STOCK_STRIKE_STEP,
+            step=step,
         )
 
-        recs.append({
+        recs.append(_add_frontend_aliases({
             "id": generate_id(),
             "rank": 0,
             "symbol": symbol,
@@ -644,7 +771,7 @@ def _scan_collars(holdings: list, settings: dict, dte: int) -> list:
             "put_strike": put_strike,
             "net_cost_per_unit": round(net_cost, 2),
             "unrealized_gain_pct": round(gain_pct * 100, 1),
-        })
+        }))
 
     return recs
 

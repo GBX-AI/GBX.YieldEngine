@@ -842,18 +842,24 @@ def create_app():
             "scanned_at": state["last_scan"],
         })
 
-    @app.route("/api/recommendations", methods=["GET"])
+    @app.route("/api/recommendations", methods=["GET", "POST"])
     def api_recommendations():
-        safety = request.args.get("safety")
-        strategy = request.args.get("type")
+        # Support both GET params and POST JSON body for filters
+        if request.method == "POST":
+            data = request.json or {}
+            safety = data.get("safety")
+            strategy = data.get("strategy") or data.get("type")
+        else:
+            safety = request.args.get("safety")
+            strategy = request.args.get("type")
 
         recs = state["recommendations"]
         if safety and safety != "ALL":
-            recs = [r for r in recs if r.get("safety_tag") == safety]
+            recs = [r for r in recs if r.get("safety_tag") == safety or r.get("safety") == safety]
         if strategy and strategy != "ALL":
-            recs = [r for r in recs if r.get("strategy_type") == strategy]
+            recs = [r for r in recs if r.get("strategy_type") == strategy or r.get("strategy") == strategy]
 
-        return jsonify(recs)
+        return jsonify({"recommendations": recs})
 
     @app.route("/api/arbitrage", methods=["GET"])
     def api_arbitrage():
