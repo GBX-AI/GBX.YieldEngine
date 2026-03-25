@@ -136,10 +136,11 @@ def create_app():
 
     @app.route("/api/holdings", methods=["GET"])
     def api_holdings():
+        summary = _compute_portfolio_summary()
         return jsonify({
-            "holdings": get_all_holdings(),
+            "holdings": summary["holdings"],  # enriched with value, pnl, status
             "cash_balance": get_cash_balance(),
-            "summary": _compute_portfolio_summary(),
+            "summary": summary,
         })
 
     @app.route("/api/import/json", methods=["POST"])
@@ -1103,6 +1104,12 @@ def _compute_portfolio_summary():
     holdings = get_all_holdings()
     cash = get_cash_balance()
 
+    # Fetch live prices for all symbols
+    symbols = [h["symbol"] for h in holdings]
+    live_prices = {}
+    if symbols:
+        live_prices = live_price_service.fetch_spot_prices_batch(symbols)
+
     total_value = 0
     non_cash_collateral = 0
     detailed = []
@@ -1110,8 +1117,16 @@ def _compute_portfolio_summary():
     for h in holdings:
         symbol = h["symbol"]
         qty = h["qty"]
-        ltp = h.get("ltp", h["avgPrice"])
         avg = h["avgPrice"]
+
+        # Use live price if available, else stored LTP, else avgPrice
+        live = live_prices.get(symbol)
+        if live:
+            ltp = live["ltp"]
+            price_source = "yahoo"
+        else:
+            ltp = h.get("ltp", avg)
+            price_source = "simulated"
         value = qty * ltp
         pnl = (ltp - avg) * qty
 
@@ -1135,13 +1150,18 @@ def _compute_portfolio_summary():
 
         detailed.append({
             **h,
+            # Canonical names (backend)
             "ltp": ltp,
             "value": round(value, 2),
             "pnl": round(pnl, 2),
-            "haircut": haircut,
-            "collateral": round(collateral, 2),
+            "haircut": round(haircut * 100, 1),  # as percentage for display
+            "collateral_value": round(collateral, 2),
             "lot_size": lot_size,
             "status": status,
+            # Frontend-compatible aliases
+            "quantity": qty,
+            "average_price": avg,
+            "price_source": price_source,
         })
 
         total_value += value

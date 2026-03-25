@@ -64,12 +64,12 @@ const inputStyle = {
 
 /* ─── Formatting helpers ─── */
 const fmt = (n) => {
-  if (n == null) return '—';
+  if (n == null || Number.isNaN(Number(n))) return '—';
   return Number(n).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 };
 
 const fmtCur = (n) => {
-  if (n == null) return '—';
+  if (n == null || Number.isNaN(Number(n))) return '—';
   return '₹' + fmt(n);
 };
 
@@ -103,7 +103,7 @@ export default function Holdings() {
       setError(null);
       const data = await getHoldings();
       setHoldings(data.holdings || []);
-      setStats(data.stats || {});
+      setStats(data.summary || {});
       if (data.cash_balance != null) setCashBalance(String(data.cash_balance));
     } catch (e) {
       setError(e.message);
@@ -233,7 +233,7 @@ export default function Holdings() {
 
   /* ─── Stat cards data ─── */
   const statCards = [
-    { label: 'Portfolio Value', value: fmtCur(stats.total_value), color: C.text },
+    { label: 'Portfolio Value', value: fmtCur(stats.portfolio_value), color: C.text },
     { label: 'Unrealized P&L', value: fmtCur(stats.unrealized_pnl), color: stats.unrealized_pnl >= 0 ? C.emerald : C.red },
     { label: 'Non-Cash Collateral', value: fmtCur(stats.non_cash_collateral), color: C.purple },
     { label: 'Cash Equivalent', value: fmtCur(stats.cash_equivalent), color: C.blue },
