@@ -74,7 +74,7 @@ const fmtPct = (n) => (n == null ? '—' : `${Number(n).toFixed(1)}%`);
 
 export default function Scanner() {
   /* ─── State ─── */
-  const [recommendations, setRecommendations] = useState([]);
+  const [allRecommendations, setAllRecommendations] = useState([]);
   const [arbitrage, setArbitrage] = useState([]);
   const [riskProfile, setRiskProfileState] = useState('MODERATE');
   const [permission, setPermission] = useState('READONLY');
@@ -112,21 +112,20 @@ export default function Scanner() {
     setScanning(true);
     setError(null);
     try {
-      await scan();
-      const filters = {};
-      if (safetyFilter !== 'ALL') filters.safety = safetyFilter;
-      if (strategyFilter !== 'ALL') filters.strategy = strategyFilter;
-      const data = await getRecommendations(filters);
-      const recs = data?.recommendations || data || [];
-      setRecommendations(recs);
-      const totalWeekly = recs.reduce((s, r) => s + (r.premium || 0), 0);
-      setSummary((prev) => ({ ...prev, weeklyIncome: totalWeekly }));
+      const scanData = await scan();
+      // Use recommendations directly from scan response (more reliable than separate call)
+      const recs = scanData?.recommendations || [];
+      const arbs = scanData?.arbitrage || [];
+      setAllRecommendations(recs);
+      setArbitrage(arbs);
+      const totalWeekly = recs.reduce((s, r) => s + (r.premium || r.premium_income || 0), 0);
+      setSummary({ weeklyIncome: totalWeekly, arbCount: arbs.length });
     } catch (e) {
       setError(e.message);
     } finally {
       setScanning(false);
     }
-  }, [safetyFilter, strategyFilter]);
+  }, []);
 
   const handleRiskChange = async (profile) => {
     try {
@@ -135,21 +134,12 @@ export default function Scanner() {
     } catch (e) { setError(e.message); }
   };
 
-  const handleFilterChange = useCallback(async () => {
-    if (recommendations.length === 0) return;
-    try {
-      const filters = {};
-      if (safetyFilter !== 'ALL') filters.safety = safetyFilter;
-      if (strategyFilter !== 'ALL') filters.strategy = strategyFilter;
-      const data = await getRecommendations(filters);
-      setRecommendations(data?.recommendations || data || []);
-    } catch (e) { setError(e.message); }
-  }, [safetyFilter, strategyFilter, recommendations.length]);
-
-  useEffect(() => {
-    if (recommendations.length > 0) handleFilterChange();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [safetyFilter, strategyFilter]);
+  // Client-side filtering (avoids stateless container issues)
+  const recommendations = allRecommendations.filter((r) => {
+    if (safetyFilter !== 'ALL' && (r.safety || r.safety_tag) !== safetyFilter) return false;
+    if (strategyFilter !== 'ALL' && (r.strategy || r.strategy_type) !== strategyFilter) return false;
+    return true;
+  });
 
   const toggleExpand = (id) => setExpandedId((prev) => (prev === id ? null : id));
 
