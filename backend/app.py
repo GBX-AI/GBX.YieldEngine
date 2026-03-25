@@ -32,6 +32,7 @@ from notification_service import create_notification as ns_create_notification
 from dry_run_validator import validate_order
 from reconciliation import reconcile_order
 from kite_service import kite_service
+import live_price_service
 
 # In-memory state (transient session data only — holdings/cash persisted in SQLite)
 state = {
@@ -65,6 +66,7 @@ def create_app():
             "kite_connected": state["access_token"] is not None,
             "holdings_count": len(get_all_holdings()),
             "simulation_mode": state["access_token"] is None,
+            "price_sources": live_price_service.get_price_source_status(),
             "timestamp": now_iso(),
         })
 

@@ -213,10 +213,14 @@ export default function Header({ permission = 'READONLY' }) {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [bellHover, setBellHover] = useState(false);
   const [simulationMode, setSimulationMode] = useState(true);
+  const [priceSources, setPriceSources] = useState(null);
   const dropdownRef = useRef(null);
 
   useEffect(() => {
-    getStatus().then((s) => setSimulationMode(s?.simulation_mode ?? true)).catch(() => {});
+    getStatus().then((s) => {
+      setSimulationMode(s?.simulation_mode ?? true);
+      setPriceSources(s?.price_sources ?? null);
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -277,11 +281,13 @@ export default function Header({ permission = 'READONLY' }) {
         <span style={styles.versionBadge}>v3</span>
         {simulationMode && (
           <span style={{
-            fontSize: 10, fontWeight: 600, color: '#fcd34d',
-            background: 'rgba(252,211,77,0.12)', borderRadius: 6,
+            fontSize: 10, fontWeight: 600,
+            color: priceSources?.spot_source === 'yahoo' ? '#6ee7b7' : '#fcd34d',
+            background: priceSources?.spot_source === 'yahoo' ? 'rgba(110,231,183,0.12)' : 'rgba(252,211,77,0.12)',
+            borderRadius: 6,
             padding: '2px 6px', letterSpacing: '0.04em',
             fontFamily: "'IBM Plex Mono', monospace",
-          }}>SIM</span>
+          }}>{priceSources?.spot_source === 'yahoo' ? 'LIVE PRICES' : 'SIM'}</span>
         )}
       </div>
 

@@ -314,6 +314,7 @@ export default function Settings() {
   const [kiteConnected, setKiteConnected] = useState(false);
   const [kiteConfigured, setKiteConfigured] = useState(false);
   const [simulationMode, setSimulationMode] = useState(true);
+  const [priceSources, setPriceSources] = useState(null);
   const [kiteLoading, setKiteLoading] = useState(false);
 
   // Local form state
@@ -342,6 +343,7 @@ export default function Settings() {
     getStatus().then((st) => {
       setSimulationMode(st?.simulation_mode ?? true);
       setKiteConnected(st?.kite_connected ?? false);
+      setPriceSources(st?.price_sources ?? null);
     }).catch(() => {});
 
     Promise.all([
@@ -515,14 +517,38 @@ export default function Settings() {
         {simulationMode && !kiteConfigured && (
           <div style={{
             padding: '14px 18px', borderRadius: 10, marginBottom: 20,
-            background: 'rgba(56,189,248,0.06)', border: '1px solid rgba(56,189,248,0.15)',
+            background: priceSources?.spot_source === 'yahoo' ? 'rgba(110,231,183,0.06)' : 'rgba(56,189,248,0.06)',
+            border: priceSources?.spot_source === 'yahoo' ? '1px solid rgba(110,231,183,0.15)' : '1px solid rgba(56,189,248,0.15)',
           }}>
-            <div style={{ fontSize: 13, color: c.blue, fontWeight: 600, marginBottom: 6 }}>Simulation Mode Active</div>
-            <div style={{ fontSize: 12, color: c.muted, lineHeight: 1.6 }}>
-              No Kite API key configured. The engine uses simulated market data to generate strategy recommendations,
-              risk alerts, and notifications. Import your holdings via CSV or manual entry to get personalized recommendations.
-              To enable live trading, configure your Kite API credentials below.
+            <div style={{ fontSize: 13, color: priceSources?.spot_source === 'yahoo' ? c.emerald : c.blue, fontWeight: 600, marginBottom: 6 }}>
+              {priceSources?.spot_source === 'yahoo' ? 'Live Prices Active' : 'Simulation Mode Active'}
             </div>
+            <div style={{ fontSize: 12, color: c.muted, lineHeight: 1.6 }}>
+              {priceSources?.spot_source === 'yahoo' ? (
+                <>
+                  No Kite broker connected, but <strong>live market prices</strong> are active via Yahoo Finance
+                  {priceSources?.option_chain_source === 'nse' ? ' and NSE India' : ''}.
+                  Spot prices, holdings valuations, and option chains use real market data.
+                  To enable live order execution, configure your Kite API credentials below.
+                </>
+              ) : (
+                <>
+                  No Kite API key configured. The engine uses simulated market data to generate strategy recommendations,
+                  risk alerts, and notifications. Import your holdings via CSV or manual entry to get personalized recommendations.
+                  To enable live trading, configure your Kite API credentials below.
+                </>
+              )}
+            </div>
+            {priceSources && (
+              <div style={{ marginTop: 10, display: 'flex', gap: 12, fontSize: 11, fontFamily: "'IBM Plex Mono', monospace" }}>
+                <span style={{ color: priceSources.spot_source === 'yahoo' ? c.emerald : c.muted }}>
+                  Spot: {priceSources.spot_source === 'yahoo' ? 'Yahoo Finance' : 'Simulated'}
+                </span>
+                <span style={{ color: priceSources.option_chain_source === 'nse' ? c.emerald : c.muted }}>
+                  Options: {priceSources.option_chain_source === 'nse' ? 'NSE India' : 'Black-Scholes'}
+                </span>
+              </div>
+            )}
           </div>
         )}
 

@@ -26,6 +26,7 @@ from models import (
     SIMULATION_INDICES,
 )
 from black_scholes import option_price, compute_greeks, RISK_FREE_RATE
+import live_price_service
 
 logger = logging.getLogger(__name__)
 
@@ -602,12 +603,28 @@ class KiteService:
         return round(value * (1 + random.uniform(-pct, pct)), 2)
 
     def _simulated_holdings(self) -> list[dict]:
-        """Generate simulated holdings from SIMULATION_STOCKS."""
+        """Generate simulated holdings, using live prices where available."""
+        # Batch fetch live prices for all simulation stocks
+        live_prices = live_price_service.fetch_spot_prices_batch(list(SIMULATION_STOCKS.keys()))
+
         holdings = []
         for symbol, data in SIMULATION_STOCKS.items():
+            live = live_prices.get(symbol)
+            if live:
+                ltp = live["ltp"]
+                close_price = live["close"]
+                day_change = round(ltp - close_price, 2)
+                day_change_pct = round((ltp - close_price) / close_price * 100, 2) if close_price else 0
+                source = "yahoo"
+            else:
+                ltp = self._jitter(data["ltp"])
+                close_price = self._jitter(data["ltp"], 0.005)
+                day_change = round(random.uniform(-2.5, 2.5), 2)
+                day_change_pct = round(random.uniform(-1.5, 1.5), 2)
+                source = "simulated"
+
             avg_price = self._jitter(data["ltp"], 0.08)  # bought at +/- 8%
             qty = data["lotSize"]
-            ltp = self._jitter(data["ltp"])
             holdings.append({
                 "tradingsymbol": symbol,
                 "exchange": "NSE",
@@ -616,26 +633,47 @@ class KiteService:
                 "average_price": avg_price,
                 "last_price": ltp,
                 "pnl": round((ltp - avg_price) * qty, 2),
-                "day_change": round(random.uniform(-2.5, 2.5), 2),
-                "day_change_percentage": round(random.uniform(-1.5, 1.5), 2),
+                "day_change": day_change,
+                "day_change_percentage": day_change_pct,
                 "collateral_quantity": qty,
                 "collateral_type": "margin",
                 "t1_quantity": 0,
-                "close_price": self._jitter(data["ltp"], 0.005),
+                "close_price": close_price,
                 "used_quantity": 0,
-                "simulated": True,
+                "price_source": source,
             })
         return holdings
 
     def _simulated_quotes(self, instruments: list[str]) -> dict:
-        """Generate simulated quote data."""
+        """Fetch live quotes where possible, fall back to simulated data."""
         quotes = {}
         for inst in instruments:
             parts = inst.split(":")
             symbol = parts[1] if len(parts) > 1 else parts[0]
             symbol_clean = symbol.replace(" ", "").upper()
 
-            # Check stocks first, then indices
+            # Try live quote first
+            live = live_price_service.get_live_quote(symbol_clean)
+            if live is not None:
+                ltp = live["ltp"]
+                quotes[inst] = {
+                    "instrument_token": abs(hash(symbol)) % 10000000,
+                    "last_price": ltp,
+                    "ohlc": {
+                        "open": live["open"],
+                        "high": live["high"],
+                        "low": live["low"],
+                        "close": live["close"],
+                    },
+                    "volume": live["volume"],
+                    "oi": 0,
+                    "depth": {"buy": [], "sell": []},
+                    "change": round(ltp - live["close"], 2),
+                    "price_source": "yahoo",
+                }
+                continue
+
+            # Fallback to hardcoded jitter
             if symbol_clean in SIMULATION_STOCKS:
                 data = SIMULATION_STOCKS[symbol_clean]
                 ltp = self._jitter(data["ltp"])
@@ -662,18 +700,29 @@ class KiteService:
                 "oi": random.randint(10000, 500000),
                 "depth": {"buy": [], "sell": []},
                 "change": round(random.uniform(-30, 30), 2),
-                "simulated": True,
+                "price_source": "simulated",
             }
         return quotes
 
     def _simulated_ltp(self, instruments: list[str]) -> dict:
-        """Generate simulated last traded prices."""
+        """Fetch live LTP where possible, fall back to simulated jitter."""
         result = {}
         for inst in instruments:
             parts = inst.split(":")
             symbol = parts[1] if len(parts) > 1 else parts[0]
             symbol_clean = symbol.replace(" ", "").upper()
 
+            # Try live price first
+            live = live_price_service.get_live_spot(symbol_clean)
+            if live is not None:
+                result[inst] = {
+                    "instrument_token": abs(hash(symbol)) % 10000000,
+                    "last_price": live,
+                    "price_source": "yahoo",
+                }
+                continue
+
+            # Fallback to hardcoded jitter
             if symbol_clean in SIMULATION_STOCKS:
                 ltp = self._jitter(SIMULATION_STOCKS[symbol_clean]["ltp"])
             elif symbol_clean in ("NIFTY50", "NIFTY"):
@@ -686,7 +735,7 @@ class KiteService:
             result[inst] = {
                 "instrument_token": abs(hash(symbol)) % 10000000,
                 "last_price": ltp,
-                "simulated": True,
+                "price_source": "simulated",
             }
         return result
 
@@ -728,32 +777,64 @@ class KiteService:
         num_strikes: int = 10,
     ) -> dict:
         """
-        Generate a realistic option chain using Black-Scholes pricing.
+        Get option chain — tries NSE live data first, then generates
+        a realistic chain using Black-Scholes with live spot from Yahoo.
 
         Returns a dict with:
-            - symbol, spot, expiry, dte
+            - symbol, spot, expiry, dte, price_source
             - strikes: list of {strike, CE: {premium, greeks...}, PE: {premium, greeks...}}
         """
         symbol_upper = symbol.upper()
 
-        # Determine spot price and IV
+        # ── Try NSE live option chain first ──
+        nse_chain = live_price_service.get_live_option_chain(symbol_upper, expiry, num_strikes)
+        if nse_chain and nse_chain.get("strikes"):
+            # Enrich with Greeks (NSE doesn't provide them)
+            spot = nse_chain["spot"]
+            dte = nse_chain["dte"]
+            T = dte / 365.0
+            for strike_row in nse_chain["strikes"]:
+                strike = strike_row["strike"]
+                for opt_type in ("CE", "PE"):
+                    opt = strike_row.get(opt_type)
+                    if not opt:
+                        continue
+                    iv_decimal = opt.get("iv", 0) / 100.0 if opt.get("iv", 0) > 0 else 0.20
+                    greeks = compute_greeks(spot, strike, T, RISK_FREE_RATE, iv_decimal, opt_type)
+                    opt["greeks"] = {
+                        "delta": round(greeks["delta"], 4),
+                        "gamma": round(greeks["gamma"], 6),
+                        "theta": round(greeks["theta"], 4),
+                        "vega": round(greeks["vega"], 4),
+                    }
+                    opt["prob_otm"] = round(greeks["prob_otm"], 4)
+            logger.info("Using NSE live option chain for %s (%d strikes)", symbol_upper, len(nse_chain["strikes"]))
+            return nse_chain
+
+        # ── Fallback: Black-Scholes generation with live spot ──
+
+        # Try live spot price from Yahoo
+        live_spot = live_price_service.get_live_spot(symbol_upper)
+        spot_source = "yahoo" if live_spot else "simulated"
+
+        # Determine spot price, IV, lot size
         if symbol_upper in SIMULATION_STOCKS:
             data = SIMULATION_STOCKS[symbol_upper]
-            spot = self._jitter(data["ltp"])
+            spot = live_spot if live_spot else self._jitter(data["ltp"])
             base_iv = data["iv"]
             lot_size = data["lotSize"]
             strike_gap = self._compute_strike_gap(spot, is_index=False)
         elif symbol_upper in SIMULATION_INDICES:
             data = SIMULATION_INDICES[symbol_upper]
-            spot = self._jitter(data["spot"])
+            spot = live_spot if live_spot else self._jitter(data["spot"])
             base_iv = data["iv"]
             lot_size = data["lotSize"]
             strike_gap = self._compute_strike_gap(spot, is_index=True)
         else:
-            spot = 1000.0
+            spot = live_spot if live_spot else 1000.0
             base_iv = 0.25
             lot_size = 100
-            strike_gap = 50
+            strike_gap = self._compute_strike_gap(spot, is_index=False)
 
         # Determine expiry and DTE
         if expiry:
@@ -822,7 +903,7 @@ class KiteService:
                         "vega": round(ce_greeks["vega"], 4),
                     },
                     "prob_otm": round(ce_greeks["prob_otm"], 4),
-                    "simulated": True,
+                    "price_source": spot_source,
                 },
                 "PE": {
                     "tradingsymbol": f"{symbol_upper}{expiry_date.strftime('%y%b').upper()}{int(strike)}PE",
@@ -840,7 +921,7 @@ class KiteService:
                         "vega": round(pe_greeks["vega"], 4),
                     },
                     "prob_otm": round(pe_greeks["prob_otm"], 4),
-                    "simulated": True,
+                    "price_source": spot_source,
                 },
             })
 
@@ -853,7 +934,7 @@ class KiteService:
             "strike_gap": strike_gap,
             "atm_strike": atm_strike,
             "strikes": strikes_data,
-            "simulated": True,
+            "price_source": spot_source,
         }
 
     def _live_option_chain(
