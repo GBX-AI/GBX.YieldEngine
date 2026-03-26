@@ -8,10 +8,14 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-logger = logging.getLogger("gunicorn.error")
-if not logger.handlers:
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO)
+import sys
+
+def _log(msg, *args):
+    if args:
+        msg = msg % args
+    print(f"[EMAIL] {msg}", file=sys.stderr, flush=True)
+
+logger = logging.getLogger(__name__)
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -23,7 +27,7 @@ FROM_NAME = os.getenv("SMTP_FROM_NAME", "Yield Engine")
 def send_reset_email(to_email: str, reset_url: str, user_name: str = "") -> bool:
     """Send a password reset email. Returns True on success."""
     if not SMTP_USER or not SMTP_PASSWORD:
-        logger.error("SMTP credentials not configured")
+        _log("SMTP credentials not configured")
         return False
 
     subject = "Reset your Yield Engine password"
@@ -74,20 +78,20 @@ This link expires in 1 hour. If you didn't request this, ignore this email.
         msg.attach(MIMEText(text_body, "plain"))
         msg.attach(MIMEText(html_body, "html"))
 
-        logger.info("SMTP: connecting to %s:%s as %s", SMTP_HOST, SMTP_PORT, SMTP_USER)
+        _log("SMTP: connecting to %s:%s as %s", SMTP_HOST, SMTP_PORT, SMTP_USER)
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
             server.starttls()
-            logger.info("SMTP: TLS established, logging in...")
+            _log("SMTP: TLS established, logging in...")
             server.login(SMTP_USER, SMTP_PASSWORD)
-            logger.info("SMTP: authenticated, sending to %s...", to_email)
+            _log("SMTP: authenticated, sending to %s...", to_email)
             server.send_message(msg)
 
-        logger.info("SMTP: email sent successfully to %s", to_email)
+        _log("SMTP: email sent successfully to %s", to_email)
         return True
 
     except smtplib.SMTPAuthenticationError as exc:
-        logger.error("SMTP AUTH FAILED for %s: %s", SMTP_USER, exc)
+        _log("SMTP AUTH FAILED for %s: %s", SMTP_USER, exc)
         return False
     except Exception as exc:
-        logger.error("SMTP: failed to send to %s: %s (%s)", to_email, type(exc).__name__, exc)
+        _log("SMTP: failed to send to %s: %s (%s)", to_email, type(exc).__name__, exc)
         return False

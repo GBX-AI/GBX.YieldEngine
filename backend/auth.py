@@ -20,10 +20,13 @@ from models import (
 )
 from email_service import send_reset_email
 
-logger = logging.getLogger("gunicorn.error")
-if not logger.handlers:
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO)
+import sys
+
+def _log(msg, *args):
+    """Print to stderr so gunicorn captures it."""
+    if args:
+        msg = msg % args
+    print(f"[AUTH] {msg}", file=sys.stderr, flush=True)
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
@@ -97,7 +100,7 @@ def signup():
     email = (data.get("email") or "").strip().lower()
     name = (data.get("name") or "").strip()
     password = data.get("password", "")
-    logger.info("Signup attempt: %s", email)
+    _log("Signup attempt: %s", email)
 
     if not email or not name or not password:
         return jsonify({"error": "Email, name, and password are required"}), 400
@@ -106,12 +109,12 @@ def signup():
 
     existing = get_user_by_email(email)
     if existing:
-        logger.warning("Signup failed: email already registered: %s", email)
+        _log("Signup failed: email already registered: %s", email)
         return jsonify({"error": "Email already registered"}), 409
 
     password_hash = _bcrypt.hashpw(password.encode("utf-8"), _bcrypt.gensalt()).decode("utf-8")
     user = create_user(email, name, password_hash)
-    logger.info("User created: %s (id: %s)", email, user["id"])
+    _log("User created: %s (id: %s)", email, user["id"])
 
     tokens = _create_tokens(user["id"], user["email"])
     return jsonify({
@@ -125,27 +128,27 @@ def login():
     data = request.json or {}
     email = (data.get("email") or "").strip().lower()
     password = data.get("password", "")
-    logger.info("Login attempt: %s", email)
+    _log("Login attempt: %s", email)
 
     if not email or not password:
         return jsonify({"error": "Email and password are required"}), 400
 
     user = get_user_by_email(email)
     if not user:
-        logger.warning("Login failed: email not found: %s", email)
+        _log("Login failed: email not found: %s", email)
         return jsonify({"error": "Invalid email or password"}), 401
 
     try:
         pw_ok = _bcrypt.checkpw(password.encode("utf-8"), user["password_hash"].encode("utf-8"))
     except Exception as exc:
-        logger.error("Login bcrypt error for %s: %s (hash prefix: %s)", email, exc, user["password_hash"][:10])
+        _log("Login bcrypt error for %s: %s (hash prefix: %s)", email, exc, user["password_hash"][:10])
         return jsonify({"error": "Invalid email or password"}), 401
 
     if not pw_ok:
-        logger.warning("Login failed: wrong password for %s", email)
+        _log("Login failed: wrong password for %s", email)
         return jsonify({"error": "Invalid email or password"}), 401
 
-    logger.info("Login successful: %s", email)
+    _log("Login successful: %s", email)
     tokens = _create_tokens(user["id"], user["email"])
     return jsonify({
         "user": {"id": user["id"], "email": user["email"], "name": user["name"]},
@@ -215,7 +218,7 @@ def forgot_password():
     # Always return success (don't reveal if email exists)
     user = get_user_by_email(email)
     if user:
-        logger.info("Forgot password: generating reset token for %s", email)
+        _log("Forgot password: generating reset token for %s", email)
         raw_token = secrets.token_urlsafe(48)
         token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
         expires_at = (datetime.utcnow() + timedelta(hours=1)).isoformat()
@@ -223,14 +226,14 @@ def forgot_password():
         create_reset_token(user["id"], token_hash, expires_at)
 
         reset_url = f"{FRONTEND_URL}/reset-password?token={raw_token}"
-        logger.info("Forgot password: sending email to %s, reset URL generated", email)
+        _log("Forgot password: sending email to %s, reset URL generated", email)
         email_sent = send_reset_email(user["email"], reset_url, user.get("name", ""))
         if not email_sent:
-            logger.error("Forgot password: FAILED to send email to %s", email)
+            _log("Forgot password: FAILED to send email to %s", email)
         else:
-            logger.info("Forgot password: email sent successfully to %s", email)
+            _log("Forgot password: email sent successfully to %s", email)
     else:
-        logger.info("Forgot password: no account found for %s (not revealing to client)", email)
+        _log("Forgot password: no account found for %s (not revealing to client)", email)
 
     return jsonify({"message": "If an account exists with that email, a reset link has been sent."})
 
