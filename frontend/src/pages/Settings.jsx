@@ -378,7 +378,8 @@ export default function Settings() {
         setAutoGtt(sett.auto_gtt ?? false);
         setCloseItm(sett.close_itm_before_expiry ?? false);
         setIntradayDrop(sett.intraday_drop_pct ?? '');
-        setAllowedStrategies(sett.allowed_strategies ?? []);
+        const strats = sett.allowed_strategies;
+        setAllowedStrategies(Array.isArray(strats) ? strats : typeof strats === 'string' ? strats.split(',').map(s => s.trim()) : []);
         const notifState = {};
         NOTIFICATION_TYPES.forEach(({ key }) => {
           notifState[key] = sett.notifications?.[key] ?? true;
@@ -390,7 +391,7 @@ export default function Settings() {
         setProfile(rp.profile ?? rp.name ?? 'moderate');
       }
       setLoading(false);
-    });
+    }).catch(() => setLoading(false));
   }, []);
 
   const handleSaveKiteCredentials = async () => {
