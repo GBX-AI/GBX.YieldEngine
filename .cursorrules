@@ -1,0 +1,345 @@
+# GBX Yield Engine - Cursor Rules & Conventions
+
+## What is Yield Engine?
+Portfolio income system for Indian F&O (Futures & Options) markets. Scans option strategies (covered calls, cash-secured puts, credit spreads, collars), detects arbitrage, monitors risk, tracks trades & P&L. Zerodha Kite for live trading, simulation fallback with Yahoo Finance + NSE.
+
+## Critical Rules
+
+### DO NOT BUILD unless explicitly asked
+- Never run `docker-compose build`, `npm run build`, or `pip install` automatically.
+- Complete ALL requested changes first, then ask: "Should I build/deploy?"
+
+### Always read before modifying
+- Read the file first — understand existing patterns before making changes.
+- Check data flow: API endpoint (app.py) → service module → models.py → SQLite.
+
+### Keep rules files up to date
+- When creating new files, endpoints, services, or pages — update both `CLAUDE.md` and `.cursorrules`.
+- If a new backend service module is added, add it to the Project Registry.
+- If a new API endpoint is added, add it to the API Endpoints section.
+- If a new frontend page is added, add it to the Frontend Pages section.
+
+### Reuse before creating
+- Check existing service modules before creating new ones.
+- Check `frontend/src/api.js` for existing API functions before adding new ones.
+- Check `models.py` for existing DB helper functions.
+
+---
+
+## Tech Stack
+
+- **Backend**: Python 3.12, Flask 3.1, Gunicorn (1 worker, 4 threads)
+- **Frontend**: React 18.3, Vite 6, React Router 6.28, Recharts 2.15, Lucide React
+- **Database**: SQLite (file-based, `data/yield_engine.db`)
+- **Broker**: Zerodha Kite Connect 5.0 + pyotp (TOTP auto-login)
+- **Market Data**: Yahoo Finance (yfinance) + NSE India API
+- **Options Pricing**: Black-Scholes (custom `black_scholes.py`)
+- **Scheduling**: APScheduler 3.10 (IST timezone)
+- **Deploy**: Docker multi-stage → GHCR → Azure Container Apps (Central India)
+
+---
+
+## Project Structure
+
+```
+GBX.YieldEngine/
+├── backend/
+│   ├── app.py                  # Flask app factory + ALL API routes (~1240 lines)
+│   ├── models.py               # SQLite DB schema, settings, holdings CRUD
+│   ├── kite_service.py         # Zerodha Kite integration + TOTP auto-login
+│   ├── live_price_service.py   # Yahoo Finance + NSE API prices (cached)
+│   ├── strategy_engine.py      # 4 option strategies scanner
+│   ├── arbitrage_scanner.py    # Cash-futures arbitrage
+│   ├── risk_manager.py         # Position monitoring, alerts, adjustments
+│   ├── trade_tracker.py        # P&L tracking
+│   ├── scheduler.py            # APScheduler jobs (IST)
+│   ├── black_scholes.py        # Option pricing + Greeks
+│   ├── strike_selector.py      # Strike selection by risk profile
+│   ├── fee_calculator.py       # Zerodha brokerage + STT
+│   ├── notification_service.py # Create notifications
+│   ├── dry_run_validator.py    # Pre-order validation
+│   ├── reconciliation.py       # Post-order reconciliation
+│   ├── gunicorn.conf.py        # Single worker config (SQLite on SMB)
+│   ├── requirements.txt        # Python dependencies
+│   └── Dockerfile              # Multi-stage: build + runtime
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx             # Router + navigation layout
+│   │   ├── api.js              # Fetch wrapper + ALL endpoint definitions
+│   │   ├── main.jsx            # React entry point
+│   │   ├── pages/              # 9 pages (Dashboard, Holdings, Scanner, etc.)
+│   │   └── components/         # Header, PermissionGate, OrderConfirmation
+│   ├── package.json
+│   ├── vite.config.js          # Dev proxy → localhost:8000
+│   ├── nginx.conf              # SPA fallback (port 3000)
+│   └── Dockerfile              # Node build + Nginx runtime
+├── deploy/
+│   ├── azure-setup.sh          # One-time GHCR registry config
+│   └── azure-deploy.sh         # Manual deploy script
+├── .github/workflows/
+│   └── deploy.yml              # CI/CD: GHCR build → Azure Container Apps
+├── docker-compose.yml          # Local dev
+├── CLAUDE.md                   # Detailed project rules (Claude Code)
+└── .cursorrules                # This file (Cursor IDE)
+```
+
+---
+
+## Backend Code Patterns
+
+### Python Style
+- **No ORM** — raw SQL with `sqlite3`, always use parameterized queries (`?` placeholders)
+- **UUIDs** for all primary keys: `uuid.uuid4()`
+- **Monetary values**: `float` with `round(x, 2)` (SQLite REAL)
+- **DB access**: Always use `get_db()` → returns shared `_SharedConnection`
+- Call `conn.close()` after use (it's a no-op — shared connection stays alive)
+- **Imports order**: stdlib → third-party → local modules
+- **IST timezone**: All scheduler jobs use `Asia/Kolkata`
+
+### SQLite on Azure File Share (SMB) — CRITICAL
+- **Single gunicorn worker**: Multiple workers break SQLite file locking on SMB
+- **Shared connection**: `_SharedConnection` wrapper — `close()` is a no-op
+- **journal_mode=DELETE**: WAL mode does NOT work on SMB mounts
+- **busy_timeout=10000**: Handle lock contention
+- **Individual execute()**: NEVER use `executescript()` — it ignores busy_timeout
+- **Global lock**: `_db_lock` serializes DB access across threads
+
+### Adding a New API Endpoint
+1. Add the route in `app.py` inside `create_app()` function
+2. If it needs a new service, create a separate module (e.g., `new_service.py`)
+3. If it needs new DB tables, add CREATE TABLE to `_CREATE_TABLE_STMTS` in `models.py`
+4. Update `CLAUDE.md` and `.cursorrules` Project Registry
+
+### Adding a New Service Module
+1. Create `backend/new_service.py`
+2. Import it in `app.py`
+3. Add routes that call the service
+4. Update the Project Registry in both rule files
+
+---
+
+## Frontend Code Patterns
+
+### React (JSX, NOT TypeScript)
+- All components are `.jsx` files
+- Functional components with hooks
+- **API calls**: Always go through `src/api.js` — never use `fetch()` directly
+- **Routing**: React Router v6 with BrowserRouter in `App.jsx`
+- **Charts**: Recharts only
+- **Icons**: Lucide React only
+- **Styling**: Inline styles (no CSS framework, no Tailwind)
+
+### Adding a New Page
+1. Create `frontend/src/pages/NewPage.jsx`
+2. Add route in `App.jsx`
+3. Add navigation link in `components/Header.jsx`
+4. Add API functions in `api.js` if needed
+5. Update the Project Registry
+
+### API Integration Pattern
+```jsx
+// In api.js — define the endpoint
+export const fetchSomething = () => apiFetch('/api/something');
+
+// In the page component — use it
+const [data, setData] = useState(null);
+useEffect(() => {
+    fetchSomething().then(setData);
+}, []);
+```
+
+---
+
+## Frontend Pages
+
+| Page | Route | Purpose |
+|------|-------|---------|
+| `Dashboard.jsx` | `/` | Portfolio overview, P&L summary |
+| `Holdings.jsx` | `/holdings` | Holdings management, CSV/JSON import |
+| `Scanner.jsx` | `/scanner` | Strategy + arbitrage scanner |
+| `Positions.jsx` | `/positions` | Active positions, close/roll |
+| `TradeLog.jsx` | `/trades` | Trade history |
+| `Analytics.jsx` | `/analytics` | P&L charts, strategy breakdown |
+| `RiskMonitor.jsx` | `/risk` | Risk metrics, alerts |
+| `Arbitrage.jsx` | `/arbitrage` | Arbitrage opportunities |
+| `Settings.jsx` | `/settings` | App configuration, Kite login |
+
+---
+
+## API Endpoints Reference
+
+### Core
+- `GET /api/status` — Health + Kite connection + simulation mode
+- `GET/POST /api/permission` — READONLY / EXECUTE toggle
+
+### Holdings & Portfolio
+- `GET /api/holdings` — All holdings with live prices + summary
+- `POST /api/import/csv/detect` — Auto-detect CSV columns
+- `POST /api/import/csv` — Import CSV with column mapping
+- `POST /api/import/json` — Import JSON holdings
+- `POST /api/import/manual` — Add single holding
+- `POST /api/import/kite` — Fetch from Kite API
+- `DELETE /api/holdings/:symbol` — Delete holding
+- `GET/POST /api/portfolios` — List/save portfolio snapshots
+- `POST /api/portfolios/:id/load` — Load snapshot
+- `DELETE /api/portfolios/:id` — Delete snapshot
+- `GET /api/collateral` — Collateral + margin summary
+
+### Scanner & Execution
+- `POST /api/scan` — Run strategy + arbitrage scanner
+- `GET/POST /api/recommendations` — Filter scan results
+- `GET /api/arbitrage` — Arbitrage opportunities
+- `POST /api/execute` — Place order (requires EXECUTE mode)
+
+### Positions & Trades
+- `GET /api/positions` — Active positions
+- `POST /api/positions/:id/close` — Close position
+- `POST /api/positions/:id/roll` — Roll to next expiry
+- `GET /api/positions/:id/adjustments` — Adjustment suggestions
+- `POST /api/positions/:id/adjust` — Execute adjustment
+- `GET /api/trades` — Trade history (filterable)
+- `GET /api/trades/:id` — Single trade detail
+
+### Analytics
+- `GET /api/analytics/summary` — P&L stats
+- `GET /api/analytics/strategy` — By strategy breakdown
+- `GET /api/analytics/monthly` — Monthly P&L (12 months)
+- `GET /api/analytics/daily` — Daily P&L by date range
+
+### Settings & Config
+- `GET/POST /api/settings` — All settings CRUD
+- `GET/POST /api/settings/risk-profile` — Risk profile
+- `POST /api/settings/circuit-breaker` — Circuit breaker toggle
+- `GET /api/safety/caps` — Hard safety limits (read-only)
+
+### Notifications
+- `GET /api/notifications` — Paginated notifications
+- `GET /api/notifications/unread-count` — Unread count
+- `POST /api/notifications/:id/read` — Mark read
+- `POST /api/notifications/read-all` — Mark all read
+- `DELETE /api/notifications/:id` — Delete
+
+### Risk & Fees
+- `GET /api/risk/status` — Risk metrics
+- `GET /api/risk/alerts` — Risk alerts
+- `GET /api/fees/estimate` — Fee calculation
+- `GET /api/fees/summary` — Fee history
+
+### Auth & Kite
+- `GET /api/kite/login` — Login URL + auth status
+- `GET /api/callback` — OAuth callback
+- `POST /api/kite/auto-login` — Trigger TOTP auto-login
+
+### Audit & GTT
+- `GET /api/audit/orders` — Order audit log
+- `GET /api/gtt/active` — Active GTT orders
+- `DELETE /api/gtt/:id` — Cancel GTT
+
+### Daily Summary
+- `GET /api/daily-summary` — Today's summary
+- `GET /api/daily-summary/:date` — Summary by date
+
+---
+
+## Database Schema (10 tables in models.py)
+
+| Table | PK | Purpose |
+|-------|-----|---------|
+| `trades` | `id` UUID | Trade entries/exits, P&L, strategy, fees |
+| `positions` | `id` UUID | Active options, Greeks, margin, expiry |
+| `holdings` | `symbol` TEXT | Stock holdings (qty, avg_price, ltp) |
+| `portfolio_snapshots` | `id` UUID | Saved portfolio snapshots |
+| `notifications` | `id` UUID | System notifications |
+| `daily_summary` | `date` TEXT | Daily aggregates |
+| `settings` | `key` TEXT | Key-value config store |
+| `order_audit` | `id` UUID | Order placement history |
+| `gtt_orders` | `id` UUID | GTT stop-loss orders |
+| `adjustments` | `id` UUID | Position adjustment history |
+
+---
+
+## Environment Variables
+
+### Backend (set in Azure Container App or .env)
+```
+KITE_API_KEY, KITE_API_SECRET, KITE_USER_ID      # Zerodha broker
+KITE_TOTP_SECRET                                    # Auto-login TOTP seed
+SQLITE_DB_PATH          # Default: data/yield_engine.db
+PORT                     # Default: 8000
+FLASK_SECRET_KEY         # For TOTP encryption
+ENVIRONMENT              # Default: Development
+MAX_LOTS_NIFTY=2, MAX_LOTS_BANKNIFTY=1, MAX_LOTS_STOCK=2  # Safety caps
+MAX_ORDER_VALUE=500000, MAX_ORDERS_PER_DAY=20
+```
+
+### Frontend (build-time)
+```
+VITE_API_BASE            # API base URL (empty = relative URLs)
+```
+
+---
+
+## Azure Deployment
+
+### Infrastructure
+- **Resource Group**: `YieldEngine` (Central India)
+- **Backend**: `yield-engine-api` → `https://yield-engine-api.whiteocean-b818a22a.centralindia.azurecontainerapps.io`
+- **Frontend**: `yield-engine-web` → `https://yield-engine-web.whiteocean-b818a22a.centralindia.azurecontainerapps.io`
+- **Registry**: GHCR (`ghcr.io/gbx-ai/yieldengine-backend`, `ghcr.io/gbx-ai/yieldengine-frontend`)
+
+### GitHub Secrets Required
+- `AZURE_CREDENTIALS` — Service principal JSON
+- `GHCR_PAT` — GitHub PAT with `read:packages`
+- `BACKEND_FQDN` — Backend container app FQDN
+
+### Deploy Flow
+1. Push to `main` → GitHub Actions builds Docker images → pushes to GHCR
+2. Logs into Azure → sets GHCR registry → updates Container Apps
+3. Manual: `az login && bash deploy/azure-deploy.sh [TAG]`
+
+### Azure CLI Notes (Windows / Git Bash)
+- Path: `"/c/Program Files/Microsoft SDKs/Azure/CLI2/wbin/az"`
+- Use `MSYS_NO_PATHCONV=1` for az commands with `/subscriptions/...` paths
+
+---
+
+## Authentication & Security
+
+### Kite Login
+1. **Auto-Login** (06:30 IST): TOTP → OTP → Kite API → access token → SQLite
+2. **Manual**: Redirect to Kite login → callback → token exchange
+3. **Simulation**: No credentials → Yahoo Finance prices, simulated orders
+
+### Permission Model
+- **READONLY** (default): View-only
+- **EXECUTE**: Can place orders — requires double confirmation in UI
+
+### Safety Controls
+- Hard caps via env vars (NOT UI-configurable)
+- Dry-run validation before every order
+- Circuit breaker on daily loss limit
+- GTT auto-placement for stop-losses
+
+---
+
+## Field Naming Convention
+- **Frontend** (JS): camelCase — `avgPrice`, `qty`, `ltp`
+- **Backend DB** (SQL): snake_case — `avg_price`, `qty`, `ltp`
+- **API responses**: Return BOTH for compatibility (`avgPrice` + `average_price`)
+
+---
+
+## Important Warnings
+- NEVER store Kite passwords — used once and discarded
+- NEVER use `executescript()` — breaks busy_timeout on Azure SMB
+- NEVER use WAL mode — doesn't work on SMB file shares
+- ALWAYS use parameterized SQL queries — prevent injection
+- ALWAYS use `get_db()` — shared connection is required for Azure
+- NEVER run multiple gunicorn workers — SQLite can't handle it on SMB
+
+---
+
+## Git Conventions
+- Conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`
+- One logical change per commit
+- Push to `main` auto-deploys to Azure
