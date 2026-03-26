@@ -125,146 +125,90 @@ def now_iso():
     return datetime.utcnow().isoformat()
 
 
+_CREATE_TABLE_STMTS = [
+    """CREATE TABLE IF NOT EXISTS trades (
+        id TEXT PRIMARY KEY, rec_id TEXT NOT NULL, strategy_type TEXT NOT NULL,
+        symbol TEXT NOT NULL, direction TEXT NOT NULL, legs TEXT NOT NULL,
+        entry_premium REAL NOT NULL, entry_time TEXT NOT NULL,
+        exit_premium REAL, exit_time TEXT, exit_reason TEXT, pnl REAL,
+        fees REAL DEFAULT 0, margin_used REAL DEFAULT 0,
+        status TEXT DEFAULT 'OPEN', notes TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""",
+    """CREATE TABLE IF NOT EXISTS positions (
+        id TEXT PRIMARY KEY, trade_id TEXT REFERENCES trades(id),
+        symbol TEXT NOT NULL, strategy_type TEXT NOT NULL, legs TEXT NOT NULL,
+        entry_premium REAL NOT NULL, current_premium REAL, unrealized_pnl REAL,
+        days_held INTEGER DEFAULT 0, expiry_date TEXT, margin_blocked REAL DEFAULT 0,
+        last_updated TEXT, status TEXT DEFAULT 'ACTIVE'
+    )""",
+    """CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, holdings TEXT NOT NULL,
+        cash_balance REAL DEFAULT 0, total_value REAL,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""",
+    """CREATE TABLE IF NOT EXISTS notifications (
+        id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT NOT NULL,
+        message TEXT NOT NULL, severity TEXT DEFAULT 'INFO',
+        read INTEGER DEFAULT 0, action_url TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""",
+    """CREATE TABLE IF NOT EXISTS daily_summary (
+        date TEXT PRIMARY KEY, open_positions INTEGER DEFAULT 0,
+        trades_executed INTEGER DEFAULT 0, premium_collected REAL DEFAULT 0,
+        premium_paid REAL DEFAULT 0, realized_pnl REAL DEFAULT 0,
+        unrealized_pnl REAL DEFAULT 0, margin_used REAL DEFAULT 0,
+        collateral_value REAL DEFAULT 0, notes TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL,
+        updated_at TEXT DEFAULT (datetime('now'))
+    )""",
+    """CREATE TABLE IF NOT EXISTS order_audit (
+        id TEXT PRIMARY KEY, timestamp TEXT DEFAULT (datetime('now')),
+        action TEXT NOT NULL, rec_id TEXT, trade_id TEXT,
+        legs TEXT NOT NULL, dry_run_result TEXT NOT NULL,
+        kite_response TEXT, reconciliation TEXT,
+        user_confirmed INTEGER DEFAULT 0, status TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS gtt_orders (
+        id TEXT PRIMARY KEY, trade_id TEXT REFERENCES trades(id),
+        kite_gtt_id INTEGER, symbol TEXT NOT NULL, trigger_type TEXT NOT NULL,
+        trigger_price REAL NOT NULL, order_type TEXT NOT NULL,
+        limit_price REAL, quantity INTEGER NOT NULL, exchange TEXT NOT NULL,
+        status TEXT DEFAULT 'ACTIVE',
+        created_at TEXT DEFAULT (datetime('now')), triggered_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS adjustments (
+        id TEXT PRIMARY KEY, trade_id TEXT REFERENCES trades(id),
+        adjustment_type TEXT NOT NULL, old_legs TEXT NOT NULL,
+        new_legs TEXT, cost REAL NOT NULL, reason TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""",
+    """CREATE TABLE IF NOT EXISTS holdings (
+        symbol TEXT PRIMARY KEY, qty INTEGER NOT NULL,
+        avg_price REAL NOT NULL, ltp REAL,
+        updated_at TEXT DEFAULT (datetime('now'))
+    )""",
+]
+
+
 def init_db():
-    """Create all tables and insert default settings."""
+    """Create all tables and insert default settings.
+    Uses individual execute() calls instead of executescript() for
+    SMB/Azure File Share compatibility (executescript ignores busy_timeout).
+    """
     conn = get_db()
-    cursor = conn.cursor()
+    for stmt in _CREATE_TABLE_STMTS:
+        conn.execute(stmt)
 
-    cursor.executescript("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id TEXT PRIMARY KEY,
-            rec_id TEXT NOT NULL,
-            strategy_type TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            direction TEXT NOT NULL,
-            legs TEXT NOT NULL,
-            entry_premium REAL NOT NULL,
-            entry_time TEXT NOT NULL,
-            exit_premium REAL,
-            exit_time TEXT,
-            exit_reason TEXT,
-            pnl REAL,
-            fees REAL DEFAULT 0,
-            margin_used REAL DEFAULT 0,
-            status TEXT DEFAULT 'OPEN',
-            notes TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS positions (
-            id TEXT PRIMARY KEY,
-            trade_id TEXT REFERENCES trades(id),
-            symbol TEXT NOT NULL,
-            strategy_type TEXT NOT NULL,
-            legs TEXT NOT NULL,
-            entry_premium REAL NOT NULL,
-            current_premium REAL,
-            unrealized_pnl REAL,
-            days_held INTEGER DEFAULT 0,
-            expiry_date TEXT,
-            margin_blocked REAL DEFAULT 0,
-            last_updated TEXT,
-            status TEXT DEFAULT 'ACTIVE'
-        );
-
-        CREATE TABLE IF NOT EXISTS portfolio_snapshots (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            holdings TEXT NOT NULL,
-            cash_balance REAL DEFAULT 0,
-            total_value REAL,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS notifications (
-            id TEXT PRIMARY KEY,
-            type TEXT NOT NULL,
-            title TEXT NOT NULL,
-            message TEXT NOT NULL,
-            severity TEXT DEFAULT 'INFO',
-            read INTEGER DEFAULT 0,
-            action_url TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS daily_summary (
-            date TEXT PRIMARY KEY,
-            open_positions INTEGER DEFAULT 0,
-            trades_executed INTEGER DEFAULT 0,
-            premium_collected REAL DEFAULT 0,
-            premium_paid REAL DEFAULT 0,
-            realized_pnl REAL DEFAULT 0,
-            unrealized_pnl REAL DEFAULT 0,
-            margin_used REAL DEFAULT 0,
-            collateral_value REAL DEFAULT 0,
-            notes TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS order_audit (
-            id TEXT PRIMARY KEY,
-            timestamp TEXT DEFAULT (datetime('now')),
-            action TEXT NOT NULL,
-            rec_id TEXT,
-            trade_id TEXT,
-            legs TEXT NOT NULL,
-            dry_run_result TEXT NOT NULL,
-            kite_response TEXT,
-            reconciliation TEXT,
-            user_confirmed INTEGER DEFAULT 0,
-            status TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS gtt_orders (
-            id TEXT PRIMARY KEY,
-            trade_id TEXT REFERENCES trades(id),
-            kite_gtt_id INTEGER,
-            symbol TEXT NOT NULL,
-            trigger_type TEXT NOT NULL,
-            trigger_price REAL NOT NULL,
-            order_type TEXT NOT NULL,
-            limit_price REAL,
-            quantity INTEGER NOT NULL,
-            exchange TEXT NOT NULL,
-            status TEXT DEFAULT 'ACTIVE',
-            created_at TEXT DEFAULT (datetime('now')),
-            triggered_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS adjustments (
-            id TEXT PRIMARY KEY,
-            trade_id TEXT REFERENCES trades(id),
-            adjustment_type TEXT NOT NULL,
-            old_legs TEXT NOT NULL,
-            new_legs TEXT,
-            cost REAL NOT NULL,
-            reason TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS holdings (
-            symbol TEXT PRIMARY KEY,
-            qty INTEGER NOT NULL,
-            avg_price REAL NOT NULL,
-            ltp REAL,
-            updated_at TEXT DEFAULT (datetime('now'))
-        );
-    """)
-
-    # Insert default settings if not present
     for key, value in DEFAULT_SETTINGS.items():
-        cursor.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             (key, value)
         )
 
     conn.commit()
-    conn.close()
 
 
 def get_setting(key):
