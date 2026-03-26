@@ -129,6 +129,7 @@ _CREATE_TABLE_STMTS = [
     """CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
         password_hash TEXT NOT NULL,
+        kite_api_key TEXT, kite_api_secret TEXT,
         kite_access_token TEXT, kite_token_date TEXT, kite_user_id TEXT,
         created_at TEXT DEFAULT (datetime('now'))
     )""",
@@ -228,11 +229,18 @@ def _migrate_add_user_id():
         except Exception:
             pass  # Column already exists
 
-    # Settings table: change PK from (key) to (key, user_id) — recreate
+    # Settings table: add user_id
     try:
         conn.execute("ALTER TABLE settings ADD COLUMN user_id TEXT")
     except Exception:
-        pass  # Already migrated
+        pass
+
+    # Users table: add kite_api_key, kite_api_secret (for per-user Kite apps)
+    for col in ("kite_api_key", "kite_api_secret"):
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+        except Exception:
+            pass
 
     # Holdings table: need composite PK (user_id, symbol) — recreate
     try:
@@ -297,6 +305,28 @@ def get_user_by_id(user_id):
     conn = get_db()
     row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     return dict(row) if row else None
+
+
+def save_user_kite_credentials(user_id, api_key, api_secret):
+    """Store user's Kite API key and secret."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE users SET kite_api_key = ?, kite_api_secret = ? WHERE id = ?",
+        (api_key, api_secret, user_id)
+    )
+    conn.commit()
+
+
+def get_user_kite_credentials(user_id):
+    """Return user's Kite API key and secret, or None."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT kite_api_key, kite_api_secret FROM users WHERE id = ?",
+        (user_id,)
+    ).fetchone()
+    if row and row["kite_api_key"]:
+        return {"kite_api_key": row["kite_api_key"], "kite_api_secret": row["kite_api_secret"]}
+    return None
 
 
 def update_user_kite_token(user_id, access_token, token_date, kite_user_id):

@@ -812,19 +812,35 @@ def create_app():
 
     # ─── KITE AUTH ────────────────────────────────────────────────
 
+    @app.route("/api/kite/credentials", methods=["POST"])
+    @require_auth
+    def api_kite_save_credentials():
+        """Save user's Kite API key and secret."""
+        user_id = g.current_user["id"]
+        data = request.json or {}
+        api_key = (data.get("api_key") or "").strip()
+        api_secret = (data.get("api_secret") or "").strip()
+        if not api_key or not api_secret:
+            return jsonify({"error": "API key and secret are required"}), 400
+        from models import save_user_kite_credentials
+        save_user_kite_credentials(user_id, api_key, api_secret)
+        return jsonify({"status": "saved", "message": "Kite credentials saved"})
+
     @app.route("/api/kite/login", methods=["GET"])
     @require_auth
     def api_kite_login():
         user_id = g.current_user["id"]
-        login_url_val = get_login_url()
+        login_url_val = get_login_url(user_id)
         kite = get_kite_for_user(user_id)
         authenticated = kite.is_authenticated() if kite else False
+        from models import get_user_kite_credentials
+        creds = get_user_kite_credentials(user_id)
         return jsonify({
             "login_url": login_url_val,
             "authenticated": authenticated,
             "simulation_mode": not authenticated,
-            "kite_configured": bool(login_url_val),
-            "message": "Kite API not configured. Running in simulation mode." if not login_url_val else None,
+            "kite_configured": bool(creds),
+            "message": "Enter your Kite API key and secret in Settings first." if not creds else None,
         })
 
     @app.route("/api/kite/connect", methods=["POST"])
@@ -837,9 +853,11 @@ def create_app():
         if not request_token:
             return jsonify({"error": "request_token is required"}), 400
         try:
-            access_token = exchange_request_token(request_token)
-            update_user_kite_token(user_id, access_token)
-            return jsonify({"status": "connected", "message": "Kite connected successfully"})
+            result = exchange_request_token(request_token, user_id)
+            update_user_kite_token(user_id, result["access_token"],
+                                   date.today().isoformat(), result["user_id"])
+            return jsonify({"status": "connected", "kite_user_id": result["user_id"],
+                           "message": "Kite connected successfully"})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
@@ -850,15 +868,21 @@ def create_app():
         user_id = g.current_user["id"]
         kite = get_kite_for_user(user_id)
         authenticated = kite.is_authenticated() if kite else False
+        from models import get_user_kite_credentials
+        creds = get_user_kite_credentials(user_id)
+        token_data = get_user_kite_token(user_id)
         return jsonify({
             "connected": authenticated,
             "simulation_mode": not authenticated,
+            "kite_configured": bool(creds),
+            "kite_user_id": token_data.get("kite_user_id") if token_data else None,
+            "has_api_key": bool(creds),
         })
 
     @app.route("/api/kite/disconnect", methods=["POST"])
     @require_auth
     def api_kite_disconnect():
-        """Clear user's Kite token."""
+        """Clear user's Kite session token (keeps API key/secret)."""
         user_id = g.current_user["id"]
         clear_user_kite_token(user_id)
         return jsonify({"status": "disconnected", "message": "Kite disconnected"})

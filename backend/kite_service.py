@@ -17,6 +17,7 @@ from models import (
     get_db,
     generate_id,
     get_user_kite_token,
+    get_user_kite_credentials,
     SIMULATION_STOCKS,
     SIMULATION_INDICES,
 )
@@ -25,9 +26,18 @@ import live_price_service
 
 logger = logging.getLogger(__name__)
 
-# App-level Kite Connect credentials (NOT user credentials)
-KITE_API_KEY = os.getenv("KITE_API_KEY", "")
-KITE_API_SECRET = os.getenv("KITE_API_SECRET", "")
+# Fallback app-level credentials (used if no per-user credentials)
+_FALLBACK_API_KEY = os.getenv("KITE_API_KEY", "")
+_FALLBACK_API_SECRET = os.getenv("KITE_API_SECRET", "")
+
+
+def _resolve_kite_credentials(user_id: str = None) -> tuple[str, str]:
+    """Resolve Kite API key and secret: per-user first, then env fallback."""
+    if user_id:
+        creds = get_user_kite_credentials(user_id)
+        if creds:
+            return creds["kite_api_key"], creds["kite_api_secret"]
+    return _FALLBACK_API_KEY, _FALLBACK_API_SECRET
 
 
 def _log_notification(severity: str, title: str, message: str, user_id: str = None) -> None:
@@ -46,33 +56,39 @@ def _log_notification(severity: str, title: str, message: str, user_id: str = No
 
 def get_kite_for_user(user_id: str) -> "KiteService":
     """Factory: construct a KiteService for the given user, loading their token from DB."""
+    api_key, _ = _resolve_kite_credentials(user_id)
     token_data = get_user_kite_token(user_id)
     if token_data and token_data["kite_token_date"] == date.today().isoformat():
         return KiteService(
             access_token=token_data["kite_access_token"],
             kite_user_id=token_data["kite_user_id"],
+            api_key=api_key,
         )
     return KiteService()  # simulation mode
 
 
-def get_login_url() -> str | None:
-    """Return the Kite login URL for browser-based OAuth."""
-    if not KITE_API_KEY:
+def get_login_url(user_id: str = None) -> str | None:
+    """Return the Kite login URL using per-user or app-level credentials."""
+    api_key, _ = _resolve_kite_credentials(user_id)
+    if not api_key:
         return None
     try:
         from kiteconnect import KiteConnect
-        kite = KiteConnect(api_key=KITE_API_KEY)
+        kite = KiteConnect(api_key=api_key)
         return kite.login_url()
     except Exception:
-        return f"https://kite.zerodha.com/connect/login?v=3&api_key={KITE_API_KEY}"
+        return f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}"
 
 
-def exchange_request_token(request_token: str) -> dict:
-    """Exchange a Kite request_token for access_token using app credentials.
+def exchange_request_token(request_token: str, user_id: str = None) -> dict:
+    """Exchange a Kite request_token for access_token using per-user or app credentials.
     Returns {"access_token": str, "user_id": str}."""
+    api_key, api_secret = _resolve_kite_credentials(user_id)
+    if not api_key or not api_secret:
+        raise ValueError("Kite API key and secret not configured")
     from kiteconnect import KiteConnect
-    kite = KiteConnect(api_key=KITE_API_KEY)
-    data = kite.generate_session(request_token, api_secret=KITE_API_SECRET)
+    kite = KiteConnect(api_key=api_key)
+    data = kite.generate_session(request_token, api_secret=api_secret)
     return {
         "access_token": data["access_token"],
         "user_id": str(data.get("user_id", "")),
@@ -87,12 +103,13 @@ class KiteService:
     user's access_token from DB. If no token, operates in simulation mode.
     """
 
-    def __init__(self, access_token: str = None, kite_user_id: str = None):
+    def __init__(self, access_token: str = None, kite_user_id: str = None, api_key: str = None):
         self._kite = None
         self._access_token: str = access_token or ""
         self._token_date: str = date.today().isoformat() if access_token else ""
         self._simulation_mode: bool = not bool(access_token)
         self._user_id: str = kite_user_id or ""
+        self._api_key: str = api_key or _FALLBACK_API_KEY
         if access_token:
             self._setup_kite(access_token)
 
@@ -100,7 +117,7 @@ class KiteService:
         """Initialize the KiteConnect instance with a valid token."""
         try:
             from kiteconnect import KiteConnect
-            self._kite = KiteConnect(api_key=KITE_API_KEY)
+            self._kite = KiteConnect(api_key=self._api_key)
             self._kite.set_access_token(access_token)
             self._simulation_mode = False
         except Exception as exc:

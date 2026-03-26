@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { getSettings, updateSettings, getRiskProfile, setRiskProfile, kiteLogin, kiteConnect, setCircuitBreaker, getStatus } from '../api';
+import { getSettings, updateSettings, getRiskProfile, setRiskProfile, kiteLogin, kiteStatus, kiteDisconnect, kiteSaveCredentials, setCircuitBreaker, getStatus } from '../api';
 
 const c = {
   bg: '#0a0f1a',
@@ -316,11 +316,12 @@ export default function Settings() {
   const [simulationMode, setSimulationMode] = useState(true);
   const [priceSources, setPriceSources] = useState(null);
   const [kiteLoading, setKiteLoading] = useState(false);
+  const [kiteApiKey, setKiteApiKey] = useState('');
+  const [kiteApiSecret, setKiteApiSecret] = useState('');
+  const [kiteUserId, setKiteUserId] = useState('');
+  const [kiteMessage, setKiteMessage] = useState('');
 
   // Local form state
-  const [totp, setTotp] = useState('');
-  const [autoLogin, setAutoLogin] = useState(false);
-  const [userId, setUserId] = useState('');
   const [profile, setProfile] = useState('moderate');
   const [strikeMode, setStrikeMode] = useState('auto');
   const [minOtm, setMinOtm] = useState('');
@@ -346,15 +347,18 @@ export default function Settings() {
       setPriceSources(st?.price_sources ?? null);
     }).catch(() => {});
 
+    kiteStatus().then((ks) => {
+      if (ks) {
+        setKiteConfigured(!!ks.kite_configured || !!ks.has_api_key);
+        setKiteConnected(ks.connected ?? false);
+        setKiteUserId(ks.kite_user_id || '');
+      }
+    }).catch(() => {});
+
     Promise.all([
       getSettings().catch(() => null),
       getRiskProfile().catch(() => null),
-      kiteLogin().catch(() => null),
-    ]).then(([sett, rp, kiteStatus]) => {
-      if (kiteStatus) {
-        setKiteConfigured(!!kiteStatus.kite_configured);
-        setKiteConnected(kiteStatus.authenticated ?? false);
-      }
+    ]).then(([sett, rp]) => {
       if (sett) {
         setSettings(sett);
         setKiteConnected(sett.kite_connected ?? false);
@@ -389,29 +393,44 @@ export default function Settings() {
     });
   }, []);
 
-  const handleKiteLogin = async () => {
+  const handleSaveKiteCredentials = async () => {
     setKiteLoading(true);
+    setKiteMessage('');
     try {
-      const result = await kiteLogin();
-      if (result?.login_url) {
-        window.open(result.login_url, '_blank');
-      }
-      setKiteConnected(true);
-    } catch {
-      // silent
+      await kiteSaveCredentials(kiteApiKey, kiteApiSecret);
+      setKiteConfigured(true);
+      setKiteMessage('Credentials saved. Click "Connect to Zerodha" to authenticate.');
+    } catch (e) {
+      setKiteMessage('Error: ' + e.message);
     }
     setKiteLoading(false);
   };
 
-  const handleAutoLogin = async () => {
+  const handleKiteLogin = async () => {
     setKiteLoading(true);
+    setKiteMessage('');
     try {
-      await kiteConnect();
-      setKiteConnected(true);
-    } catch {
-      // silent
+      const result = await kiteLogin();
+      if (result?.login_url) {
+        window.location.href = result.login_url;
+      } else {
+        setKiteMessage(result?.message || 'Save your API credentials first');
+      }
+    } catch (e) {
+      setKiteMessage('Error: ' + e.message);
     }
     setKiteLoading(false);
+  };
+
+  const handleKiteDisconnect = async () => {
+    try {
+      await kiteDisconnect();
+      setKiteConnected(false);
+      setKiteUserId('');
+      setKiteMessage('Disconnected from Kite');
+    } catch (e) {
+      setKiteMessage('Error: ' + e.message);
+    }
   };
 
   const toggleStrategy = (st) => {
@@ -497,75 +516,98 @@ export default function Settings() {
       {/* Mode & Broker Connection */}
       <div style={s.card}>
         <div style={s.sectionTitle}>Broker Connection</div>
-        <div style={s.sectionSub}>Connect to Zerodha Kite for live trading, or use simulation mode for recommendations only</div>
+        <div style={s.sectionSub}>Connect your Zerodha Kite account for live data import, or use Yahoo Finance prices in simulation mode</div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
           <div style={s.statusDot(kiteConnected)} />
           <span style={{ fontSize: 13, fontWeight: 600, color: kiteConnected ? c.emerald : c.amber }}>
-            {kiteConnected ? 'Kite Connected' : simulationMode ? 'Simulation Mode' : 'Disconnected'}
+            {kiteConnected ? `Kite Connected${kiteUserId ? ` (${kiteUserId})` : ''}` : kiteConfigured ? 'Not Connected' : 'Simulation Mode'}
           </span>
-          {simulationMode && !kiteConnected && (
+          {!kiteConnected && (
             <span style={{
               fontSize: 11, fontWeight: 600, padding: '3px 10px', borderRadius: 6,
-              background: 'rgba(252,211,77,0.12)', color: c.amber, fontFamily: mono,
+              background: priceSources?.spot_source === 'yahoo' ? 'rgba(110,231,183,0.12)' : 'rgba(252,211,77,0.12)',
+              color: priceSources?.spot_source === 'yahoo' ? c.emerald : c.amber,
+              fontFamily: mono,
             }}>
-              SIM
+              {priceSources?.spot_source === 'yahoo' ? 'LIVE PRICES' : 'SIM'}
             </span>
           )}
         </div>
 
-        {simulationMode && !kiteConfigured && (
+        {priceSources && !kiteConnected && (
           <div style={{
             padding: '14px 18px', borderRadius: 10, marginBottom: 20,
-            background: priceSources?.spot_source === 'yahoo' ? 'rgba(110,231,183,0.06)' : 'rgba(56,189,248,0.06)',
-            border: priceSources?.spot_source === 'yahoo' ? '1px solid rgba(110,231,183,0.15)' : '1px solid rgba(56,189,248,0.15)',
+            background: 'rgba(110,231,183,0.06)', border: '1px solid rgba(110,231,183,0.15)',
           }}>
-            <div style={{ fontSize: 13, color: priceSources?.spot_source === 'yahoo' ? c.emerald : c.blue, fontWeight: 600, marginBottom: 6 }}>
-              {priceSources?.spot_source === 'yahoo' ? 'Live Prices Active' : 'Simulation Mode Active'}
-            </div>
             <div style={{ fontSize: 12, color: c.muted, lineHeight: 1.6 }}>
-              {priceSources?.spot_source === 'yahoo' ? (
-                <>
-                  No Kite broker connected, but <strong>live market prices</strong> are active via Yahoo Finance
-                  {priceSources?.option_chain_source === 'nse' ? ' and NSE India' : ''}.
-                  Spot prices, holdings valuations, and option chains use real market data.
-                  To enable live order execution, configure your Kite API credentials below.
-                </>
-              ) : (
-                <>
-                  No Kite API key configured. The engine uses simulated market data to generate strategy recommendations,
-                  risk alerts, and notifications. Import your holdings via CSV or manual entry to get personalized recommendations.
-                  To enable live trading, configure your Kite API credentials below.
-                </>
-              )}
+              Live market prices via Yahoo Finance. Connect Kite for real-time quotes and holdings import.
             </div>
-            {priceSources && (
-              <div style={{ marginTop: 10, display: 'flex', gap: 12, fontSize: 11, fontFamily: "'IBM Plex Mono', monospace" }}>
-                <span style={{ color: priceSources.spot_source === 'yahoo' ? c.emerald : c.muted }}>
-                  Spot: {priceSources.spot_source === 'yahoo' ? 'Yahoo Finance' : 'Simulated'}
-                </span>
-                <span style={{ color: priceSources.option_chain_source === 'nse' ? c.emerald : c.muted }}>
-                  Options: {priceSources.option_chain_source === 'nse' ? 'NSE India' : 'Black-Scholes'}
-                </span>
-              </div>
-            )}
           </div>
         )}
 
-        {(kiteConfigured || kiteConnected) && (
-          <>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
-              <div style={{ flex: 1 }} />
+        {/* Kite API Credentials */}
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: c.text, marginBottom: 8 }}>
+            Kite Connect Credentials
+          </div>
+          <div style={{ fontSize: 11, color: c.muted, marginBottom: 12 }}>
+            Register a Kite Connect app at <a href="https://developers.kite.trade" target="_blank" rel="noopener noreferrer" style={{ color: c.blue }}>developers.kite.trade</a> to get your API Key and Secret.
+          </div>
+          <div style={{ display: 'flex', gap: 12, marginBottom: 12 }}>
+            <div style={{ flex: 1 }}>
+              <label style={{ fontSize: 11, color: c.muted, marginBottom: 4, display: 'block' }}>API Key</label>
+              <input
+                style={s.input}
+                type="text"
+                value={kiteApiKey}
+                onChange={(e) => setKiteApiKey(e.target.value)}
+                placeholder="Your Kite API Key"
+              />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={{ fontSize: 11, color: c.muted, marginBottom: 4, display: 'block' }}>API Secret</label>
+              <input
+                style={s.input}
+                type="password"
+                value={kiteApiSecret}
+                onChange={(e) => setKiteApiSecret(e.target.value)}
+                placeholder="Your Kite API Secret"
+              />
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+            <button
+              style={{ ...s.btn, background: 'rgba(56,189,248,0.12)', color: c.blue, opacity: kiteLoading ? 0.6 : 1 }}
+              onClick={handleSaveKiteCredentials}
+              disabled={kiteLoading || !kiteApiKey || !kiteApiSecret}
+            >
+              Save Credentials
+            </button>
+            {kiteConfigured && (
               <button
                 style={{ ...s.btn, ...s.btnPrimary, opacity: kiteLoading ? 0.6 : 1 }}
                 onClick={handleKiteLogin}
                 disabled={kiteLoading}
               >
-                {kiteLoading ? 'Connecting...' : kiteConnected ? 'Reconnect' : 'Login to Kite'}
+                {kiteLoading ? 'Connecting...' : kiteConnected ? 'Reconnect to Zerodha' : 'Connect to Zerodha'}
               </button>
+            )}
+            {kiteConnected && (
+              <button
+                style={{ ...s.btn, background: 'rgba(248,113,113,0.12)', color: c.red }}
+                onClick={handleKiteDisconnect}
+              >
+                Disconnect
+              </button>
+            )}
+          </div>
+          {kiteMessage && (
+            <div style={{ marginTop: 10, fontSize: 12, color: kiteMessage.includes('Error') || kiteMessage.includes('error') ? c.red : c.emerald }}>
+              {kiteMessage}
             </div>
-          </>
-        )}
+          )}
+        </div>
 
         <div style={s.inputRow}>
           <Field label="Kite API Key">

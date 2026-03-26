@@ -175,6 +175,7 @@ export const kiteLogin = () => request('/api/kite/login');
 export const kiteConnect = (requestToken) => request('/api/kite/connect', { method: 'POST', body: JSON.stringify({ request_token: requestToken }) });
 export const kiteStatus = () => request('/api/kite/status');
 export const kiteDisconnect = () => request('/api/kite/disconnect', { method: 'POST' });
+export const kiteSaveCredentials = (apiKey, apiSecret) => request('/api/kite/credentials', { method: 'POST', body: JSON.stringify({ api_key: apiKey, api_secret: apiSecret }) });
 
 // Auth
 export const authMe = () => request('/api/auth/me');
