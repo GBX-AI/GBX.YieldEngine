@@ -76,16 +76,50 @@ DEFAULT_SETTINGS = {
 }
 
 
+import threading as _threading
+
+_db_lock = _threading.Lock()
+_db_conn = None
+
+
 def get_db():
-    """Get a database connection with row factory."""
+    """
+    Get a shared database connection. Uses a single connection per process
+    with serialized access via lock — required for Azure File Share (SMB)
+    which doesn't support POSIX file locking properly.
+    """
+    global _db_conn
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    # Use DELETE journal mode for Azure File Share SMB compatibility (WAL needs shared memory)
-    conn.execute("PRAGMA journal_mode=DELETE")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+
+    if _db_conn is None:
+        _db_conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+        _db_conn.row_factory = sqlite3.Row
+        _db_conn.execute("PRAGMA journal_mode=DELETE")
+        _db_conn.execute("PRAGMA busy_timeout=10000")
+        _db_conn.execute("PRAGMA foreign_keys=ON")
+        # Override close() to be a no-op — shared connection stays open
+        _db_conn._real_close = _db_conn.close
+        _db_conn.close = lambda: None
+
+    return _db_conn
+
+
+class _DBContext:
+    """Context manager that serializes DB access."""
+    def __enter__(self):
+        _db_lock.acquire()
+        return get_db()
+    def __exit__(self, *args):
+        try:
+            get_db().commit()
+        except Exception:
+            pass
+        _db_lock.release()
+
+
+def db_context():
+    """Get a thread-safe database context. Usage: with db_context() as conn: ..."""
+    return _DBContext()
 
 
 def generate_id():
