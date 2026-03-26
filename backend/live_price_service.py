@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class _PriceCache:
     """Thread-safe in-memory cache with per-key TTL."""
 
-    def __init__(self, default_ttl: int = 30):
+    def __init__(self, default_ttl: int = 120):
         self._store: dict[str, tuple[float, object]] = {}  # key -> (expires_at, value)
         self._lock = threading.Lock()
         self._default_ttl = default_ttl
@@ -115,7 +115,7 @@ def fetch_spot_price(symbol: str) -> dict | None:
             "volume": int(getattr(info, "last_volume", 0) or 0),
             "source": "yahoo",
         }
-        _cache.set(cache_key, result, ttl=30)
+        _cache.set(cache_key, result, ttl=120)
         logger.debug("Yahoo Finance: fetched %s → LTP=%.2f", symbol, ltp)
         return result
 
@@ -129,7 +129,7 @@ def fetch_spot_price(symbol: str) -> dict | None:
 
 def fetch_spot_prices_batch(symbols: list[str]) -> dict[str, dict]:
     """
-    Fetch spot prices for multiple symbols efficiently.
+    Fetch spot prices for multiple symbols in a single HTTP call via yf.download().
 
     Returns: {symbol: {ltp, open, high, low, close, volume, source}} for successful fetches.
     """
@@ -152,29 +152,54 @@ def fetch_spot_prices_batch(symbols: list[str]) -> dict[str, dict]:
         import yfinance as yf
 
         yf_symbols = [_yf_symbol(s) for s in misses]
-        tickers = yf.Tickers(" ".join(yf_symbols))
+        sym_map = dict(zip(yf_symbols, misses))  # YF ticker -> original symbol
 
-        for orig_sym, yf_sym in zip(misses, yf_symbols):
+        # Single HTTP call for all tickers — much faster than per-ticker fast_info
+        df = yf.download(
+            yf_symbols,
+            period="2d",
+            interval="1d",
+            progress=False,
+            threads=True,
+            group_by="ticker" if len(yf_symbols) > 1 else "column",
+        )
+
+        if df.empty:
+            return results
+
+        for yf_sym, orig_sym in sym_map.items():
             try:
-                ticker = tickers.tickers.get(yf_sym)
-                if ticker is None:
+                if len(yf_symbols) == 1:
+                    ticker_df = df
+                else:
+                    ticker_df = df[yf_sym] if yf_sym in df.columns.get_level_values(0) else None
+
+                if ticker_df is None or ticker_df.empty:
                     continue
-                info = ticker.fast_info
-                ltp = getattr(info, "last_price", None)
-                if ltp is None or ltp <= 0:
+
+                # Use the last available row
+                last = ticker_df.dropna(subset=["Close"]).iloc[-1] if "Close" in ticker_df.columns else None
+                if last is None:
                     continue
+
+                ltp = float(last["Close"])
+                if ltp <= 0:
+                    continue
+
+                # Previous close for day change calculation
+                prev_close = float(ticker_df.iloc[-2]["Close"]) if len(ticker_df) > 1 else ltp
 
                 result = {
-                    "ltp": round(float(ltp), 2),
-                    "open": round(float(getattr(info, "open", ltp)), 2),
-                    "high": round(float(getattr(info, "day_high", ltp)), 2),
-                    "low": round(float(getattr(info, "day_low", ltp)), 2),
-                    "close": round(float(getattr(info, "previous_close", ltp)), 2),
-                    "volume": int(getattr(info, "last_volume", 0) or 0),
+                    "ltp": round(ltp, 2),
+                    "open": round(float(last.get("Open", ltp)), 2),
+                    "high": round(float(last.get("High", ltp)), 2),
+                    "low": round(float(last.get("Low", ltp)), 2),
+                    "close": round(prev_close, 2),
+                    "volume": int(last.get("Volume", 0) or 0),
                     "source": "yahoo",
                 }
                 results[orig_sym] = result
-                _cache.set(f"spot:{orig_sym}", result, ttl=30)
+                _cache.set(f"spot:{orig_sym}", result, ttl=120)
             except Exception as exc:
                 logger.debug("Yahoo batch: failed for %s: %s", orig_sym, exc)
 

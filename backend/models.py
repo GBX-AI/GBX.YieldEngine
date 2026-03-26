@@ -79,9 +79,11 @@ DEFAULT_SETTINGS = {
 def get_db():
     """Get a database connection with row factory."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # Use DELETE journal mode for Azure File Share SMB compatibility (WAL needs shared memory)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 

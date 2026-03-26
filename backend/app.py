@@ -54,6 +54,8 @@ def create_app():
         init_db()
         # Load holdings from last session if available
         _load_persisted_state()
+        # Pre-warm price cache in background so first page load is fast
+        _warm_price_cache()
 
     # ─── HEALTH / STATUS ─────────────────────────────────────────
 
@@ -1197,6 +1199,24 @@ def _create_notification(ntype, title, message, severity="INFO", action_url=None
     )
     conn.commit()
     conn.close()
+
+
+def _warm_price_cache():
+    """Pre-fetch live prices for all holdings in background thread."""
+    import threading
+    holdings = get_all_holdings()
+    if not holdings:
+        return
+    symbols = [h["symbol"] for h in holdings]
+    # Also warm index prices
+    symbols.extend(["NIFTY", "BANKNIFTY"])
+
+    def _fetch():
+        try:
+            live_price_service.fetch_spot_prices_batch(symbols)
+        except Exception:
+            pass
+    threading.Thread(target=_fetch, daemon=True).start()
 
 
 def _load_persisted_state():
