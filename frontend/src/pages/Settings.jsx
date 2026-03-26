@@ -361,10 +361,6 @@ export default function Settings() {
     ]).then(([sett, rp]) => {
       if (sett) {
         setSettings(sett);
-        setKiteConnected(sett.kite_connected ?? false);
-        setAutoLogin(sett.auto_login ?? false);
-        setUserId(sett.user_id ?? '');
-        setTotp(sett.totp_secret ?? '');
         setStrikeMode(sett.strike_mode ?? 'auto');
         setMinOtm(sett.min_otm_pct ?? '');
         setMaxOtm(sett.max_otm_pct ?? '');
@@ -454,9 +450,7 @@ export default function Settings() {
     try {
       await Promise.all([
         updateSettings({
-          totp_secret: totp,
-          auto_login: autoLogin,
-          user_id: userId,
+          // totp_secret, auto_login, user_id removed — using OAuth now
           strike_mode: strikeMode,
           min_otm_pct: minOtm ? parseFloat(minOtm) : null,
           max_otm_pct: maxOtm ? parseFloat(maxOtm) : null,
@@ -610,35 +604,7 @@ export default function Settings() {
           )}
         </div>
 
-        <div style={s.inputRow}>
-          <Field label="Kite API Key">
-            <input
-              style={s.input}
-              value={userId}
-              onChange={(e) => setUserId(e.target.value)}
-              placeholder="Not configured (optional)"
-            />
-          </Field>
-          <Field label="TOTP Secret">
-            <input
-              style={s.input}
-              type="password"
-              value={totp}
-              onChange={(e) => setTotp(e.target.value)}
-              placeholder="Not configured (optional)"
-            />
-          </Field>
-        </div>
-
-        {(kiteConfigured || userId || totp) && (
-          <div style={s.flexBetween}>
-            <div>
-              <div style={{ fontSize: 13, color: c.text, fontWeight: 500 }}>Auto-Login</div>
-              <div style={{ fontSize: 11, color: c.muted }}>Automatically login to Kite on system startup</div>
-            </div>
-            <Toggle on={autoLogin} onToggle={() => setAutoLogin(!autoLogin)} />
-          </div>
-        )}
+        {/* Old TOTP/auto-login fields removed — using OAuth now */}
       </div>
 
       {/* Risk Profile */}
