@@ -1,5 +1,7 @@
-import React from 'react';
-import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom';
+import React, { useEffect } from 'react';
+import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom';
+import useAuthStore from './stores/authStore';
+import ProtectedRoute from './components/ProtectedRoute';
 
 // Page components
 import Dashboard from './pages/Dashboard';
@@ -11,6 +13,8 @@ import Analytics from './pages/Analytics';
 import Settings from './pages/Settings';
 import RiskMonitor from './pages/RiskMonitor';
 import Arbitrage from './pages/Arbitrage';
+import Login from './pages/Login';
+import KiteCallback from './pages/KiteCallback';
 
 const NAV_ITEMS = [
   { to: '/', label: 'Dashboard' },
@@ -25,13 +29,15 @@ const NAV_ITEMS = [
 ];
 
 function Header() {
+  const { user, logout } = useAuthStore();
+
   return (
     <header style={styles.header}>
       <div style={styles.headerInner}>
         <div style={styles.logo}>
-          <span style={styles.logoIcon}>◆</span>
+          <span style={styles.logoIcon}>&#9670;</span>
           <span style={styles.logoText}>Yield Engine</span>
-          <span style={styles.versionBadge}>v3</span>
+          <span style={styles.versionBadge}>v4</span>
         </div>
         <nav style={styles.nav}>
           {NAV_ITEMS.map((item) => (
@@ -48,30 +54,53 @@ function Header() {
             </NavLink>
           ))}
         </nav>
+        {user && (
+          <div style={styles.userSection}>
+            <span style={styles.userEmail}>{user.email}</span>
+            <button style={styles.logoutBtn} onClick={logout}>Logout</button>
+          </div>
+        )}
       </div>
     </header>
   );
 }
 
+function AppLayout() {
+  const location = useLocation();
+  const isPublicPage = location.pathname === '/login';
+
+  return (
+    <div style={styles.app}>
+      {!isPublicPage && <Header />}
+      <main style={isPublicPage ? {} : styles.main}>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/kite/callback" element={<ProtectedRoute><KiteCallback /></ProtectedRoute>} />
+          <Route path="/" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
+          <Route path="/holdings" element={<ProtectedRoute><Holdings /></ProtectedRoute>} />
+          <Route path="/scanner" element={<ProtectedRoute><Scanner /></ProtectedRoute>} />
+          <Route path="/positions" element={<ProtectedRoute><Positions /></ProtectedRoute>} />
+          <Route path="/trades" element={<ProtectedRoute><TradeLog /></ProtectedRoute>} />
+          <Route path="/analytics" element={<ProtectedRoute><Analytics /></ProtectedRoute>} />
+          <Route path="/settings" element={<ProtectedRoute><Settings /></ProtectedRoute>} />
+          <Route path="/risk" element={<ProtectedRoute><RiskMonitor /></ProtectedRoute>} />
+          <Route path="/arbitrage" element={<ProtectedRoute><Arbitrage /></ProtectedRoute>} />
+        </Routes>
+      </main>
+    </div>
+  );
+}
+
 export default function App() {
+  const { checkAuth } = useAuthStore();
+
+  useEffect(() => {
+    checkAuth();
+  }, []);
+
   return (
     <BrowserRouter>
-      <div style={styles.app}>
-        <Header />
-        <main style={styles.main}>
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/holdings" element={<Holdings />} />
-            <Route path="/scanner" element={<Scanner />} />
-            <Route path="/positions" element={<Positions />} />
-            <Route path="/trades" element={<TradeLog />} />
-            <Route path="/analytics" element={<Analytics />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/risk" element={<RiskMonitor />} />
-            <Route path="/arbitrage" element={<Arbitrage />} />
-          </Routes>
-        </main>
-      </div>
+      <AppLayout />
     </BrowserRouter>
   );
 }
@@ -155,21 +184,29 @@ const styles = {
     color: colors.emerald,
     background: 'rgba(110,231,183,0.1)',
   },
+  userSection: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+  },
+  userEmail: {
+    fontSize: 12,
+    color: colors.textMuted,
+    fontFamily: "'IBM Plex Mono', monospace",
+  },
+  logoutBtn: {
+    padding: '5px 12px',
+    borderRadius: 6,
+    border: `1px solid ${colors.border}`,
+    background: 'transparent',
+    color: colors.textMuted,
+    fontSize: 12,
+    cursor: 'pointer',
+    fontFamily: "'DM Sans', sans-serif",
+  },
   main: {
     maxWidth: 1280,
     margin: '0 auto',
     padding: '32px 24px',
-  },
-  pageShell: {
-    background: colors.cardBg,
-    border: `1px solid ${colors.border}`,
-    borderRadius: 12,
-    padding: 32,
-  },
-  pageTitle: {
-    fontSize: 24,
-    fontWeight: 600,
-    marginBottom: 8,
-    color: colors.text,
   },
 };

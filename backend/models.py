@@ -126,6 +126,12 @@ def now_iso():
 
 
 _CREATE_TABLE_STMTS = [
+    """CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        kite_access_token TEXT, kite_token_date TEXT, kite_user_id TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""",
     """CREATE TABLE IF NOT EXISTS trades (
         id TEXT PRIMARY KEY, rec_id TEXT NOT NULL, strategy_type TEXT NOT NULL,
         symbol TEXT NOT NULL, direction TEXT NOT NULL, legs TEXT NOT NULL,
@@ -194,10 +200,7 @@ _CREATE_TABLE_STMTS = [
 
 
 def init_db():
-    """Create all tables and insert default settings.
-    Uses individual execute() calls instead of executescript() for
-    SMB/Azure File Share compatibility (executescript ignores busy_timeout).
-    """
+    """Create all tables, run migrations, insert default settings."""
     conn = get_db()
     for stmt in _CREATE_TABLE_STMTS:
         conn.execute(stmt)
@@ -209,88 +212,225 @@ def init_db():
         )
 
     conn.commit()
+    _migrate_add_user_id()
 
 
-def get_setting(key):
+def _migrate_add_user_id():
+    """Add user_id column to all data tables (idempotent)."""
     conn = get_db()
-    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-    conn.close()
+    tables_needing_user_id = [
+        "trades", "positions", "portfolio_snapshots", "notifications",
+        "daily_summary", "order_audit", "gtt_orders", "adjustments",
+    ]
+    for table in tables_needing_user_id:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
+        except Exception:
+            pass  # Column already exists
+
+    # Settings table: change PK from (key) to (key, user_id) — recreate
+    try:
+        conn.execute("ALTER TABLE settings ADD COLUMN user_id TEXT")
+    except Exception:
+        pass  # Already migrated
+
+    # Holdings table: need composite PK (user_id, symbol) — recreate
+    try:
+        conn.execute("ALTER TABLE holdings ADD COLUMN user_id TEXT")
+        # Recreate with composite PK
+        conn.execute("""CREATE TABLE IF NOT EXISTS holdings_v2 (
+            user_id TEXT NOT NULL, symbol TEXT NOT NULL,
+            qty INTEGER NOT NULL, avg_price REAL NOT NULL, ltp REAL,
+            updated_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (user_id, symbol)
+        )""")
+        conn.execute("""INSERT OR IGNORE INTO holdings_v2 (user_id, symbol, qty, avg_price, ltp, updated_at)
+            SELECT COALESCE(user_id, ''), symbol, qty, avg_price, ltp, updated_at FROM holdings""")
+        conn.execute("DROP TABLE holdings")
+        conn.execute("ALTER TABLE holdings_v2 RENAME TO holdings")
+    except Exception:
+        pass  # Already migrated
+
+    conn.commit()
+
+
+def migrate_orphaned_data(user_id):
+    """Assign all data with empty/NULL user_id to the given user. Called on first signup."""
+    conn = get_db()
+    tables = ["holdings", "trades", "positions", "portfolio_snapshots", "notifications",
+              "daily_summary", "order_audit", "gtt_orders", "adjustments", "settings"]
+    for table in tables:
+        try:
+            conn.execute(f"UPDATE {table} SET user_id = ? WHERE user_id IS NULL OR user_id = ''", (user_id,))
+        except Exception:
+            pass
+    conn.commit()
+
+
+# ─── User functions ──────────────────────────────────────────────────────────
+
+def create_user(email, name, password_hash):
+    """Create a new user and return the user dict."""
+    conn = get_db()
+    user_id = generate_id()
+    conn.execute(
+        "INSERT INTO users (id, email, name, password_hash) VALUES (?, ?, ?, ?)",
+        (user_id, email.lower().strip(), name.strip(), password_hash)
+    )
+    conn.commit()
+
+    # If this is the first user, migrate orphaned data
+    count = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
+    if count == 1:
+        migrate_orphaned_data(user_id)
+
+    return {"id": user_id, "email": email.lower().strip(), "name": name.strip()}
+
+
+def get_user_by_email(email):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE email = ?", (email.lower().strip(),)).fetchone()
+    return dict(row) if row else None
+
+
+def get_user_by_id(user_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_user_kite_token(user_id, access_token, token_date, kite_user_id):
+    conn = get_db()
+    conn.execute(
+        "UPDATE users SET kite_access_token = ?, kite_token_date = ?, kite_user_id = ? WHERE id = ?",
+        (access_token, token_date, kite_user_id, user_id)
+    )
+    conn.commit()
+
+
+def clear_user_kite_token(user_id):
+    conn = get_db()
+    conn.execute(
+        "UPDATE users SET kite_access_token = NULL, kite_token_date = NULL, kite_user_id = NULL WHERE id = ?",
+        (user_id,)
+    )
+    conn.commit()
+
+
+def get_user_kite_token(user_id):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT kite_access_token, kite_token_date, kite_user_id FROM users WHERE id = ?",
+        (user_id,)
+    ).fetchone()
+    if row and row["kite_access_token"]:
+        return {"kite_access_token": row["kite_access_token"],
+                "kite_token_date": row["kite_token_date"],
+                "kite_user_id": row["kite_user_id"]}
+    return None
+
+
+def get_setting(key, user_id=None):
+    conn = get_db()
+    if user_id:
+        row = conn.execute("SELECT value FROM settings WHERE key = ? AND user_id = ?", (key, user_id)).fetchone()
+        if row:
+            return row["value"]
+    # Fall back to global setting
+    row = conn.execute("SELECT value FROM settings WHERE key = ? AND (user_id IS NULL OR user_id = '')", (key,)).fetchone()
     return row["value"] if row else None
 
 
-def set_setting(key, value):
+def set_setting(key, value, user_id=None):
     conn = get_db()
-    conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
-        (key, str(value), now_iso())
-    )
+    if user_id:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, ?)",
+            (key, str(value), user_id, now_iso())
+        )
+    else:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, str(value), now_iso())
+        )
     conn.commit()
-    conn.close()
 
 
-def get_all_settings():
+def get_all_settings(user_id=None):
     conn = get_db()
-    rows = conn.execute("SELECT key, value FROM settings").fetchall()
-    conn.close()
-    return {row["key"]: row["value"] for row in rows}
+    # Start with global defaults
+    rows = conn.execute("SELECT key, value FROM settings WHERE user_id IS NULL OR user_id = ''").fetchall()
+    result = {row["key"]: row["value"] for row in rows}
+    # Override with user-specific settings
+    if user_id:
+        user_rows = conn.execute("SELECT key, value FROM settings WHERE user_id = ?", (user_id,)).fetchall()
+        for row in user_rows:
+            result[row["key"]] = row["value"]
+    return result
 
 
 # ─── Holdings persistence ────────────────────────────────────────────────────
 
-def get_all_holdings():
+def get_all_holdings(user_id=None):
     """Load all holdings from the database."""
     conn = get_db()
-    rows = conn.execute("SELECT symbol, qty, avg_price, ltp FROM holdings ORDER BY symbol").fetchall()
-    conn.close()
+    if user_id:
+        rows = conn.execute("SELECT symbol, qty, avg_price, ltp FROM holdings WHERE user_id = ? ORDER BY symbol", (user_id,)).fetchall()
+    else:
+        rows = conn.execute("SELECT symbol, qty, avg_price, ltp FROM holdings ORDER BY symbol").fetchall()
     return [{"symbol": r["symbol"], "qty": r["qty"], "avgPrice": r["avg_price"],
              "ltp": r["ltp"] or r["avg_price"]} for r in rows]
 
 
-def save_holdings(holdings):
-    """Replace all holdings in the database."""
+def save_holdings(holdings, user_id=None):
+    """Replace all holdings in the database for a user."""
     conn = get_db()
-    conn.execute("DELETE FROM holdings")
+    if user_id:
+        conn.execute("DELETE FROM holdings WHERE user_id = ?", (user_id,))
+    else:
+        conn.execute("DELETE FROM holdings")
     for h in holdings:
         conn.execute(
-            "INSERT INTO holdings (symbol, qty, avg_price, ltp, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (h["symbol"], h["qty"], h["avgPrice"], h.get("ltp", h["avgPrice"]), now_iso())
+            "INSERT INTO holdings (user_id, symbol, qty, avg_price, ltp, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id or "", h["symbol"], h["qty"], h["avgPrice"], h.get("ltp", h["avgPrice"]), now_iso())
         )
     conn.commit()
-    conn.close()
 
 
-def upsert_holding(holding):
+def upsert_holding(holding, user_id=None):
     """Insert or update a single holding."""
+    uid = user_id or ""
     conn = get_db()
     conn.execute(
-        "INSERT INTO holdings (symbol, qty, avg_price, ltp, updated_at) VALUES (?, ?, ?, ?, ?) "
-        "ON CONFLICT(symbol) DO UPDATE SET qty=?, avg_price=?, ltp=?, updated_at=?",
-        (holding["symbol"], holding["qty"], holding["avgPrice"],
+        "INSERT INTO holdings (user_id, symbol, qty, avg_price, ltp, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(user_id, symbol) DO UPDATE SET qty=?, avg_price=?, ltp=?, updated_at=?",
+        (uid, holding["symbol"], holding["qty"], holding["avgPrice"],
          holding.get("ltp", holding["avgPrice"]), now_iso(),
          holding["qty"], holding["avgPrice"],
          holding.get("ltp", holding["avgPrice"]), now_iso())
     )
     conn.commit()
-    conn.close()
 
 
-def delete_holding(symbol):
+def delete_holding(symbol, user_id=None):
     """Delete a holding by symbol."""
     conn = get_db()
-    conn.execute("DELETE FROM holdings WHERE symbol = ?", (symbol,))
+    if user_id:
+        conn.execute("DELETE FROM holdings WHERE symbol = ? AND user_id = ?", (symbol, user_id))
+    else:
+        conn.execute("DELETE FROM holdings WHERE symbol = ?", (symbol,))
     conn.commit()
-    conn.close()
 
 
-def get_cash_balance():
+def get_cash_balance(user_id=None):
     """Get persisted cash balance from settings."""
-    val = get_setting("cash_balance")
+    val = get_setting("cash_balance", user_id=user_id)
     try:
         return float(val) if val else 0
     except (ValueError, TypeError):
         return 0
 
 
-def save_cash_balance(amount):
+def save_cash_balance(amount, user_id=None):
     """Persist cash balance to settings."""
-    set_setting("cash_balance", str(amount))
+    set_setting("cash_balance", str(amount), user_id=user_id)

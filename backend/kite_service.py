@@ -1,16 +1,12 @@
 """
-Kite Connect wrapper + TOTP auto-login service for Yield Engine.
+Kite Connect wrapper for Yield Engine.
 
 Handles:
-- KiteConnect API wrapper with auto-login via TOTP
-- Token persistence in SQLite settings table
+- Per-user KiteConnect sessions via OAuth (no stored passwords)
 - Simulation mode fallback when Kite is not connected
 - Holdings, quotes, and option chain retrieval (live + simulated)
-- Auth event logging to notifications table
 """
 
-import hashlib
-import hmac
 import logging
 import math
 import os
@@ -20,8 +16,7 @@ from datetime import datetime, date, timedelta
 from models import (
     get_db,
     generate_id,
-    get_setting,
-    set_setting,
+    get_user_kite_token,
     SIMULATION_STOCKS,
     SIMULATION_INDICES,
 )
@@ -30,142 +25,87 @@ import live_price_service
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Environment variables — password is NEVER persisted
-# ---------------------------------------------------------------------------
+# App-level Kite Connect credentials (NOT user credentials)
 KITE_API_KEY = os.getenv("KITE_API_KEY", "")
 KITE_API_SECRET = os.getenv("KITE_API_SECRET", "")
-KITE_USER_ID = os.getenv("KITE_USER_ID", "")
-KITE_PASSWORD = os.getenv("KITE_PASSWORD", "")      # Used once, never stored
-KITE_TOTP_SECRET = os.getenv("KITE_TOTP_SECRET", "")
-
-# Settings keys for SQLite persistence
-_KEY_ACCESS_TOKEN = "kite_access_token"
-_KEY_TOKEN_DATE = "kite_token_date"
-_KEY_TOTP_SECRET_ENC = "kite_totp_secret_enc"
-_KEY_USER_ID = "kite_user_id"
-
-# Notification types
-_NOTIFY_AUTH = "KITE_AUTH"
-_NOTIFY_TOKEN = "KITE_TOKEN"
 
 
-def _encrypt_value(plain: str, secret_key: str) -> str:
-    """
-    Simple HMAC-based obfuscation for storing TOTP secret in SQLite.
-    Uses XOR with HMAC-derived keystream. NOT cryptographic-grade encryption
-    but sufficient for at-rest obfuscation of a TOTP seed that is already
-    protected by OS-level access controls on the SQLite file.
-    """
-    if not plain:
-        return ""
-    key_bytes = hmac.new(
-        secret_key.encode("utf-8"),
-        b"yield-engine-totp-key",
-        hashlib.sha256,
-    ).digest()
-    encrypted = bytearray()
-    for i, ch in enumerate(plain.encode("utf-8")):
-        encrypted.append(ch ^ key_bytes[i % len(key_bytes)])
-    return encrypted.hex()
-
-
-def _decrypt_value(cipher_hex: str, secret_key: str) -> str:
-    """Reverse of _encrypt_value."""
-    if not cipher_hex:
-        return ""
-    try:
-        key_bytes = hmac.new(
-            secret_key.encode("utf-8"),
-            b"yield-engine-totp-key",
-            hashlib.sha256,
-        ).digest()
-        cipher_bytes = bytes.fromhex(cipher_hex)
-        decrypted = bytearray()
-        for i, cb in enumerate(cipher_bytes):
-            decrypted.append(cb ^ key_bytes[i % len(key_bytes)])
-        return decrypted.decode("utf-8")
-    except Exception:
-        logger.warning("Failed to decrypt TOTP secret from settings")
-        return ""
-
-
-def _log_notification(severity: str, title: str, message: str) -> None:
+def _log_notification(severity: str, title: str, message: str, user_id: str = None) -> None:
     """Insert an auth event into the notifications table."""
     try:
         conn = get_db()
         conn.execute(
-            "INSERT INTO notifications (id, type, title, message, severity) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (generate_id(), _NOTIFY_AUTH, title, message, severity),
+            "INSERT INTO notifications (id, type, title, message, severity, user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (generate_id(), "KITE_AUTH", title, message, severity, user_id or ""),
         )
         conn.commit()
-        conn.close()
     except Exception as exc:
         logger.error("Failed to log notification: %s", exc)
 
 
+def get_kite_for_user(user_id: str) -> "KiteService":
+    """Factory: construct a KiteService for the given user, loading their token from DB."""
+    token_data = get_user_kite_token(user_id)
+    if token_data and token_data["kite_token_date"] == date.today().isoformat():
+        return KiteService(
+            access_token=token_data["kite_access_token"],
+            kite_user_id=token_data["kite_user_id"],
+        )
+    return KiteService()  # simulation mode
+
+
+def get_login_url() -> str | None:
+    """Return the Kite login URL for browser-based OAuth."""
+    if not KITE_API_KEY:
+        return None
+    try:
+        from kiteconnect import KiteConnect
+        kite = KiteConnect(api_key=KITE_API_KEY)
+        return kite.login_url()
+    except Exception:
+        return f"https://kite.zerodha.com/connect/login?v=3&api_key={KITE_API_KEY}"
+
+
+def exchange_request_token(request_token: str) -> dict:
+    """Exchange a Kite request_token for access_token using app credentials.
+    Returns {"access_token": str, "user_id": str}."""
+    from kiteconnect import KiteConnect
+    kite = KiteConnect(api_key=KITE_API_KEY)
+    data = kite.generate_session(request_token, api_secret=KITE_API_SECRET)
+    return {
+        "access_token": data["access_token"],
+        "user_id": str(data.get("user_id", "")),
+    }
+
+
 class KiteService:
     """
-    Singleton-style wrapper around kiteconnect.KiteConnect.
+    Per-user Kite Connect wrapper.
 
-    Usage:
-        kite_svc = KiteService()
-        kite_svc.initialize()          # call once at app startup
-        if kite_svc.is_authenticated():
-            holdings = kite_svc.get_holdings()
+    Constructed via get_kite_for_user(user_id) factory which loads the
+    user's access_token from DB. If no token, operates in simulation mode.
     """
 
-    def __init__(self):
-        self._kite = None              # kiteconnect.KiteConnect instance
-        self._access_token: str = ""
-        self._token_date: str = ""     # ISO date (YYYY-MM-DD) of the token
-        self._simulation_mode: bool = True
-        self._user_id: str = KITE_USER_ID or ""
-        self._flask_secret: str = os.getenv("FLASK_SECRET_KEY", "yield-engine-default-key")
+    def __init__(self, access_token: str = None, kite_user_id: str = None):
+        self._kite = None
+        self._access_token: str = access_token or ""
+        self._token_date: str = date.today().isoformat() if access_token else ""
+        self._simulation_mode: bool = not bool(access_token)
+        self._user_id: str = kite_user_id or ""
+        if access_token:
+            self._setup_kite(access_token)
 
-    # ------------------------------------------------------------------
-    # Initialization
-    # ------------------------------------------------------------------
-
-    def initialize(self) -> dict:
-        """
-        Called once at app startup.
-
-        Returns a status dict:
-            {"authenticated": bool, "mode": "live"|"simulation", "login_url": str|None, "message": str}
-        """
-        today = date.today().isoformat()
-
-        # 1. Try to reuse today's persisted token
-        stored_token = get_setting(_KEY_ACCESS_TOKEN)
-        stored_date = get_setting(_KEY_TOKEN_DATE)
-
-        if stored_token and stored_date == today:
-            logger.info("Reusing persisted access token from today (%s)", today)
-            if self._try_set_token(stored_token):
-                _log_notification("INFO", "Kite Connected", "Reused today's access token.")
-                return self._status_dict(login_url=None, message="Reused today's access token.")
-
-        # 2. Token missing or expired — attempt auto-login
-        totp_secret = self._resolve_totp_secret()
-        if totp_secret and KITE_API_KEY and KITE_API_SECRET:
-            result = self._auto_login(totp_secret)
-            if result["authenticated"]:
-                return result
-
-        # 3. Fallback: return manual login URL (or simulation mode)
-        login_url = self.get_login_url()
-        if login_url:
-            msg = "Auto-login unavailable. Use manual login URL."
-            _log_notification("WARNING", "Manual Login Required", msg)
-            return self._status_dict(login_url=login_url, message=msg)
-
-        # 4. No API key configured at all — pure simulation
-        msg = "No Kite API key configured. Running in simulation mode."
-        _log_notification("INFO", "Simulation Mode", msg)
-        logger.info(msg)
-        return self._status_dict(login_url=None, message=msg)
+    def _setup_kite(self, access_token: str):
+        """Initialize the KiteConnect instance with a valid token."""
+        try:
+            from kiteconnect import KiteConnect
+            self._kite = KiteConnect(api_key=KITE_API_KEY)
+            self._kite.set_access_token(access_token)
+            self._simulation_mode = False
+        except Exception as exc:
+            logger.warning("Failed to setup Kite: %s", exc)
+            self._simulation_mode = True
 
     # ------------------------------------------------------------------
     # Authentication helpers
@@ -189,27 +129,6 @@ class KiteService:
     def is_simulation(self) -> bool:
         return self._simulation_mode
 
-    def set_access_token(self, request_token: str) -> dict:
-        """
-        Complete the login flow after manual login redirect.
-        Called with the request_token from Kite's redirect URL.
-        """
-        if not KITE_API_KEY or not KITE_API_SECRET:
-            return {"authenticated": False, "message": "API key/secret not configured."}
-
-        try:
-            kite = self._get_kite_instance()
-            data = kite.generate_session(request_token, api_secret=KITE_API_SECRET)
-            token = data["access_token"]
-            self._apply_token(token)
-            _log_notification("SUCCESS", "Kite Connected", "Manual login successful.")
-            return self._status_dict(login_url=None, message="Manual login successful.")
-        except Exception as exc:
-            msg = f"Failed to generate session: {exc}"
-            logger.error(msg)
-            _log_notification("ERROR", "Login Failed", msg)
-            return {"authenticated": False, "mode": "simulation", "message": msg}
-
     def logout(self) -> dict:
         """Invalidate current session and switch to simulation mode."""
         if self._kite and self._access_token:
@@ -218,19 +137,9 @@ class KiteService:
             except Exception:
                 pass
         self._access_token = ""
-        self._token_date = ""
         self._simulation_mode = True
         self._kite = None
-        set_setting(_KEY_ACCESS_TOKEN, "")
-        set_setting(_KEY_TOKEN_DATE, "")
-        _log_notification("INFO", "Kite Disconnected", "Logged out. Switched to simulation mode.")
-        return self._status_dict(login_url=None, message="Logged out. Simulation mode active.")
-
-    def store_totp_secret(self, totp_secret: str) -> None:
-        """Encrypt and store TOTP secret in SQLite for future auto-logins."""
-        encrypted = _encrypt_value(totp_secret, self._flask_secret)
-        set_setting(_KEY_TOTP_SECRET_ENC, encrypted)
-        logger.info("TOTP secret stored (encrypted) in settings.")
+        return {"status": "disconnected"}
 
     # ------------------------------------------------------------------
     # Holdings
@@ -421,177 +330,6 @@ class KiteService:
                 logger.error("kiteconnect package not installed. pip install kiteconnect")
                 raise
         return self._kite
-
-    def get_login_url(self) -> str | None:
-        """Return the Kite login URL for manual browser-based auth."""
-        if not KITE_API_KEY:
-            return None
-        try:
-            kite = self._get_kite_instance()
-            return kite.login_url()
-        except Exception:
-            return f"https://kite.zerodha.com/connect/login?v=3&api_key={KITE_API_KEY}"
-
-    def _resolve_totp_secret(self) -> str:
-        """
-        Resolve TOTP secret from (in priority order):
-        1. Environment variable
-        2. Encrypted value in SQLite settings
-        """
-        if KITE_TOTP_SECRET:
-            return KITE_TOTP_SECRET
-        encrypted = get_setting(_KEY_TOTP_SECRET_ENC)
-        if encrypted:
-            return _decrypt_value(encrypted, self._flask_secret)
-        return ""
-
-    def _auto_login(self, totp_secret: str) -> dict:
-        """
-        Perform automated login using TOTP — no browser needed.
-
-        Flow:
-        1. POST to Kite login API with user_id + password
-        2. Generate TOTP from secret
-        3. POST TOTP to complete 2FA
-        4. Extract request_token and generate session
-        """
-        import requests
-
-        user_id = self._user_id or get_setting(_KEY_USER_ID) or ""
-        password = KITE_PASSWORD  # from env only, never persisted
-
-        if not user_id or not password:
-            msg = "Auto-login skipped: user_id or password not available."
-            logger.info(msg)
-            return self._status_dict(login_url=self.get_login_url(), message=msg)
-
-        try:
-            import pyotp
-        except ImportError:
-            msg = "pyotp not installed. Cannot auto-login."
-            logger.error(msg)
-            _log_notification("ERROR", "Auto-login Failed", msg)
-            return self._status_dict(login_url=self.get_login_url(), message=msg)
-
-        session = requests.Session()
-        login_url = "https://kite.zerodha.com/api/login"
-        twofa_url = "https://kite.zerodha.com/api/twofa"
-
-        try:
-            # Step 1: Login with user_id + password
-            login_resp = session.post(
-                login_url,
-                data={"user_id": user_id, "password": password},
-                timeout=15,
-            )
-            login_data = login_resp.json()
-
-            if login_data.get("status") != "success":
-                msg = f"Login step 1 failed: {login_data.get('message', 'Unknown error')}"
-                logger.error(msg)
-                _log_notification("ERROR", "Auto-login Failed", msg)
-                return self._status_dict(login_url=self.get_login_url(), message=msg)
-
-            request_id = login_data["data"]["request_id"]
-
-            # Step 2: Generate TOTP and complete 2FA
-            totp = pyotp.TOTP(totp_secret)
-            twofa_pin = totp.now()
-
-            twofa_resp = session.post(
-                twofa_url,
-                data={
-                    "user_id": user_id,
-                    "request_id": request_id,
-                    "twofa_value": twofa_pin,
-                    "twofa_type": "totp",
-                },
-                timeout=15,
-            )
-            twofa_data = twofa_resp.json()
-
-            if twofa_data.get("status") != "success":
-                msg = f"TOTP 2FA failed: {twofa_data.get('message', 'Unknown error')}"
-                logger.error(msg)
-                _log_notification("ERROR", "Auto-login Failed", msg)
-                return self._status_dict(login_url=self.get_login_url(), message=msg)
-
-            # Step 3: Extract request_token from redirect or response
-            # Kite returns a redirect URL with the request_token
-            request_token = twofa_data.get("data", {}).get("request_token")
-            if not request_token:
-                # Sometimes the token is in a redirect URL in the response
-                redirect_url = twofa_data.get("data", {}).get("redirect_url", "")
-                if "request_token=" in redirect_url:
-                    request_token = redirect_url.split("request_token=")[1].split("&")[0]
-
-            if not request_token:
-                msg = "Auto-login: could not extract request_token from 2FA response."
-                logger.error(msg)
-                _log_notification("ERROR", "Auto-login Failed", msg)
-                return self._status_dict(login_url=self.get_login_url(), message=msg)
-
-            # Step 4: Generate session with KiteConnect
-            kite = self._get_kite_instance()
-            data = kite.generate_session(request_token, api_secret=KITE_API_SECRET)
-            token = data["access_token"]
-            self._apply_token(token)
-
-            # Password was used once — it lives only in KITE_PASSWORD env var,
-            # which Python's os.getenv reads into a local string. We do NOT persist it.
-            _log_notification("SUCCESS", "Kite Connected", "Auto-login via TOTP successful.")
-            logger.info("Auto-login successful for user %s", user_id)
-            return self._status_dict(login_url=None, message="Auto-login successful.")
-
-        except requests.RequestException as exc:
-            msg = f"Auto-login network error: {exc}"
-            logger.error(msg)
-            _log_notification("ERROR", "Auto-login Failed", msg)
-            return self._status_dict(login_url=self.get_login_url(), message=msg)
-        except Exception as exc:
-            msg = f"Auto-login unexpected error: {exc}"
-            logger.error(msg)
-            _log_notification("ERROR", "Auto-login Failed", msg)
-            return self._status_dict(login_url=self.get_login_url(), message=msg)
-
-    def _try_set_token(self, token: str) -> bool:
-        """Set token on the Kite instance and verify it works."""
-        try:
-            kite = self._get_kite_instance()
-            kite.set_access_token(token)
-            # Quick profile check to verify token is still valid
-            kite.profile()
-            self._access_token = token
-            self._token_date = date.today().isoformat()
-            self._simulation_mode = False
-            return True
-        except Exception as exc:
-            logger.warning("Stored token invalid: %s", exc)
-            self._simulation_mode = True
-            return False
-
-    def _apply_token(self, token: str) -> None:
-        """Apply a fresh access token — set on instance and persist."""
-        kite = self._get_kite_instance()
-        kite.set_access_token(token)
-        self._access_token = token
-        self._token_date = date.today().isoformat()
-        self._simulation_mode = False
-
-        # Persist for reuse within the same trading day
-        set_setting(_KEY_ACCESS_TOKEN, token)
-        set_setting(_KEY_TOKEN_DATE, self._token_date)
-        logger.info("Access token applied and persisted for %s", self._token_date)
-
-    def _status_dict(self, login_url: str | None, message: str) -> dict:
-        return {
-            "authenticated": self.is_authenticated(),
-            "mode": "live" if not self._simulation_mode else "simulation",
-            "login_url": login_url,
-            "message": message,
-            "user_id": self._user_id,
-            "token_date": self._token_date,
-        }
 
     # ======================================================================
     # SIMULATION HELPERS
@@ -1081,7 +819,4 @@ class KiteService:
         return today + timedelta(days=days_ahead)
 
 
-# ---------------------------------------------------------------------------
-# Module-level singleton
-# ---------------------------------------------------------------------------
-kite_service = KiteService()
+# Module-level singleton removed — use get_kite_for_user(user_id) factory

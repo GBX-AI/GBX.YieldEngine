@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { getSettings, updateSettings, getRiskProfile, setRiskProfile, kiteLogin, kiteAutoLogin, setCircuitBreaker, getStatus } from '../api';
+import { getSettings, updateSettings, getRiskProfile, setRiskProfile, kiteLogin, kiteConnect, setCircuitBreaker, getStatus } from '../api';
 
 const c = {
   bg: '#0a0f1a',
@@ -406,7 +406,7 @@ export default function Settings() {
   const handleAutoLogin = async () => {
     setKiteLoading(true);
     try {
-      await kiteAutoLogin();
+      await kiteConnect();
       setKiteConnected(true);
     } catch {
       // silent

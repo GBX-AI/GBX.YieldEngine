@@ -7,3 +7,5 @@ requests==2.32.3
 apscheduler==3.10.4
 cryptography==44.0.0
 yfinance>=0.2.36
+PyJWT>=2.8.0
+bcrypt>=4.0.0

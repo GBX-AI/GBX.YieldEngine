@@ -1,13 +1,87 @@
 const BASE = import.meta.env.VITE_API_BASE || '';
 
+let _isRefreshing = false;
+let _refreshQueue = [];
+
+async function _tryRefresh() {
+  const refreshToken = localStorage.getItem('refreshToken');
+  if (!refreshToken) return false;
+  try {
+    const res = await fetch(`${BASE}/api/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    localStorage.setItem('accessToken', data.access_token);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function request(path, options = {}) {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
-    ...options,
-  });
+  const token = localStorage.getItem('accessToken');
+  const headers = { 'Content-Type': 'application/json', ...options.headers };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  let res = await fetch(`${BASE}${path}`, { ...options, headers });
+
+  // Handle 401 — try refresh once
+  if (res.status === 401) {
+    if (!_isRefreshing) {
+      _isRefreshing = true;
+      const refreshed = await _tryRefresh();
+      _isRefreshing = false;
+      _refreshQueue.forEach((cb) => cb(refreshed));
+      _refreshQueue = [];
+
+      if (refreshed) {
+        const newToken = localStorage.getItem('accessToken');
+        headers['Authorization'] = `Bearer ${newToken}`;
+        res = await fetch(`${BASE}${path}`, { ...options, headers });
+      } else {
+        localStorage.removeItem('accessToken');
+        localStorage.removeItem('refreshToken');
+        window.location.href = '/login';
+        throw new Error('Session expired');
+      }
+    } else {
+      // Wait for ongoing refresh
+      const refreshed = await new Promise((resolve) => _refreshQueue.push(resolve));
+      if (refreshed) {
+        const newToken = localStorage.getItem('accessToken');
+        headers['Authorization'] = `Bearer ${newToken}`;
+        res = await fetch(`${BASE}${path}`, { ...options, headers });
+      } else {
+        throw new Error('Session expired');
+      }
+    }
+  }
+
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || res.statusText);
+    throw new Error(err.error || err.detail || res.statusText);
+  }
+  return res.json();
+}
+
+// Authenticated file upload (FormData — no Content-Type header, browser sets it)
+async function uploadRequest(path, formData) {
+  const token = localStorage.getItem('accessToken');
+  const headers = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const res = await fetch(`${BASE}${path}`, { method: 'POST', headers, body: formData });
+  if (res.status === 401) {
+    const refreshed = await _tryRefresh();
+    if (refreshed) {
+      headers['Authorization'] = `Bearer ${localStorage.getItem('accessToken')}`;
+      const res2 = await fetch(`${BASE}${path}`, { method: 'POST', headers, body: formData });
+      return res2.json();
+    }
+    window.location.href = '/login';
+    throw new Error('Session expired');
   }
   return res.json();
 }
@@ -20,8 +94,8 @@ export const setPermission = (data) => request('/api/permission', { method: 'POS
 // Holdings
 export const getHoldings = () => request('/api/holdings');
 export const importJson = (data) => request('/api/import/json', { method: 'POST', body: JSON.stringify(data) });
-export const detectCsvColumns = (formData) => fetch(`${BASE}/api/import/csv/detect`, { method: 'POST', body: formData }).then(r => r.json());
-export const importCsv = (formData) => fetch(`${BASE}/api/import/csv`, { method: 'POST', body: formData }).then(r => r.json());
+export const detectCsvColumns = (formData) => uploadRequest('/api/import/csv/detect', formData);
+export const importCsv = (formData) => uploadRequest('/api/import/csv', formData);
 export const importManual = (data) => request('/api/import/manual', { method: 'POST', body: JSON.stringify(data) });
 export const importFromKite = () => request('/api/import/kite', { method: 'POST' });
 export const deleteHolding = (symbol) => request(`/api/holdings/${encodeURIComponent(symbol)}`, { method: 'DELETE' });
@@ -98,4 +172,9 @@ export const cancelGtt = (id) => request(`/api/gtt/${id}`, { method: 'DELETE' })
 
 // Kite Auth
 export const kiteLogin = () => request('/api/kite/login');
-export const kiteAutoLogin = () => request('/api/kite/auto-login', { method: 'POST' });
+export const kiteConnect = (requestToken) => request('/api/kite/connect', { method: 'POST', body: JSON.stringify({ request_token: requestToken }) });
+export const kiteStatus = () => request('/api/kite/status');
+export const kiteDisconnect = () => request('/api/kite/disconnect', { method: 'POST' });
+
+// Auth
+export const authMe = () => request('/api/auth/me');

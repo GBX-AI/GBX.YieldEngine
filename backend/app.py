@@ -1,6 +1,6 @@
 """
 Yield Engine v3 — Flask app factory with all API routes.
-Complete implementation with all endpoints from the spec.
+Multi-user implementation with per-user Kite connections and auth.
 """
 
 import csv
@@ -9,7 +9,7 @@ import os
 import json
 from collections import defaultdict
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, g, redirect
 from flask_cors import CORS
 
 from models import (
@@ -17,6 +17,7 @@ from models import (
     get_setting, set_setting, get_all_settings,
     get_all_holdings, save_holdings, upsert_holding, delete_holding as db_delete_holding,
     get_cash_balance, save_cash_balance,
+    update_user_kite_token, clear_user_kite_token, get_user_kite_token,
     SAFETY_HARD_CAPS, SIMULATION_STOCKS, SIMULATION_INDICES,
 )
 from fee_calculator import calculate_fees, calculate_trade_fees, format_fee_breakdown
@@ -31,29 +32,29 @@ from risk_manager import monitor_positions, compute_adjustments, compute_risk_di
 from notification_service import create_notification as ns_create_notification
 from dry_run_validator import validate_order
 from reconciliation import reconcile_order
-from kite_service import kite_service
+from kite_service import KiteService, get_kite_for_user, get_login_url, exchange_request_token
+from auth import auth_bp, require_auth
 import live_price_service
 
-# In-memory state (transient session data only — holdings/cash persisted in SQLite)
-state = {
-    "permission": "READONLY",
-    "kite": None,
-    "access_token": None,
-    "last_scan": None,
-    "recommendations": [],
-    "arbitrage_opportunities": [],
-}
+# Per-user in-memory state (transient session data only — holdings/cash persisted in SQLite)
+_user_state = {}  # {user_id: {recommendations: [], arbitrage_opportunities: [], last_scan: None}}
+
+def _get_user_state(user_id):
+    if user_id not in _user_state:
+        _user_state[user_id] = {"recommendations": [], "arbitrage_opportunities": [], "last_scan": None, "permission": "READONLY"}
+    return _user_state[user_id]
 
 
 def create_app():
     app = Flask(__name__, static_folder="static", static_url_path="")
     CORS(app)
 
+    # Register auth blueprint
+    app.register_blueprint(auth_bp)
+
     # Initialize database on startup
     with app.app_context():
         init_db()
-        # Load holdings from last session if available
-        _load_persisted_state()
         # Pre-warm price cache in background so first page load is fast
         _warm_price_cache()
 
@@ -64,10 +65,6 @@ def create_app():
         return jsonify({
             "status": "running",
             "version": "3.0.0",
-            "permission": state["permission"],
-            "kite_connected": state["access_token"] is not None,
-            "holdings_count": len(get_all_holdings()),
-            "simulation_mode": state["access_token"] is None,
             "price_sources": live_price_service.get_price_source_status(),
             "timestamp": now_iso(),
         })
@@ -75,11 +72,15 @@ def create_app():
     # ─── PERMISSION ──────────────────────────────────────────────
 
     @app.route("/api/permission", methods=["GET"])
+    @require_auth
     def get_permission():
-        return jsonify({"permission": state["permission"]})
+        user_id = g.current_user["id"]
+        return jsonify({"permission": _get_user_state(user_id)["permission"]})
 
     @app.route("/api/permission", methods=["POST"])
+    @require_auth
     def set_permission():
+        user_id = g.current_user["id"]
         data = request.json or {}
         requested = data.get("permission", "READONLY")
 
@@ -88,26 +89,28 @@ def create_app():
                 return jsonify({
                     "error": "Must set confirm=true and understand_risk=true to enable EXECUTE"
                 }), 400
-            state["permission"] = "EXECUTE"
+            _get_user_state(user_id)["permission"] = "EXECUTE"
             _create_notification(
                 "PERMISSION_CHANGE", "Execute mode enabled",
                 "You have enabled execute mode. All trades require individual confirmation.",
                 "WARNING"
             )
         else:
-            state["permission"] = "READONLY"
+            _get_user_state(user_id)["permission"] = "READONLY"
             _create_notification(
                 "PERMISSION_CHANGE", "Read-only mode",
                 "Execution disabled. No orders can be placed.", "INFO"
             )
 
-        return jsonify({"permission": state["permission"]})
+        return jsonify({"permission": _get_user_state(user_id)["permission"]})
 
     # ─── SETTINGS ────────────────────────────────────────────────
 
     @app.route("/api/settings", methods=["GET"])
+    @require_auth
     def api_get_settings():
-        settings = get_all_settings()
+        user_id = g.current_user["id"]
+        settings = get_all_settings(user_id)
         # Mask TOTP secret
         if settings.get("kite_totp_secret"):
             secret = settings["kite_totp_secret"]
@@ -118,7 +121,9 @@ def create_app():
         return jsonify(settings)
 
     @app.route("/api/settings", methods=["POST"])
+    @require_auth
     def api_update_settings():
+        user_id = g.current_user["id"]
         data = request.json or {}
         updated = []
         for key, value in data.items():
@@ -126,37 +131,42 @@ def create_app():
             if key in ("MAX_LOTS_PER_ORDER_NIFTY", "MAX_ORDER_VALUE", "MAX_ORDERS_PER_DAY",
                        "MAX_OPEN_POSITIONS", "ALLOWED_EXCHANGES", "ALLOWED_PRODUCTS"):
                 continue
-            set_setting(key, value)
+            set_setting(key, value, user_id)
             updated.append(key)
         return jsonify({"updated": updated})
 
     @app.route("/api/safety/caps", methods=["GET"])
+    @require_auth
     def api_safety_caps():
         return jsonify(SAFETY_HARD_CAPS)
 
     # ─── HOLDINGS / PORTFOLIO ────────────────────────────────────
 
     @app.route("/api/holdings", methods=["GET"])
+    @require_auth
     def api_holdings():
-        summary = _compute_portfolio_summary()
+        user_id = g.current_user["id"]
+        summary = _compute_portfolio_summary(user_id)
         return jsonify({
             "holdings": summary["holdings"],  # enriched with value, pnl, status
-            "cash_balance": get_cash_balance(),
+            "cash_balance": get_cash_balance(user_id),
             "summary": summary,
         })
 
     @app.route("/api/import/json", methods=["POST"])
+    @require_auth
     def api_import_json():
+        user_id = g.current_user["id"]
         data = request.json or {}
         holdings = data.get("holdings", [])
-        cash = data.get("cash_balance", get_cash_balance())
+        cash = data.get("cash_balance", get_cash_balance(user_id))
 
-        save_holdings(holdings)
-        save_cash_balance(cash)
+        save_holdings(holdings, user_id)
+        save_cash_balance(cash, user_id)
         return jsonify({
             "imported": len(holdings),
             "cash_balance": cash,
-            "summary": _compute_portfolio_summary(),
+            "summary": _compute_portfolio_summary(user_id),
         })
 
     # ─── CSV COLUMN AUTO-DETECTION ──────────────────────────────
@@ -224,10 +234,10 @@ def create_app():
                 groups[symbol]["sell_qty"] += qty
 
         holdings = []
-        for sym, g in groups.items():
-            net_qty = g["buy_qty"] - g["sell_qty"]
+        for sym, g_item in groups.items():
+            net_qty = g_item["buy_qty"] - g_item["sell_qty"]
             if net_qty > 0:
-                avg_price = g["buy_value"] / g["buy_qty"] if g["buy_qty"] > 0 else 0
+                avg_price = g_item["buy_value"] / g_item["buy_qty"] if g_item["buy_qty"] > 0 else 0
                 holdings.append({
                     "symbol": sym,
                     "qty": int(net_qty),
@@ -273,6 +283,7 @@ def create_app():
         return holdings
 
     @app.route("/api/import/csv/detect", methods=["POST"])
+    @require_auth
     def api_csv_detect():
         """Step 1: Upload CSV, auto-detect columns, return mapping + preview."""
         if "file" not in request.files:
@@ -338,8 +349,10 @@ def create_app():
         })
 
     @app.route("/api/import/csv", methods=["POST"])
+    @require_auth
     def api_import_csv():
         """Step 2: Import CSV with confirmed column mapping."""
+        user_id = g.current_user["id"]
         if "file" not in request.files:
             return jsonify({"error": "No file uploaded"}), 400
 
@@ -389,7 +402,7 @@ def create_app():
         # Append or replace
         mode = request.form.get("mode", "replace")
         if mode == "append":
-            existing = get_all_holdings()
+            existing = get_all_holdings(user_id)
             existing_map = {h["symbol"]: h for h in existing}
             for h in holdings:
                 if h["symbol"] in existing_map:
@@ -401,21 +414,23 @@ def create_app():
                         )
                         old["qty"] = total_qty
                         old["ltp"] = h.get("ltp", old.get("ltp", old["avgPrice"]))
-                    upsert_holding(old)
+                    upsert_holding(old, user_id)
                 else:
-                    upsert_holding(h)
+                    upsert_holding(h, user_id)
         else:
-            save_holdings(holdings)
+            save_holdings(holdings, user_id)
 
         return jsonify({
             "imported": len(holdings),
             "mode": mode,
             "format_detected": "tradebook" if is_tradebook else "holdings",
-            "summary": _compute_portfolio_summary(),
+            "summary": _compute_portfolio_summary(user_id),
         })
 
     @app.route("/api/import/manual", methods=["POST"])
+    @require_auth
     def api_import_manual():
+        user_id = g.current_user["id"]
         data = request.json or {}
         # Accept both naming conventions
         symbol = data.get("symbol", "")
@@ -435,24 +450,28 @@ def create_app():
         }
 
         # Upsert into DB
-        upsert_holding(holding)
+        upsert_holding(holding, user_id)
 
         return jsonify({
             "holding": holding,
-            "total_holdings": len(get_all_holdings()),
+            "total_holdings": len(get_all_holdings(user_id)),
         })
 
     @app.route("/api/holdings/<symbol>", methods=["DELETE"])
+    @require_auth
     def api_delete_holding(symbol):
+        user_id = g.current_user["id"]
         symbol = symbol.upper()
-        db_delete_holding(symbol)
-        remaining = len(get_all_holdings())
+        db_delete_holding(symbol, user_id)
+        remaining = len(get_all_holdings(user_id))
         return jsonify({"deleted": symbol, "remaining": remaining})
 
     # ─── PORTFOLIO SNAPSHOTS ─────────────────────────────────────
 
     @app.route("/api/portfolios", methods=["GET"])
+    @require_auth
     def api_get_portfolios():
+        user_id = g.current_user["id"]
         conn = get_db()
         rows = conn.execute(
             "SELECT * FROM portfolio_snapshots ORDER BY created_at DESC"
@@ -461,23 +480,26 @@ def create_app():
         return jsonify([dict(r) for r in rows])
 
     @app.route("/api/portfolios", methods=["POST"])
+    @require_auth
     def api_save_portfolio():
+        user_id = g.current_user["id"]
         data = request.json or {}
         name = data.get("name", f"Snapshot {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         snapshot_id = generate_id()
-        summary = _compute_portfolio_summary()
+        summary = _compute_portfolio_summary(user_id)
 
         conn = get_db()
         conn.execute(
             "INSERT INTO portfolio_snapshots (id, name, holdings, cash_balance, total_value) VALUES (?, ?, ?, ?, ?)",
-            (snapshot_id, name, json.dumps(get_all_holdings()),
-             get_cash_balance(), summary["portfolio_value"])
+            (snapshot_id, name, json.dumps(get_all_holdings(user_id)),
+             get_cash_balance(user_id), summary["portfolio_value"])
         )
         conn.commit()
         conn.close()
         return jsonify({"id": snapshot_id, "name": name})
 
     @app.route("/api/portfolios/<pid>", methods=["DELETE"])
+    @require_auth
     def api_delete_portfolio(pid):
         conn = get_db()
         conn.execute("DELETE FROM portfolio_snapshots WHERE id = ?", (pid,))
@@ -486,7 +508,9 @@ def create_app():
         return jsonify({"deleted": pid})
 
     @app.route("/api/portfolios/<pid>/load", methods=["POST"])
+    @require_auth
     def api_load_portfolio(pid):
+        user_id = g.current_user["id"]
         conn = get_db()
         row = conn.execute("SELECT * FROM portfolio_snapshots WHERE id = ?", (pid,)).fetchone()
         conn.close()
@@ -495,8 +519,8 @@ def create_app():
 
         loaded_holdings = json.loads(row["holdings"])
         loaded_cash = row["cash_balance"] or 0
-        save_holdings(loaded_holdings)
-        save_cash_balance(loaded_cash)
+        save_holdings(loaded_holdings, user_id)
+        save_cash_balance(loaded_cash, user_id)
         return jsonify({
             "loaded": row["name"],
             "holdings_count": len(loaded_holdings),
@@ -506,12 +530,15 @@ def create_app():
     # ─── COLLATERAL ──────────────────────────────────────────────
 
     @app.route("/api/collateral", methods=["GET"])
+    @require_auth
     def api_collateral():
-        return jsonify(_compute_portfolio_summary())
+        user_id = g.current_user["id"]
+        return jsonify(_compute_portfolio_summary(user_id))
 
     # ─── NOTIFICATIONS ───────────────────────────────────────────
 
     @app.route("/api/notifications", methods=["GET"])
+    @require_auth
     def api_notifications():
         page = int(request.args.get("page", 1))
         per_page = int(request.args.get("per_page", 20))
@@ -532,6 +559,7 @@ def create_app():
         })
 
     @app.route("/api/notifications/unread-count", methods=["GET"])
+    @require_auth
     def api_unread_count():
         conn = get_db()
         count = conn.execute(
@@ -541,6 +569,7 @@ def create_app():
         return jsonify({"unread_count": count})
 
     @app.route("/api/notifications/<nid>/read", methods=["POST"])
+    @require_auth
     def api_mark_read(nid):
         conn = get_db()
         conn.execute("UPDATE notifications SET read = 1 WHERE id = ?", (nid,))
@@ -549,6 +578,7 @@ def create_app():
         return jsonify({"marked": nid})
 
     @app.route("/api/notifications/read-all", methods=["POST"])
+    @require_auth
     def api_mark_all_read():
         conn = get_db()
         conn.execute("UPDATE notifications SET read = 1 WHERE read = 0")
@@ -557,6 +587,7 @@ def create_app():
         return jsonify({"status": "all_read"})
 
     @app.route("/api/notifications/<nid>", methods=["DELETE"])
+    @require_auth
     def api_delete_notification(nid):
         conn = get_db()
         conn.execute("DELETE FROM notifications WHERE id = ?", (nid,))
@@ -567,6 +598,7 @@ def create_app():
     # ─── DAILY SUMMARY ───────────────────────────────────────────
 
     @app.route("/api/daily-summary", methods=["GET"])
+    @require_auth
     def api_today_summary():
         today = datetime.now().strftime("%Y-%m-%d")
         conn = get_db()
@@ -581,6 +613,7 @@ def create_app():
         })
 
     @app.route("/api/daily-summary/<date>", methods=["GET"])
+    @require_auth
     def api_summary_by_date(date):
         conn = get_db()
         row = conn.execute("SELECT * FROM daily_summary WHERE date = ?", (date,)).fetchone()
@@ -592,6 +625,7 @@ def create_app():
     # ─── TRADES (read-only for Phase 1) ──────────────────────────
 
     @app.route("/api/trades", methods=["GET"])
+    @require_auth
     def api_trades():
         conn = get_db()
         strategy = request.args.get("strategy")
@@ -616,6 +650,7 @@ def create_app():
         return jsonify([dict(r) for r in rows])
 
     @app.route("/api/trades/<tid>", methods=["GET"])
+    @require_auth
     def api_trade_detail(tid):
         conn = get_db()
         row = conn.execute("SELECT * FROM trades WHERE id = ?", (tid,)).fetchone()
@@ -627,6 +662,7 @@ def create_app():
     # ─── POSITIONS (read-only for Phase 1) ───────────────────────
 
     @app.route("/api/positions", methods=["GET"])
+    @require_auth
     def api_positions():
         conn = get_db()
         rows = conn.execute(
@@ -638,6 +674,7 @@ def create_app():
     # ─── ANALYTICS (basic for Phase 1) ───────────────────────────
 
     @app.route("/api/analytics/summary", methods=["GET"])
+    @require_auth
     def api_analytics_summary():
         conn = get_db()
         closed = conn.execute(
@@ -665,6 +702,7 @@ def create_app():
         })
 
     @app.route("/api/analytics/strategy", methods=["GET"])
+    @require_auth
     def api_analytics_strategy():
         conn = get_db()
         rows = conn.execute(
@@ -679,6 +717,7 @@ def create_app():
         return jsonify([dict(r) for r in rows])
 
     @app.route("/api/analytics/monthly", methods=["GET"])
+    @require_auth
     def api_analytics_monthly():
         conn = get_db()
         rows = conn.execute(
@@ -693,6 +732,7 @@ def create_app():
         return jsonify([dict(r) for r in rows])
 
     @app.route("/api/analytics/daily", methods=["GET"])
+    @require_auth
     def api_analytics_daily():
         start = request.args.get("start")
         end = request.args.get("end")
@@ -713,6 +753,7 @@ def create_app():
     # ─── FEES ────────────────────────────────────────────────────
 
     @app.route("/api/fees/estimate", methods=["GET"])
+    @require_auth
     def api_fees_estimate():
         action = request.args.get("action", "SELL")
         premium = float(request.args.get("premium", 0))
@@ -721,6 +762,7 @@ def create_app():
         return jsonify(fees)
 
     @app.route("/api/fees/summary", methods=["GET"])
+    @require_auth
     def api_fees_summary():
         period = request.args.get("period", "monthly")
         conn = get_db()
@@ -747,6 +789,7 @@ def create_app():
     # ─── AUDIT ───────────────────────────────────────────────────
 
     @app.route("/api/audit/orders", methods=["GET"])
+    @require_auth
     def api_audit_orders():
         conn = get_db()
         rows = conn.execute(
@@ -758,6 +801,7 @@ def create_app():
     # ─── GTT ─────────────────────────────────────────────────────
 
     @app.route("/api/gtt/active", methods=["GET"])
+    @require_auth
     def api_gtt_active():
         conn = get_db()
         rows = conn.execute(
@@ -769,70 +813,97 @@ def create_app():
     # ─── KITE AUTH ────────────────────────────────────────────────
 
     @app.route("/api/kite/login", methods=["GET"])
+    @require_auth
     def api_kite_login():
-        login_url = kite_service.get_login_url()
-        authenticated = kite_service.is_authenticated()
+        user_id = g.current_user["id"]
+        login_url_val = get_login_url()
+        kite = get_kite_for_user(user_id)
+        authenticated = kite.is_authenticated() if kite else False
         return jsonify({
-            "login_url": login_url,
+            "login_url": login_url_val,
             "authenticated": authenticated,
             "simulation_mode": not authenticated,
-            "kite_configured": bool(login_url),
-            "message": "Kite API not configured. Running in simulation mode." if not login_url else None,
+            "kite_configured": bool(login_url_val),
+            "message": "Kite API not configured. Running in simulation mode." if not login_url_val else None,
         })
+
+    @app.route("/api/kite/connect", methods=["POST"])
+    @require_auth
+    def api_kite_connect():
+        """Exchange request_token for access_token and store on user."""
+        user_id = g.current_user["id"]
+        data = request.json or {}
+        request_token = data.get("request_token")
+        if not request_token:
+            return jsonify({"error": "request_token is required"}), 400
+        try:
+            access_token = exchange_request_token(request_token)
+            update_user_kite_token(user_id, access_token)
+            return jsonify({"status": "connected", "message": "Kite connected successfully"})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/kite/status", methods=["GET"])
+    @require_auth
+    def api_kite_status():
+        """Return user's Kite connection status."""
+        user_id = g.current_user["id"]
+        kite = get_kite_for_user(user_id)
+        authenticated = kite.is_authenticated() if kite else False
+        return jsonify({
+            "connected": authenticated,
+            "simulation_mode": not authenticated,
+        })
+
+    @app.route("/api/kite/disconnect", methods=["POST"])
+    @require_auth
+    def api_kite_disconnect():
+        """Clear user's Kite token."""
+        user_id = g.current_user["id"]
+        clear_user_kite_token(user_id)
+        return jsonify({"status": "disconnected", "message": "Kite disconnected"})
 
     @app.route("/api/callback", methods=["GET"])
     def api_kite_callback():
+        """Redirect to frontend with request_token (browser redirect from Zerodha)."""
         request_token = request.args.get("request_token")
         if not request_token:
             return jsonify({"error": "No request_token provided"}), 400
-        try:
-            kite_service.set_access_token(request_token)
-            state["access_token"] = request_token
-            return jsonify({"status": "authenticated"})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-    @app.route("/api/kite/auto-login", methods=["POST"])
-    def api_kite_auto_login():
-        try:
-            result = kite_service.initialize()
-            if kite_service.is_authenticated():
-                state["access_token"] = "active"
-                return jsonify({"status": "authenticated", "message": "Auto-login successful"})
-            login_url = kite_service.get_login_url()
-            if not login_url:
-                return jsonify({"status": "simulation", "message": "No Kite API key configured. Running in simulation mode."}), 200
-            return jsonify({"status": "failed", "message": "Auto-login failed, use manual login",
-                          "login_url": login_url}), 401
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+        return redirect(f"/kite/callback?request_token={request_token}")
 
     @app.route("/api/import/kite", methods=["POST"])
+    @require_auth
     def api_import_kite():
-        if not kite_service.is_authenticated():
+        user_id = g.current_user["id"]
+        kite = get_kite_for_user(user_id)
+        if not kite or not kite.is_authenticated():
             return jsonify({"error": "Kite not connected"}), 401
         try:
-            holdings = kite_service.get_holdings()
-            save_holdings(holdings)
-            return jsonify({"imported": len(holdings), "summary": _compute_portfolio_summary()})
+            holdings = kite.get_holdings()
+            save_holdings(holdings, user_id)
+            return jsonify({"imported": len(holdings), "summary": _compute_portfolio_summary(user_id)})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
     # ─── SCAN / RECOMMENDATIONS ──────────────────────────────────
 
     @app.route("/api/scan", methods=["POST"])
+    @require_auth
     def api_scan():
+        user_id = g.current_user["id"]
         data = request.json or {}
-        cash = data.get("cash_balance", get_cash_balance())
-        save_cash_balance(cash)
+        cash = data.get("cash_balance", get_cash_balance(user_id))
+        save_cash_balance(cash, user_id)
 
-        settings = get_all_settings()
-        recs = scan_strategies(get_all_holdings(), cash, settings)
-        state["recommendations"] = recs
-        state["last_scan"] = now_iso()
+        settings = get_all_settings(user_id)
+        recs = scan_strategies(get_all_holdings(user_id), cash, settings)
+        _get_user_state(user_id)["recommendations"] = recs
+        _get_user_state(user_id)["last_scan"] = now_iso()
 
-        arbs = scan_arbitrage(None, simulation=not kite_service.is_authenticated())
-        state["arbitrage_opportunities"] = arbs
+        kite = get_kite_for_user(user_id)
+        kite_authenticated = kite.is_authenticated() if kite else False
+        arbs = scan_arbitrage(None, simulation=not kite_authenticated)
+        _get_user_state(user_id)["arbitrage_opportunities"] = arbs
 
         _create_notification("SCAN_COMPLETE", "Scan complete",
             f"Found {len(recs)} strategy opportunities and {len(arbs)} arbitrage opportunities.",
@@ -841,11 +912,13 @@ def create_app():
         return jsonify({
             "recommendations": recs,
             "arbitrage": arbs,
-            "scanned_at": state["last_scan"],
+            "scanned_at": _get_user_state(user_id)["last_scan"],
         })
 
     @app.route("/api/recommendations", methods=["GET", "POST"])
+    @require_auth
     def api_recommendations():
+        user_id = g.current_user["id"]
         # Support both GET params and POST JSON body for filters
         if request.method == "POST":
             data = request.json or {}
@@ -855,7 +928,7 @@ def create_app():
             safety = request.args.get("safety")
             strategy = request.args.get("type")
 
-        recs = state["recommendations"]
+        recs = _get_user_state(user_id)["recommendations"]
         if safety and safety != "ALL":
             recs = [r for r in recs if r.get("safety_tag") == safety or r.get("safety") == safety]
         if strategy and strategy != "ALL":
@@ -864,14 +937,18 @@ def create_app():
         return jsonify({"recommendations": recs})
 
     @app.route("/api/arbitrage", methods=["GET"])
+    @require_auth
     def api_arbitrage():
-        return jsonify(state["arbitrage_opportunities"])
+        user_id = g.current_user["id"]
+        return jsonify(_get_user_state(user_id)["arbitrage_opportunities"])
 
     # ─── EXECUTE ─────────────────────────────────────────────────
 
     @app.route("/api/execute", methods=["POST"])
+    @require_auth
     def api_execute():
-        if state["permission"] != "EXECUTE":
+        user_id = g.current_user["id"]
+        if _get_user_state(user_id)["permission"] != "EXECUTE":
             return jsonify({"error": "Permission denied. Enable EXECUTE mode first."}), 403
 
         data = request.json or {}
@@ -883,7 +960,7 @@ def create_app():
             return jsonify({"error": "Must confirm execution and acknowledge risk"}), 400
 
         # Find recommendation
-        rec = next((r for r in state["recommendations"] if r.get("id") == rec_id), None)
+        rec = next((r for r in _get_user_state(user_id)["recommendations"] if r.get("id") == rec_id), None)
         if not rec:
             return jsonify({"error": "Recommendation not found"}), 404
 
@@ -901,7 +978,7 @@ def create_app():
             })
 
         # Dry run validation
-        validation = validate_order(order_legs, state)
+        validation = validate_order(order_legs, _get_user_state(user_id))
         if not validation["valid"]:
             # Log rejected order
             conn = get_db()
@@ -923,19 +1000,22 @@ def create_app():
 
         # Execute (simulation or live)
         try:
-            if kite_service.is_authenticated():
+            kite = get_kite_for_user(user_id)
+            kite_authenticated = kite.is_authenticated() if kite else False
+
+            if kite_authenticated:
                 # Live execution via Kite
                 kite_order_ids = []
                 for leg in order_legs:
-                    result = kite_service.place_order(**leg)
+                    result = kite.place_order(**leg)
                     if not result.get("success"):
                         return jsonify({"error": f"Order failed: {result.get('error', 'unknown')}"}), 500
                     kite_order_ids.append(result["order_id"])
 
                     # Post-order reconciliation
-                    recon = reconcile_order(leg, result["order_id"], kite_service)
+                    recon = reconcile_order(leg, result["order_id"], kite)
                     if recon["alert"]:
-                        state["permission"] = "READONLY"
+                        _get_user_state(user_id)["permission"] = "READONLY"
                         return jsonify({"error": recon["message"], "reconciliation": recon}), 500
             else:
                 kite_order_ids = [f"SIM-{generate_id()[:8]}"]
@@ -966,7 +1046,7 @@ def create_app():
                 "status": "executed",
                 "trade_id": trade_id,
                 "kite_order_ids": kite_order_ids,
-                "simulation": not kite_service.is_authenticated(),
+                "simulation": not kite_authenticated,
             })
 
         except Exception as e:
@@ -984,8 +1064,10 @@ def create_app():
     # ─── POSITIONS MANAGEMENT ────────────────────────────────────
 
     @app.route("/api/positions/<pid>/close", methods=["POST"])
+    @require_auth
     def api_close_position(pid):
-        if state["permission"] != "EXECUTE":
+        user_id = g.current_user["id"]
+        if _get_user_state(user_id)["permission"] != "EXECUTE":
             return jsonify({"error": "Permission denied. Enable EXECUTE mode first."}), 403
 
         data = request.json or {}
@@ -999,8 +1081,10 @@ def create_app():
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/positions/<pid>/roll", methods=["POST"])
+    @require_auth
     def api_roll_position(pid):
-        if state["permission"] != "EXECUTE":
+        user_id = g.current_user["id"]
+        if _get_user_state(user_id)["permission"] != "EXECUTE":
             return jsonify({"error": "Permission denied. Enable EXECUTE mode first."}), 403
 
         data = request.json or {}
@@ -1012,6 +1096,7 @@ def create_app():
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/positions/<pid>/adjustments", methods=["GET"])
+    @require_auth
     def api_position_adjustments(pid):
         try:
             adjustments = compute_adjustments(pid)
@@ -1020,8 +1105,10 @@ def create_app():
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/positions/<pid>/adjust", methods=["POST"])
+    @require_auth
     def api_execute_adjustment(pid):
-        if state["permission"] != "EXECUTE":
+        user_id = g.current_user["id"]
+        if _get_user_state(user_id)["permission"] != "EXECUTE":
             return jsonify({"error": "Permission denied. Enable EXECUTE mode first."}), 403
 
         data = request.json or {}
@@ -1039,6 +1126,7 @@ def create_app():
     # ─── RISK ────────────────────────────────────────────────────
 
     @app.route("/api/risk/status", methods=["GET"])
+    @require_auth
     def api_risk_status():
         try:
             status = get_risk_status()
@@ -1047,6 +1135,7 @@ def create_app():
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/risk/alerts", methods=["GET"])
+    @require_auth
     def api_risk_alerts():
         try:
             alerts = get_risk_alerts()
@@ -1055,33 +1144,41 @@ def create_app():
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/settings/risk-profile", methods=["GET"])
+    @require_auth
     def api_get_risk_profile():
-        profile = get_setting("risk_profile") or "moderate"
+        user_id = g.current_user["id"]
+        profile = get_setting("risk_profile", user_id) or "moderate"
         from strike_selector import RISK_PROFILES
         profile_data = RISK_PROFILES.get(profile.capitalize(), RISK_PROFILES["Moderate"])
         return jsonify({"profile": profile, "details": profile_data})
 
     @app.route("/api/settings/risk-profile", methods=["POST"])
+    @require_auth
     def api_set_risk_profile():
+        user_id = g.current_user["id"]
         data = request.json or {}
         profile = data.get("profile", "moderate").lower()
         if profile not in ("conservative", "moderate", "aggressive"):
             return jsonify({"error": "Invalid profile. Use conservative, moderate, or aggressive."}), 400
-        set_setting("risk_profile", profile)
+        set_setting("risk_profile", profile, user_id)
         return jsonify({"profile": profile})
 
     @app.route("/api/settings/circuit-breaker", methods=["POST"])
+    @require_auth
     def api_circuit_breaker():
+        user_id = g.current_user["id"]
         data = request.json or {}
         enabled = data.get("enabled", False)
-        set_setting("circuit_breaker_enabled", str(enabled).lower())
+        set_setting("circuit_breaker_enabled", str(enabled).lower(), user_id)
         return jsonify({"circuit_breaker_enabled": enabled})
 
     # ─── GTT DELETE ──────────────────────────────────────────────
 
     @app.route("/api/gtt/<gtt_id>", methods=["DELETE"])
+    @require_auth
     def api_delete_gtt(gtt_id):
-        if state["permission"] != "EXECUTE":
+        user_id = g.current_user["id"]
+        if _get_user_state(user_id)["permission"] != "EXECUTE":
             return jsonify({"error": "Permission denied. Enable EXECUTE mode first."}), 403
         conn = get_db()
         conn.execute("UPDATE gtt_orders SET status = 'CANCELLED' WHERE id = ?", (gtt_id,))
@@ -1107,10 +1204,10 @@ def create_app():
 
 # ─── HELPERS ─────────────────────────────────────────────────────
 
-def _compute_portfolio_summary():
+def _compute_portfolio_summary(user_id):
     """Compute collateral and portfolio summary from holdings."""
-    holdings = get_all_holdings()
-    cash = get_cash_balance()
+    holdings = get_all_holdings(user_id)
+    cash = get_cash_balance(user_id)
 
     # Fetch live prices for all symbols
     symbols = [h["symbol"] for h in holdings]
@@ -1202,12 +1299,19 @@ def _create_notification(ntype, title, message, severity="INFO", action_url=None
 
 
 def _warm_price_cache():
-    """Pre-fetch live prices for all holdings in background thread."""
+    """Pre-fetch live prices for all users' holdings in background thread."""
     import threading
-    holdings = get_all_holdings()
-    if not holdings:
+    # Collect symbols from all users
+    try:
+        conn = get_db()
+        rows = conn.execute("SELECT DISTINCT symbol FROM holdings").fetchall()
+        conn.close()
+        symbols = [r["symbol"] for r in rows]
+    except Exception:
+        symbols = []
+
+    if not symbols:
         return
-    symbols = [h["symbol"] for h in holdings]
     # Also warm index prices
     symbols.extend(["NIFTY", "BANKNIFTY"])
 
@@ -1217,18 +1321,6 @@ def _warm_price_cache():
         except Exception:
             pass
     threading.Thread(target=_fetch, daemon=True).start()
-
-
-def _load_persisted_state():
-    """Load any persisted state from the database on startup."""
-    # Check if we have a recent access token
-    token = get_setting("access_token")
-    token_date = get_setting("access_token_date")
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    if token and token_date == today:
-        state["access_token"] = token
-    # Holdings and cash_balance are now always read from SQLite — no in-memory loading needed
 
 
 # ─── APP ENTRY POINT ─────────────────────────────────────────────
