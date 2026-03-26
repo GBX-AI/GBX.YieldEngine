@@ -43,7 +43,8 @@ export default function Login() {
       }
       navigate('/', { replace: true });
     } catch (err) {
-      setError(err.message);
+      console.error('Auth error:', err);
+      setError(err.message || 'Something went wrong. Please try again.');
     } finally {
       setLoading(false);
     }
