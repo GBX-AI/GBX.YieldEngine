@@ -4,14 +4,20 @@ Provides signup, login, token refresh, and @require_auth decorator.
 """
 
 import functools
+import hashlib
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 
 import jwt
 import bcrypt as _bcrypt
 from flask import Blueprint, request, jsonify, g
 
-from models import create_user, get_user_by_email, get_user_by_id, generate_id
+from models import (
+    create_user, get_user_by_email, get_user_by_id, generate_id,
+    create_reset_token, get_valid_reset_token, mark_reset_token_used, update_user_password,
+)
+from email_service import send_reset_email
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
@@ -170,3 +176,56 @@ def me():
         "kite_connected": bool(user.get("kite_access_token")),
         "kite_user_id": user.get("kite_user_id"),
     })
+
+
+# ─── Forgot / Reset Password ────────────────────────────────────────────────
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://yield-engine-web.whiteocean-b818a22a.centralindia.azurecontainerapps.io")
+
+
+@auth_bp.route("/forgot-password", methods=["POST"])
+def forgot_password():
+    data = request.json or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    # Always return success (don't reveal if email exists)
+    user = get_user_by_email(email)
+    if user:
+        # Generate a secure random token
+        raw_token = secrets.token_urlsafe(48)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        expires_at = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+
+        create_reset_token(user["id"], token_hash, expires_at)
+
+        reset_url = f"{FRONTEND_URL}/reset-password?token={raw_token}"
+        send_reset_email(user["email"], reset_url, user.get("name", ""))
+
+    return jsonify({"message": "If an account exists with that email, a reset link has been sent."})
+
+
+@auth_bp.route("/reset-password", methods=["POST"])
+def reset_password():
+    data = request.json or {}
+    token = data.get("token", "")
+    new_password = data.get("password", "")
+
+    if not token or not new_password:
+        return jsonify({"error": "Token and new password are required"}), 400
+    if len(new_password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    reset_record = get_valid_reset_token(token_hash)
+
+    if not reset_record:
+        return jsonify({"error": "Invalid or expired reset link. Please request a new one."}), 400
+
+    # Update password
+    password_hash = _bcrypt.hashpw(new_password.encode("utf-8"), _bcrypt.gensalt()).decode("utf-8")
+    update_user_password(reset_record["user_id"], password_hash)
+    mark_reset_token_used(reset_record["id"])
+
+    return jsonify({"message": "Password has been reset. You can now login with your new password."})

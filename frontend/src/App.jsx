@@ -14,6 +14,8 @@ import Settings from './pages/Settings';
 import RiskMonitor from './pages/RiskMonitor';
 import Arbitrage from './pages/Arbitrage';
 import Login from './pages/Login';
+import ForgotPassword from './pages/ForgotPassword';
+import ResetPassword from './pages/ResetPassword';
 import KiteCallback from './pages/KiteCallback';
 
 const NAV_ITEMS = [
@@ -67,7 +69,7 @@ function Header() {
 
 function AppLayout() {
   const location = useLocation();
-  const isPublicPage = location.pathname === '/login';
+  const isPublicPage = ['/login', '/forgot-password', '/reset-password'].includes(location.pathname);
 
   return (
     <div style={styles.app}>
@@ -75,6 +77,8 @@ function AppLayout() {
       <main style={isPublicPage ? {} : styles.main}>
         <Routes>
           <Route path="/login" element={<Login />} />
+          <Route path="/forgot-password" element={<ForgotPassword />} />
+          <Route path="/reset-password" element={<ResetPassword />} />
           <Route path="/kite/callback" element={<ProtectedRoute><KiteCallback /></ProtectedRoute>} />
           <Route path="/" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
           <Route path="/holdings" element={<ProtectedRoute><Holdings /></ProtectedRoute>} />

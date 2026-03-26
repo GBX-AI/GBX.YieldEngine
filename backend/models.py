@@ -133,6 +133,11 @@ _CREATE_TABLE_STMTS = [
         kite_access_token TEXT, kite_token_date TEXT, kite_user_id TEXT,
         created_at TEXT DEFAULT (datetime('now'))
     )""",
+    """CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
+        token_hash TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""",
     """CREATE TABLE IF NOT EXISTS trades (
         id TEXT PRIMARY KEY, rec_id TEXT NOT NULL, strategy_type TEXT NOT NULL,
         symbol TEXT NOT NULL, direction TEXT NOT NULL, legs TEXT NOT NULL,
@@ -359,6 +364,44 @@ def get_user_kite_token(user_id):
                 "kite_user_id": row["kite_user_id"]}
     return None
 
+
+# ─── Password reset tokens ───────────────────────────────────────────────────
+
+def create_reset_token(user_id, token_hash, expires_at):
+    conn = get_db()
+    token_id = generate_id()
+    conn.execute(
+        "INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+        (token_id, user_id, token_hash, expires_at)
+    )
+    conn.commit()
+    return token_id
+
+
+def get_valid_reset_token(token_hash):
+    """Find a valid (unused, not expired) reset token."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, user_id, expires_at FROM password_reset_tokens "
+        "WHERE token_hash = ? AND used = 0 AND expires_at > datetime('now')",
+        (token_hash,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def mark_reset_token_used(token_id):
+    conn = get_db()
+    conn.execute("UPDATE password_reset_tokens SET used = 1 WHERE id = ?", (token_id,))
+    conn.commit()
+
+
+def update_user_password(user_id, password_hash):
+    conn = get_db()
+    conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
+    conn.commit()
+
+
+# ─── Settings ────────────────────────────────────────────────────────────────
 
 def get_setting(key, user_id=None):
     conn = get_db()

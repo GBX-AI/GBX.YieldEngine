@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import useAuthStore from '../stores/authStore';
+
+const BASE = import.meta.env.VITE_API_BASE || '';
 
 const C = {
   bg: '#0a0f1a', card: 'rgba(15,23,42,0.85)', border: 'rgba(148,163,184,0.15)',
@@ -90,6 +92,13 @@ export default function Login() {
           <button style={s.submit} type="submit" disabled={loading}>
             {loading ? 'Please wait...' : isSignup ? 'Create Account' : 'Login'}
           </button>
+          {!isSignup && (
+            <div style={{ textAlign: 'center', marginTop: 12 }}>
+              <Link to="/forgot-password" style={{ fontSize: 12, color: C.blue, textDecoration: 'none' }}>
+                Forgot password?
+              </Link>
+            </div>
+          )}
         </form>
 
         <div style={s.footer}>
