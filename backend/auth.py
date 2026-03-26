@@ -20,10 +20,10 @@ from models import (
 )
 from email_service import send_reset_email
 
-logger = logging.getLogger(__name__)
-
-# Configure logging to show in gunicorn output
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
+logger = logging.getLogger("gunicorn.error")
+if not logger.handlers:
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO)
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 

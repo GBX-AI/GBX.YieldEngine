@@ -94,7 +94,7 @@ export default function Login() {
           </button>
           {!isSignup && (
             <div style={{ textAlign: 'center', marginTop: 12 }}>
-              <Link to="/forgot-password" style={{ fontSize: 12, color: C.blue, textDecoration: 'none' }}>
+              <Link to={`/forgot-password${email ? `?email=${encodeURIComponent(email)}` : ''}`} style={{ fontSize: 12, color: C.blue, textDecoration: 'none' }}>
                 Forgot password?
               </Link>
             </div>

@@ -8,7 +8,10 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("gunicorn.error")
+if not logger.handlers:
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO)
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
