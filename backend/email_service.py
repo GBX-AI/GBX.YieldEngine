@@ -71,14 +71,20 @@ This link expires in 1 hour. If you didn't request this, ignore this email.
         msg.attach(MIMEText(text_body, "plain"))
         msg.attach(MIMEText(html_body, "html"))
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        logger.info("SMTP: connecting to %s:%s as %s", SMTP_HOST, SMTP_PORT, SMTP_USER)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
             server.starttls()
+            logger.info("SMTP: TLS established, logging in...")
             server.login(SMTP_USER, SMTP_PASSWORD)
+            logger.info("SMTP: authenticated, sending to %s...", to_email)
             server.send_message(msg)
 
-        logger.info("Reset email sent to %s", to_email)
+        logger.info("SMTP: email sent successfully to %s", to_email)
         return True
 
+    except smtplib.SMTPAuthenticationError as exc:
+        logger.error("SMTP AUTH FAILED for %s: %s", SMTP_USER, exc)
+        return False
     except Exception as exc:
-        logger.error("Failed to send reset email to %s: %s", to_email, exc)
+        logger.error("SMTP: failed to send to %s: %s (%s)", to_email, type(exc).__name__, exc)
         return False

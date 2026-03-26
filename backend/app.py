@@ -5,12 +5,17 @@ Multi-user implementation with per-user Kite connections and auth.
 
 import csv
 import io
+import logging
 import os
 import json
 from collections import defaultdict
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory, g, redirect
 from flask_cors import CORS
+
+# Configure root logger so all modules output to gunicorn
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 from models import (
     init_db, get_db, generate_id, now_iso,
