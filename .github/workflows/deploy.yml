@@ -12,12 +12,13 @@ env:
   BACKEND_APP: yield-engine-api
   FRONTEND_APP: yield-engine-web
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build-backend:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +33,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push backend image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: ./backend
           push: true
@@ -44,9 +45,6 @@ jobs:
 
   build-frontend:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +59,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push frontend image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: ./frontend
           push: true
@@ -83,33 +81,41 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Set GHCR registry on backend
-        run: |
-          az containerapp registry set \
-            --name ${{ env.BACKEND_APP }} \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --server ghcr.io \
-            --username gbx-ai \
-            --password "${{ secrets.GHCR_PAT }}"
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az containerapp registry set \
+              --name ${{ env.BACKEND_APP }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --server ghcr.io \
+              --username gbx-ai \
+              --password "${{ secrets.GHCR_PAT }}"
 
       - name: Deploy backend
-        run: |
-          az containerapp update \
-            --name ${{ env.BACKEND_APP }} \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --image ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az containerapp update \
+              --name ${{ env.BACKEND_APP }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --image ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
 
       - name: Set GHCR registry on frontend
-        run: |
-          az containerapp registry set \
-            --name ${{ env.FRONTEND_APP }} \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --server ghcr.io \
-            --username gbx-ai \
-            --password "${{ secrets.GHCR_PAT }}"
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az containerapp registry set \
+              --name ${{ env.FRONTEND_APP }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --server ghcr.io \
+              --username gbx-ai \
+              --password "${{ secrets.GHCR_PAT }}"
 
       - name: Deploy frontend
-        run: |
-          az containerapp update \
-            --name ${{ env.FRONTEND_APP }} \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --image ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az containerapp update \
+              --name ${{ env.FRONTEND_APP }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --image ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
