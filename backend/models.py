@@ -1,7 +1,7 @@
 """
-SQLite database models and initialization for Yield Engine.
+Database models and initialization for Yield Engine.
+Supports PostgreSQL (via DATABASE_URL) with SQLite fallback for local dev.
 All tables created via raw SQL — no ORM.
-DB file at data/yield_engine.db
 """
 
 import os
@@ -9,7 +9,9 @@ import sqlite3
 import uuid
 from datetime import datetime
 
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 DB_PATH = os.getenv("SQLITE_DB_PATH", os.path.join(os.path.dirname(__file__), "data", "yield_engine.db"))
+_is_pg = bool(DATABASE_URL)
 
 # Safety hard caps — NOT configurable via UI, only via env vars
 SAFETY_HARD_CAPS = {
@@ -76,45 +78,106 @@ DEFAULT_SETTINGS = {
 }
 
 
-import threading as _threading
+# ─── SQLite wrapper that accepts %s placeholders ─────────────────────────────
 
-_db_lock = _threading.Lock()
-_db_conn = None
+class _SQLiteWrapper:
+    """Wraps a sqlite3.Connection so all SQL written with %s placeholders
+    is transparently converted to ? for SQLite. Also converts NOW() to
+    datetime('now') in SQL strings."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=None):
+        sql = sql.replace("%s", "?").replace("NOW()", "datetime('now')")
+        return self._conn.execute(sql, params or ())
+
+    def executemany(self, sql, params_list):
+        sql = sql.replace("%s", "?").replace("NOW()", "datetime('now')")
+        return self._conn.executemany(sql, params_list)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        pass  # no-op — keep connection alive
+
+    @property
+    def row_factory(self):
+        return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._conn.row_factory = value
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
 
 
-def get_db():
-    """
-    Get a shared database connection. Uses a single connection per process
-    with serialized access via lock — required for Azure File Share (SMB)
-    which doesn't support POSIX file locking properly.
-    """
-    global _db_conn
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+# ─── PostgreSQL wrapper that returns dict rows ───────────────────────────────
 
-    if _db_conn is None:
-        _db_conn = _SharedConnection(DB_PATH)
+class _PgWrapper:
+    """Wraps a psycopg2 connection. Uses RealDictCursor so rows come back
+    as dicts (matching sqlite3.Row behaviour). execute() returns a cursor
+    with a fetchone/fetchall interface."""
 
-    return _db_conn
+    def __init__(self, conn):
+        self._conn = conn
 
+    def execute(self, sql, params=None):
+        import psycopg2.extras
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql, params or ())
+        return cur
 
-class _SharedConnection:
-    """
-    Wrapper around sqlite3.Connection that makes close() a no-op.
-    Required because the codebase calls conn.close() everywhere,
-    but we need a single shared connection for Azure File Share (SMB).
-    """
-    def __init__(self, db_path):
-        self._conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=DELETE")
-        self._conn.execute("PRAGMA busy_timeout=10000")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+    def executemany(self, sql, params_list):
+        import psycopg2.extras
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.executemany(sql, params_list)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
 
     def close(self):
         pass  # no-op — keep connection alive
 
     def __getattr__(self, name):
         return getattr(self._conn, name)
+
+
+# ─── Connection management ───────────────────────────────────────────────────
+
+_db_conn = None
+
+
+def get_db():
+    """Return a wrapped database connection (PostgreSQL or SQLite)."""
+    global _db_conn
+    if _db_conn is not None:
+        return _db_conn
+
+    if _is_pg:
+        import psycopg2
+        raw = psycopg2.connect(DATABASE_URL)
+        raw.autocommit = False
+        _db_conn = _PgWrapper(raw)
+    else:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        raw = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+        raw.row_factory = sqlite3.Row
+        raw.execute("PRAGMA journal_mode=DELETE")
+        raw.execute("PRAGMA busy_timeout=10000")
+        raw.execute("PRAGMA foreign_keys=ON")
+        _db_conn = _SQLiteWrapper(raw)
+
+    return _db_conn
 
 
 def generate_id():
@@ -125,18 +188,21 @@ def now_iso():
     return datetime.utcnow().isoformat()
 
 
+# ─── Table definitions (use %s placeholders, NOW() for timestamps) ───────────
+# SQLite wrapper converts %s→? and NOW()→datetime('now') automatically.
+
 _CREATE_TABLE_STMTS = [
     """CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
         password_hash TEXT NOT NULL,
         kite_api_key TEXT, kite_api_secret TEXT,
         kite_access_token TEXT, kite_token_date TEXT, kite_user_id TEXT,
-        created_at TEXT DEFAULT (datetime('now'))
+        created_at TEXT DEFAULT (NOW())
     )""",
     """CREATE TABLE IF NOT EXISTS password_reset_tokens (
         id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
         token_hash TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER DEFAULT 0,
-        created_at TEXT DEFAULT (datetime('now'))
+        created_at TEXT DEFAULT (NOW())
     )""",
     """CREATE TABLE IF NOT EXISTS trades (
         id TEXT PRIMARY KEY, rec_id TEXT NOT NULL, strategy_type TEXT NOT NULL,
@@ -145,7 +211,7 @@ _CREATE_TABLE_STMTS = [
         exit_premium REAL, exit_time TEXT, exit_reason TEXT, pnl REAL,
         fees REAL DEFAULT 0, margin_used REAL DEFAULT 0,
         status TEXT DEFAULT 'OPEN', notes TEXT,
-        created_at TEXT DEFAULT (datetime('now'))
+        created_at TEXT DEFAULT (NOW())
     )""",
     """CREATE TABLE IF NOT EXISTS positions (
         id TEXT PRIMARY KEY, trade_id TEXT REFERENCES trades(id),
@@ -157,13 +223,13 @@ _CREATE_TABLE_STMTS = [
     """CREATE TABLE IF NOT EXISTS portfolio_snapshots (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, holdings TEXT NOT NULL,
         cash_balance REAL DEFAULT 0, total_value REAL,
-        created_at TEXT DEFAULT (datetime('now'))
+        created_at TEXT DEFAULT (NOW())
     )""",
     """CREATE TABLE IF NOT EXISTS notifications (
         id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT NOT NULL,
         message TEXT NOT NULL, severity TEXT DEFAULT 'INFO',
         read INTEGER DEFAULT 0, action_url TEXT,
-        created_at TEXT DEFAULT (datetime('now'))
+        created_at TEXT DEFAULT (NOW())
     )""",
     """CREATE TABLE IF NOT EXISTS daily_summary (
         date TEXT PRIMARY KEY, open_positions INTEGER DEFAULT 0,
@@ -173,11 +239,13 @@ _CREATE_TABLE_STMTS = [
         collateral_value REAL DEFAULT 0, notes TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY, value TEXT NOT NULL,
-        updated_at TEXT DEFAULT (datetime('now'))
+        key TEXT NOT NULL, value TEXT NOT NULL,
+        user_id TEXT NOT NULL DEFAULT '',
+        updated_at TEXT DEFAULT (NOW()),
+        PRIMARY KEY (key, user_id)
     )""",
     """CREATE TABLE IF NOT EXISTS order_audit (
-        id TEXT PRIMARY KEY, timestamp TEXT DEFAULT (datetime('now')),
+        id TEXT PRIMARY KEY, timestamp TEXT DEFAULT (NOW()),
         action TEXT NOT NULL, rec_id TEXT, trade_id TEXT,
         legs TEXT NOT NULL, dry_run_result TEXT NOT NULL,
         kite_response TEXT, reconciliation TEXT,
@@ -189,18 +257,19 @@ _CREATE_TABLE_STMTS = [
         trigger_price REAL NOT NULL, order_type TEXT NOT NULL,
         limit_price REAL, quantity INTEGER NOT NULL, exchange TEXT NOT NULL,
         status TEXT DEFAULT 'ACTIVE',
-        created_at TEXT DEFAULT (datetime('now')), triggered_at TEXT
+        created_at TEXT DEFAULT (NOW()), triggered_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS adjustments (
         id TEXT PRIMARY KEY, trade_id TEXT REFERENCES trades(id),
         adjustment_type TEXT NOT NULL, old_legs TEXT NOT NULL,
         new_legs TEXT, cost REAL NOT NULL, reason TEXT,
-        created_at TEXT DEFAULT (datetime('now'))
+        created_at TEXT DEFAULT (NOW())
     )""",
     """CREATE TABLE IF NOT EXISTS holdings (
-        symbol TEXT PRIMARY KEY, qty INTEGER NOT NULL,
-        avg_price REAL NOT NULL, ltp REAL,
-        updated_at TEXT DEFAULT (datetime('now'))
+        user_id TEXT NOT NULL DEFAULT '', symbol TEXT NOT NULL,
+        qty INTEGER NOT NULL, avg_price REAL NOT NULL, ltp REAL,
+        updated_at TEXT DEFAULT (NOW()),
+        PRIMARY KEY (user_id, symbol)
     )""",
 ]
 
@@ -213,7 +282,8 @@ def init_db():
 
     for key, value in DEFAULT_SETTINGS.items():
         conn.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            "INSERT INTO settings (key, value, user_id) VALUES (%s, %s, '') "
+            "ON CONFLICT (key, user_id) DO NOTHING",
             (key, value)
         )
 
@@ -228,41 +298,34 @@ def _migrate_add_user_id():
         "trades", "positions", "portfolio_snapshots", "notifications",
         "daily_summary", "order_audit", "gtt_orders", "adjustments",
     ]
-    for table in tables_needing_user_id:
-        try:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
-        except Exception:
-            pass  # Column already exists
 
-    # Settings table: add user_id
-    try:
-        conn.execute("ALTER TABLE settings ADD COLUMN user_id TEXT")
-    except Exception:
-        pass
+    if _is_pg:
+        # PostgreSQL supports ADD COLUMN IF NOT EXISTS
+        for table in tables_needing_user_id:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS user_id TEXT")
+            except Exception:
+                pass
 
-    # Users table: add kite_api_key, kite_api_secret (for per-user Kite apps)
-    for col in ("kite_api_key", "kite_api_secret"):
-        try:
-            conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
-        except Exception:
-            pass
+        # Users table: add kite columns
+        for col in ("kite_api_key", "kite_api_secret"):
+            try:
+                conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} TEXT")
+            except Exception:
+                pass
+    else:
+        # SQLite: no IF NOT EXISTS for ADD COLUMN, swallow errors
+        for table in tables_needing_user_id:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
+            except Exception:
+                pass
 
-    # Holdings table: need composite PK (user_id, symbol) — recreate
-    try:
-        conn.execute("ALTER TABLE holdings ADD COLUMN user_id TEXT")
-        # Recreate with composite PK
-        conn.execute("""CREATE TABLE IF NOT EXISTS holdings_v2 (
-            user_id TEXT NOT NULL, symbol TEXT NOT NULL,
-            qty INTEGER NOT NULL, avg_price REAL NOT NULL, ltp REAL,
-            updated_at TEXT DEFAULT (datetime('now')),
-            PRIMARY KEY (user_id, symbol)
-        )""")
-        conn.execute("""INSERT OR IGNORE INTO holdings_v2 (user_id, symbol, qty, avg_price, ltp, updated_at)
-            SELECT COALESCE(user_id, ''), symbol, qty, avg_price, ltp, updated_at FROM holdings""")
-        conn.execute("DROP TABLE holdings")
-        conn.execute("ALTER TABLE holdings_v2 RENAME TO holdings")
-    except Exception:
-        pass  # Already migrated
+        for col in ("kite_api_key", "kite_api_secret"):
+            try:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+            except Exception:
+                pass
 
     conn.commit()
 
@@ -274,7 +337,7 @@ def migrate_orphaned_data(user_id):
               "daily_summary", "order_audit", "gtt_orders", "adjustments", "settings"]
     for table in tables:
         try:
-            conn.execute(f"UPDATE {table} SET user_id = ? WHERE user_id IS NULL OR user_id = ''", (user_id,))
+            conn.execute(f"UPDATE {table} SET user_id = %s WHERE user_id IS NULL OR user_id = ''", (user_id,))
         except Exception:
             pass
     conn.commit()
@@ -287,7 +350,7 @@ def create_user(email, name, password_hash):
     conn = get_db()
     user_id = generate_id()
     conn.execute(
-        "INSERT INTO users (id, email, name, password_hash) VALUES (?, ?, ?, ?)",
+        "INSERT INTO users (id, email, name, password_hash) VALUES (%s, %s, %s, %s)",
         (user_id, email.lower().strip(), name.strip(), password_hash)
     )
     conn.commit()
@@ -302,13 +365,13 @@ def create_user(email, name, password_hash):
 
 def get_user_by_email(email):
     conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE email = ?", (email.lower().strip(),)).fetchone()
+    row = conn.execute("SELECT * FROM users WHERE email = %s", (email.lower().strip(),)).fetchone()
     return dict(row) if row else None
 
 
 def get_user_by_id(user_id):
     conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    row = conn.execute("SELECT * FROM users WHERE id = %s", (user_id,)).fetchone()
     return dict(row) if row else None
 
 
@@ -316,7 +379,7 @@ def save_user_kite_credentials(user_id, api_key, api_secret):
     """Store user's Kite API key and secret."""
     conn = get_db()
     conn.execute(
-        "UPDATE users SET kite_api_key = ?, kite_api_secret = ? WHERE id = ?",
+        "UPDATE users SET kite_api_key = %s, kite_api_secret = %s WHERE id = %s",
         (api_key, api_secret, user_id)
     )
     conn.commit()
@@ -326,7 +389,7 @@ def get_user_kite_credentials(user_id):
     """Return user's Kite API key and secret, or None."""
     conn = get_db()
     row = conn.execute(
-        "SELECT kite_api_key, kite_api_secret FROM users WHERE id = ?",
+        "SELECT kite_api_key, kite_api_secret FROM users WHERE id = %s",
         (user_id,)
     ).fetchone()
     if row and row["kite_api_key"]:
@@ -337,7 +400,7 @@ def get_user_kite_credentials(user_id):
 def update_user_kite_token(user_id, access_token, token_date, kite_user_id):
     conn = get_db()
     conn.execute(
-        "UPDATE users SET kite_access_token = ?, kite_token_date = ?, kite_user_id = ? WHERE id = ?",
+        "UPDATE users SET kite_access_token = %s, kite_token_date = %s, kite_user_id = %s WHERE id = %s",
         (access_token, token_date, kite_user_id, user_id)
     )
     conn.commit()
@@ -346,7 +409,7 @@ def update_user_kite_token(user_id, access_token, token_date, kite_user_id):
 def clear_user_kite_token(user_id):
     conn = get_db()
     conn.execute(
-        "UPDATE users SET kite_access_token = NULL, kite_token_date = NULL, kite_user_id = NULL WHERE id = ?",
+        "UPDATE users SET kite_access_token = NULL, kite_token_date = NULL, kite_user_id = NULL WHERE id = %s",
         (user_id,)
     )
     conn.commit()
@@ -355,7 +418,7 @@ def clear_user_kite_token(user_id):
 def get_user_kite_token(user_id):
     conn = get_db()
     row = conn.execute(
-        "SELECT kite_access_token, kite_token_date, kite_user_id FROM users WHERE id = ?",
+        "SELECT kite_access_token, kite_token_date, kite_user_id FROM users WHERE id = %s",
         (user_id,)
     ).fetchone()
     if row and row["kite_access_token"]:
@@ -371,7 +434,7 @@ def create_reset_token(user_id, token_hash, expires_at):
     conn = get_db()
     token_id = generate_id()
     conn.execute(
-        "INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at) VALUES (%s, %s, %s, %s)",
         (token_id, user_id, token_hash, expires_at)
     )
     conn.commit()
@@ -383,7 +446,7 @@ def get_valid_reset_token(token_hash):
     conn = get_db()
     row = conn.execute(
         "SELECT id, user_id, expires_at FROM password_reset_tokens "
-        "WHERE token_hash = ? AND used = 0 AND expires_at > datetime('now')",
+        "WHERE token_hash = %s AND used = 0 AND expires_at > NOW()",
         (token_hash,)
     ).fetchone()
     return dict(row) if row else None
@@ -391,13 +454,13 @@ def get_valid_reset_token(token_hash):
 
 def mark_reset_token_used(token_id):
     conn = get_db()
-    conn.execute("UPDATE password_reset_tokens SET used = 1 WHERE id = ?", (token_id,))
+    conn.execute("UPDATE password_reset_tokens SET used = 1 WHERE id = %s", (token_id,))
     conn.commit()
 
 
 def update_user_password(user_id, password_hash):
     conn = get_db()
-    conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
+    conn.execute("UPDATE users SET password_hash = %s WHERE id = %s", (password_hash, user_id))
     conn.commit()
 
 
@@ -406,26 +469,22 @@ def update_user_password(user_id, password_hash):
 def get_setting(key, user_id=None):
     conn = get_db()
     if user_id:
-        row = conn.execute("SELECT value FROM settings WHERE key = ? AND user_id = ?", (key, user_id)).fetchone()
+        row = conn.execute("SELECT value FROM settings WHERE key = %s AND user_id = %s", (key, user_id)).fetchone()
         if row:
             return row["value"]
     # Fall back to global setting
-    row = conn.execute("SELECT value FROM settings WHERE key = ? AND (user_id IS NULL OR user_id = '')", (key,)).fetchone()
+    row = conn.execute("SELECT value FROM settings WHERE key = %s AND (user_id IS NULL OR user_id = '')", (key,)).fetchone()
     return row["value"] if row else None
 
 
 def set_setting(key, value, user_id=None):
     conn = get_db()
-    if user_id:
-        conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, ?)",
-            (key, str(value), user_id, now_iso())
-        )
-    else:
-        conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
-            (key, str(value), now_iso())
-        )
+    uid = user_id or ""
+    conn.execute(
+        "INSERT INTO settings (key, value, user_id, updated_at) VALUES (%s, %s, %s, NOW()) "
+        "ON CONFLICT (key, user_id) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+        (key, str(value), uid)
+    )
     conn.commit()
 
 
@@ -436,7 +495,7 @@ def get_all_settings(user_id=None):
     result = {row["key"]: row["value"] for row in rows}
     # Override with user-specific settings
     if user_id:
-        user_rows = conn.execute("SELECT key, value FROM settings WHERE user_id = ?", (user_id,)).fetchall()
+        user_rows = conn.execute("SELECT key, value FROM settings WHERE user_id = %s", (user_id,)).fetchall()
         for row in user_rows:
             result[row["key"]] = row["value"]
     return result
@@ -448,7 +507,7 @@ def get_all_holdings(user_id=None):
     """Load all holdings from the database."""
     conn = get_db()
     if user_id:
-        rows = conn.execute("SELECT symbol, qty, avg_price, ltp FROM holdings WHERE user_id = ? ORDER BY symbol", (user_id,)).fetchall()
+        rows = conn.execute("SELECT symbol, qty, avg_price, ltp FROM holdings WHERE user_id = %s ORDER BY symbol", (user_id,)).fetchall()
     else:
         rows = conn.execute("SELECT symbol, qty, avg_price, ltp FROM holdings ORDER BY symbol").fetchall()
     return [{"symbol": r["symbol"], "qty": r["qty"], "avgPrice": r["avg_price"],
@@ -459,13 +518,13 @@ def save_holdings(holdings, user_id=None):
     """Replace all holdings in the database for a user."""
     conn = get_db()
     if user_id:
-        conn.execute("DELETE FROM holdings WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM holdings WHERE user_id = %s", (user_id,))
     else:
         conn.execute("DELETE FROM holdings")
     for h in holdings:
         conn.execute(
-            "INSERT INTO holdings (user_id, symbol, qty, avg_price, ltp, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id or "", h["symbol"], h["qty"], h["avgPrice"], h.get("ltp", h["avgPrice"]), now_iso())
+            "INSERT INTO holdings (user_id, symbol, qty, avg_price, ltp, updated_at) VALUES (%s, %s, %s, %s, %s, NOW())",
+            (user_id or "", h["symbol"], h["qty"], h["avgPrice"], h.get("ltp", h["avgPrice"]))
         )
     conn.commit()
 
@@ -475,12 +534,10 @@ def upsert_holding(holding, user_id=None):
     uid = user_id or ""
     conn = get_db()
     conn.execute(
-        "INSERT INTO holdings (user_id, symbol, qty, avg_price, ltp, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(user_id, symbol) DO UPDATE SET qty=?, avg_price=?, ltp=?, updated_at=?",
+        "INSERT INTO holdings (user_id, symbol, qty, avg_price, ltp, updated_at) VALUES (%s, %s, %s, %s, %s, NOW()) "
+        "ON CONFLICT(user_id, symbol) DO UPDATE SET qty = EXCLUDED.qty, avg_price = EXCLUDED.avg_price, ltp = EXCLUDED.ltp, updated_at = NOW()",
         (uid, holding["symbol"], holding["qty"], holding["avgPrice"],
-         holding.get("ltp", holding["avgPrice"]), now_iso(),
-         holding["qty"], holding["avgPrice"],
-         holding.get("ltp", holding["avgPrice"]), now_iso())
+         holding.get("ltp", holding["avgPrice"]))
     )
     conn.commit()
 
@@ -489,9 +546,9 @@ def delete_holding(symbol, user_id=None):
     """Delete a holding by symbol."""
     conn = get_db()
     if user_id:
-        conn.execute("DELETE FROM holdings WHERE symbol = ? AND user_id = ?", (symbol, user_id))
+        conn.execute("DELETE FROM holdings WHERE symbol = %s AND user_id = %s", (symbol, user_id))
     else:
-        conn.execute("DELETE FROM holdings WHERE symbol = ?", (symbol,))
+        conn.execute("DELETE FROM holdings WHERE symbol = %s", (symbol,))
     conn.commit()
 
 
