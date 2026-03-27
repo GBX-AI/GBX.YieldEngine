@@ -205,6 +205,7 @@ _CREATE_TABLE_STMTS = [
         password_hash TEXT NOT NULL,
         kite_api_key TEXT, kite_api_secret TEXT,
         kite_access_token TEXT, kite_token_date TEXT, kite_user_id TEXT,
+        kite_permission TEXT DEFAULT 'readonly',
         created_at TEXT DEFAULT (NOW())
     )""",
     """CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -323,7 +324,7 @@ def _migrate_add_user_id():
                 conn.commit()
             except Exception:
                 conn.rollback()
-        for col in ("kite_api_key", "kite_api_secret"):
+        for col in ("kite_api_key", "kite_api_secret", "kite_permission"):
             try:
                 conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} TEXT")
                 conn.commit()
@@ -335,7 +336,7 @@ def _migrate_add_user_id():
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
             except Exception:
                 pass
-        for col in ("kite_api_key", "kite_api_secret"):
+        for col in ("kite_api_key", "kite_api_secret", "kite_permission"):
             try:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
             except Exception:
@@ -388,13 +389,27 @@ def get_user_by_id(user_id):
     return dict(row) if row else None
 
 
-def save_user_kite_credentials(user_id, api_key, api_secret):
-    """Store user's Kite API key and secret."""
+def save_user_kite_credentials(user_id, api_key, api_secret, permission='readonly'):
+    """Store user's Kite API key, secret, and permission level."""
     conn = get_db()
     conn.execute(
-        "UPDATE users SET kite_api_key = %s, kite_api_secret = %s WHERE id = %s",
-        (api_key, api_secret, user_id)
+        "UPDATE users SET kite_api_key = %s, kite_api_secret = %s, kite_permission = %s WHERE id = %s",
+        (api_key, api_secret, permission, user_id)
     )
+    conn.commit()
+
+
+def get_user_kite_permission(user_id):
+    """Return user's Kite permission level: 'readonly' or 'readwrite'."""
+    conn = get_db()
+    row = conn.execute("SELECT kite_permission FROM users WHERE id = %s", (user_id,)).fetchone()
+    return (row["kite_permission"] or "readonly") if row else "readonly"
+
+
+def set_user_kite_permission(user_id, permission):
+    """Set user's Kite permission level."""
+    conn = get_db()
+    conn.execute("UPDATE users SET kite_permission = %s WHERE id = %s", (permission, user_id))
     conn.commit()
 
 

@@ -820,16 +820,20 @@ def create_app():
     @app.route("/api/kite/credentials", methods=["POST"])
     @require_auth
     def api_kite_save_credentials():
-        """Save user's Kite API key and secret."""
+        """Save user's Kite API key, secret, and permission level."""
         user_id = g.current_user["id"]
         data = request.json or {}
         api_key = (data.get("api_key") or "").strip()
         api_secret = (data.get("api_secret") or "").strip()
+        permission = data.get("permission", "readonly").strip().lower()
         if not api_key or not api_secret:
             return jsonify({"error": "API key and secret are required"}), 400
+        if permission not in ("readonly", "readwrite"):
+            permission = "readonly"
         from models import save_user_kite_credentials
-        save_user_kite_credentials(user_id, api_key, api_secret)
-        return jsonify({"status": "saved", "message": "Kite credentials saved"})
+        save_user_kite_credentials(user_id, api_key, api_secret, permission)
+        return jsonify({"status": "saved", "permission": permission,
+                        "message": f"Kite credentials saved ({permission} mode)"})
 
     @app.route("/api/kite/login", methods=["GET"])
     @require_auth
@@ -873,15 +877,17 @@ def create_app():
         user_id = g.current_user["id"]
         kite = get_kite_for_user(user_id)
         authenticated = kite.is_authenticated() if kite else False
-        from models import get_user_kite_credentials
+        from models import get_user_kite_credentials, get_user_kite_permission
         creds = get_user_kite_credentials(user_id)
         token_data = get_user_kite_token(user_id)
+        permission = get_user_kite_permission(user_id)
         return jsonify({
             "connected": authenticated,
             "simulation_mode": not authenticated,
             "kite_configured": bool(creds),
             "kite_user_id": token_data.get("kite_user_id") if token_data else None,
             "has_api_key": bool(creds),
+            "permission": permission,
         })
 
     @app.route("/api/kite/disconnect", methods=["POST"])
@@ -977,6 +983,9 @@ def create_app():
     @require_auth
     def api_execute():
         user_id = g.current_user["id"]
+        from models import get_user_kite_permission
+        if get_user_kite_permission(user_id) != "readwrite":
+            return jsonify({"error": "Trading disabled. Enable 'Read & Trade' mode in Settings → Broker Connection."}), 403
         if _get_user_state(user_id)["permission"] != "EXECUTE":
             return jsonify({"error": "Permission denied. Enable EXECUTE mode first."}), 403
 
@@ -1096,6 +1105,9 @@ def create_app():
     @require_auth
     def api_close_position(pid):
         user_id = g.current_user["id"]
+        from models import get_user_kite_permission
+        if get_user_kite_permission(user_id) != "readwrite":
+            return jsonify({"error": "Trading disabled. Enable 'Read & Trade' mode in Settings."}), 403
         if _get_user_state(user_id)["permission"] != "EXECUTE":
             return jsonify({"error": "Permission denied. Enable EXECUTE mode first."}), 403
 
@@ -1113,6 +1125,9 @@ def create_app():
     @require_auth
     def api_roll_position(pid):
         user_id = g.current_user["id"]
+        from models import get_user_kite_permission
+        if get_user_kite_permission(user_id) != "readwrite":
+            return jsonify({"error": "Trading disabled. Enable 'Read & Trade' mode in Settings."}), 403
         if _get_user_state(user_id)["permission"] != "EXECUTE":
             return jsonify({"error": "Permission denied. Enable EXECUTE mode first."}), 403
 
@@ -1137,6 +1152,9 @@ def create_app():
     @require_auth
     def api_execute_adjustment(pid):
         user_id = g.current_user["id"]
+        from models import get_user_kite_permission
+        if get_user_kite_permission(user_id) != "readwrite":
+            return jsonify({"error": "Trading disabled. Enable 'Read & Trade' mode in Settings."}), 403
         if _get_user_state(user_id)["permission"] != "EXECUTE":
             return jsonify({"error": "Permission denied. Enable EXECUTE mode first."}), 403
 

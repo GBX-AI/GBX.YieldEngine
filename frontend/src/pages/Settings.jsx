@@ -319,6 +319,7 @@ export default function Settings() {
   const [kiteApiKey, setKiteApiKey] = useState('');
   const [kiteApiSecret, setKiteApiSecret] = useState('');
   const [kiteUserId, setKiteUserId] = useState('');
+  const [kitePermission, setKitePermission] = useState('readonly');
   const [kiteMessage, setKiteMessage] = useState('');
 
   // Local form state
@@ -352,6 +353,7 @@ export default function Settings() {
         setKiteConfigured(!!ks.kite_configured || !!ks.has_api_key);
         setKiteConnected(ks.connected ?? false);
         setKiteUserId(ks.kite_user_id || '');
+        setKitePermission(ks.permission || 'readonly');
       }
     }).catch(() => {});
 
@@ -394,7 +396,7 @@ export default function Settings() {
     setKiteLoading(true);
     setKiteMessage('');
     try {
-      await kiteSaveCredentials(kiteApiKey, kiteApiSecret);
+      await kiteSaveCredentials(kiteApiKey, kiteApiSecret, kitePermission);
       setKiteConfigured(true);
       setKiteMessage('Credentials saved. Click "Connect to Zerodha" to authenticate.');
     } catch (e) {
@@ -571,6 +573,45 @@ export default function Settings() {
               />
             </div>
           </div>
+          {/* Access Level */}
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 12, fontWeight: 500, color: c.muted, marginBottom: 8 }}>Access Level</div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button
+                style={{
+                  ...s.btn, flex: 1, justifyContent: 'center',
+                  background: kitePermission === 'readonly' ? 'rgba(110,231,183,0.15)' : 'rgba(148,163,184,0.06)',
+                  color: kitePermission === 'readonly' ? c.emerald : c.muted,
+                  border: kitePermission === 'readonly' ? '1px solid rgba(110,231,183,0.3)' : `1px solid ${c.border}`,
+                }}
+                onClick={() => setKitePermission('readonly')}
+              >
+                Read Only
+              </button>
+              <button
+                style={{
+                  ...s.btn, flex: 1, justifyContent: 'center',
+                  background: kitePermission === 'readwrite' ? 'rgba(252,211,77,0.15)' : 'rgba(148,163,184,0.06)',
+                  color: kitePermission === 'readwrite' ? c.amber : c.muted,
+                  border: kitePermission === 'readwrite' ? '1px solid rgba(252,211,77,0.3)' : `1px solid ${c.border}`,
+                }}
+                onClick={() => setKitePermission('readwrite')}
+              >
+                Read & Trade
+              </button>
+            </div>
+            <div style={{ fontSize: 11, color: c.muted, marginTop: 6, lineHeight: 1.5 }}>
+              {kitePermission === 'readonly'
+                ? 'Read Only: Import holdings and view live data. No orders will be placed.'
+                : 'Read & Trade: Full access including order placement. Use with caution.'}
+            </div>
+            {kitePermission === 'readwrite' && (
+              <div style={{ fontSize: 11, color: c.amber, marginTop: 4 }}>
+                Zerodha will ask to authorize all permissions. YieldEngine will only execute trades when you explicitly confirm.
+              </div>
+            )}
+          </div>
+
           <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
             <button
               style={{ ...s.btn, background: 'rgba(56,189,248,0.12)', color: c.blue, opacity: kiteLoading ? 0.6 : 1 }}
