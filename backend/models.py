@@ -129,12 +129,15 @@ class _PgWrapper:
 
     def execute(self, sql, params=None):
         import psycopg2.extras
+        # Convert SQLite-style ? placeholders to PostgreSQL %s
+        sql = sql.replace("?", "%s")
+        # Convert datetime('now') to NOW() if any slipped through
+        sql = sql.replace("datetime('now')", "NOW()")
         try:
             cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             cur.execute(sql, params or ())
             return cur
         except Exception:
-            # PostgreSQL requires rollback after any error before new queries
             try:
                 self._conn.rollback()
             except Exception:
@@ -143,6 +146,8 @@ class _PgWrapper:
 
     def executemany(self, sql, params_list):
         import psycopg2.extras
+        sql = sql.replace("?", "%s")
+        sql = sql.replace("datetime('now')", "NOW()")
         cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.executemany(sql, params_list)
         return cur
