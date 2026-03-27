@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { getSettings, updateSettings, getRiskProfile, setRiskProfile, kiteLogin, kiteStatus, kiteDisconnect, kiteSaveCredentials, setCircuitBreaker, getStatus } from '../api';
+import { getSettings, updateSettings, getRiskProfile, setRiskProfile, kiteLogin, kiteStatus, kiteDisconnect, kiteSaveCredentials, setCircuitBreaker, getStatus, importFromKite } from '../api';
 
 const c = {
   bg: '#0a0f1a',
@@ -421,6 +421,19 @@ export default function Settings() {
     setKiteLoading(false);
   };
 
+  const handleImportFromKite = async () => {
+    setKiteLoading(true);
+    setKiteMessage('');
+    try {
+      const result = await importFromKite();
+      const count = result?.imported ?? result?.holdings_imported ?? 0;
+      setKiteMessage(count > 0 ? `${count} holdings imported from Kite` : 'No holdings found in your Kite account');
+    } catch (e) {
+      setKiteMessage('Error: ' + e.message);
+    }
+    setKiteLoading(false);
+  };
+
   const handleKiteDisconnect = async () => {
     try {
       await kiteDisconnect();
@@ -627,6 +640,15 @@ export default function Settings() {
                 disabled={kiteLoading}
               >
                 {kiteLoading ? 'Connecting...' : kiteConnected ? 'Reconnect to Zerodha' : 'Connect to Zerodha'}
+              </button>
+            )}
+            {kiteConnected && (
+              <button
+                style={{ ...s.btn, background: 'rgba(167,139,250,0.12)', color: c.purple, opacity: kiteLoading ? 0.6 : 1 }}
+                onClick={handleImportFromKite}
+                disabled={kiteLoading}
+              >
+                {kiteLoading ? 'Importing...' : 'Import Holdings'}
               </button>
             )}
             {kiteConnected && (

@@ -865,8 +865,31 @@ def create_app():
             result = exchange_request_token(request_token, user_id)
             update_user_kite_token(user_id, result["access_token"],
                                    date.today().isoformat(), result["user_id"])
+
+            # Auto-import holdings on connect
+            imported_count = 0
+            try:
+                kite = get_kite_for_user(user_id)
+                if kite and kite.is_authenticated():
+                    live_holdings = kite.get_holdings()
+                    if live_holdings:
+                        parsed = []
+                        for h in live_holdings:
+                            symbol = h.get("tradingsymbol", h.get("symbol", ""))
+                            qty = h.get("quantity", 0)
+                            avg = h.get("average_price", 0)
+                            ltp = h.get("last_price", avg)
+                            if symbol and qty > 0:
+                                parsed.append({"symbol": symbol, "qty": qty, "avgPrice": round(avg, 2), "ltp": round(ltp, 2)})
+                        if parsed:
+                            save_holdings(parsed, user_id)
+                            imported_count = len(parsed)
+            except Exception:
+                pass  # Don't fail the connect if import fails
+
             return jsonify({"status": "connected", "kite_user_id": result["user_id"],
-                           "message": "Kite connected successfully"})
+                           "holdings_imported": imported_count,
+                           "message": f"Kite connected. {imported_count} holdings imported." if imported_count else "Kite connected successfully."})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 

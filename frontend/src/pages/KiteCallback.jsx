@@ -29,8 +29,11 @@ export default function KiteCallback() {
         });
         const data = await res.json();
         if (res.ok) {
-          setStatus('Connected! Redirecting...');
-          setTimeout(() => navigate('/settings', { replace: true }), 1000);
+          const msg = data.holdings_imported
+            ? `Connected! ${data.holdings_imported} holdings imported. Redirecting...`
+            : 'Connected! Redirecting...';
+          setStatus(msg);
+          setTimeout(() => navigate('/holdings', { replace: true }), 1500);
         } else {
           setError(data.error || 'Failed to connect');
         }
