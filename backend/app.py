@@ -954,11 +954,11 @@ def create_app():
         save_cash_balance(cash, user_id)
 
         settings = get_all_settings(user_id)
-        recs = scan_strategies(get_all_holdings(user_id), cash, settings)
+        kite = get_kite_for_user(user_id)
+        recs = scan_strategies(get_all_holdings(user_id), cash, settings, kite_service=kite)
         _get_user_state(user_id)["recommendations"] = recs
         _get_user_state(user_id)["last_scan"] = now_iso()
 
-        kite = get_kite_for_user(user_id)
         kite_authenticated = kite.is_authenticated() if kite else False
         arbs = scan_arbitrage(None, simulation=not kite_authenticated)
         _get_user_state(user_id)["arbitrage_opportunities"] = arbs
@@ -967,10 +967,15 @@ def create_app():
             f"Found {len(recs)} strategy opportunities and {len(arbs)} arbitrage opportunities.",
             "INFO", "/scanner")
 
+        total_margin = sum(r.get("margin_needed", 0) for r in recs)
+        total_premium = sum(r.get("premium_income", 0) for r in recs if r.get("premium_income", 0) > 0)
+
         return jsonify({
             "recommendations": recs,
             "arbitrage": arbs,
             "scanned_at": _get_user_state(user_id)["last_scan"],
+            "total_margin_required": round(total_margin, 2),
+            "total_weekly_income": round(total_premium, 2),
         })
 
     @app.route("/api/recommendations", methods=["GET", "POST"])

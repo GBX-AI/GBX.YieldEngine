@@ -92,7 +92,7 @@ export default function Scanner() {
   const [strategyFilter, setStrategyFilter] = useState('ALL');
 
   // Summary
-  const [summary, setSummary] = useState({ weeklyIncome: null, arbCount: 0 });
+  const [summary, setSummary] = useState({ weeklyIncome: null, arbCount: 0, totalMargin: null });
 
   /* ─── Init ─── */
   useEffect(() => {
@@ -124,7 +124,11 @@ export default function Scanner() {
       setAllRecommendations(recs);
       setArbitrage(arbs);
       const totalWeekly = recs.reduce((s, r) => s + (r.premium || r.premium_income || 0), 0);
-      setSummary({ weeklyIncome: totalWeekly, arbCount: arbs.length });
+      setSummary({
+        weeklyIncome: scanData?.total_weekly_income || totalWeekly,
+        arbCount: arbs.length,
+        totalMargin: scanData?.total_margin_required || null,
+      });
     } catch (e) {
       setError(e.message);
     } finally {
@@ -172,6 +176,12 @@ export default function Scanner() {
             <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Safe Weekly Income Est.</div>
             <div style={{ fontSize: 22, fontWeight: 700, fontFamily: font.mono, color: C.emerald }}>
               {summary.weeklyIncome != null ? fmtCur(summary.weeklyIncome) : '—'}
+            </div>
+          </div>
+          <div style={cardStyle}>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Margin Required</div>
+            <div style={{ fontSize: 22, fontWeight: 700, fontFamily: font.mono, color: C.amber }}>
+              {summary.totalMargin != null ? fmtCur(summary.totalMargin) : '—'}
             </div>
           </div>
           <div style={cardStyle}>
@@ -343,6 +353,13 @@ export default function Scanner() {
                     <span style={{ fontFamily: font.mono, fontSize: 14, color: C.muted }}>
                       {rec.strike ? `₹${fmt(rec.strike)}` : ''}
                     </span>
+
+                    {/* Holding qty for covered calls */}
+                    {rec.holding_qty && (
+                      <span style={{ fontSize: 11, color: C.muted, fontFamily: font.mono, background: 'rgba(148,163,184,0.08)', padding: '2px 8px', borderRadius: 4 }}>
+                        Holdings: {rec.holding_qty} shares
+                      </span>
+                    )}
 
                     {/* Type tag */}
                     <span style={{

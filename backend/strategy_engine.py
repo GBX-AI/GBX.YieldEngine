@@ -28,6 +28,7 @@ from black_scholes import (
 from strike_selector import select_strike, select_strike_price, generate_alternatives, generate_strike_alternatives
 from fee_calculator import calculate_fees, calculate_trade_fees
 import live_price_service
+import market_data
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -247,12 +248,38 @@ _DEFAULT_IV = 0.30  # 30% — conservative default for mid/small cap
 _DEFAULT_HAIRCUT = 0.25
 
 
-def _resolve_stock_info(symbol: str, holding: dict | None = None) -> dict | None:
+def _resolve_stock_info(symbol: str, holding: dict | None = None, kite_service=None) -> dict | None:
     """
     Resolve spot price, IV, lot size, and haircut for any stock.
-    Tries: 1) SIMULATION_STOCKS 2) Live Yahoo price + FNO lot size lookup.
+    When kite_service is authenticated, uses real lot sizes and F&O eligibility.
+    Tries: 1) Kite real data 2) SIMULATION_STOCKS 3) Live Yahoo price + FNO lot size lookup.
     Returns dict with ltp, iv, lotSize, haircut — or None if not F&O eligible.
     """
+    kite_connected = kite_service and kite_service.is_authenticated()
+
+    # When Kite is connected, use real F&O eligibility and lot size
+    if kite_connected:
+        if not market_data.has_fno_options(kite_service, symbol):
+            return None  # Not F&O eligible per Kite instruments
+        kite_lot = market_data.get_lot_size(kite_service, symbol)
+        if kite_lot:
+            # Try live price from various sources
+            live_spot = live_price_service.get_live_spot(symbol)
+            sim = SIMULATION_STOCKS.get(symbol)
+            if not live_spot and sim:
+                live_spot = sim["ltp"]
+            if not live_spot and holding:
+                live_spot = holding.get("ltp") or holding.get("avgPrice")
+            if not live_spot:
+                return None
+            return {
+                "ltp": live_spot,
+                "iv": sim["iv"] if sim else _DEFAULT_IV,
+                "lotSize": kite_lot,
+                "haircut": sim["haircut"] if sim else _DEFAULT_HAIRCUT,
+                "source": "kite",
+            }
+
     # Check if in the hardcoded simulation data first
     sim = SIMULATION_STOCKS.get(symbol)
     if sim:
@@ -287,15 +314,24 @@ def _resolve_stock_info(symbol: str, holding: dict | None = None) -> dict | None
     }
 
 
-def _resolve_index_info(index_name: str) -> dict:
-    """Resolve live spot price for indices, falling back to hardcoded."""
+def _resolve_index_info(index_name: str, kite_service=None) -> dict:
+    """Resolve live spot price for indices, falling back to hardcoded.
+    When kite_service is authenticated, uses real lot size from Kite."""
     sim = SIMULATION_INDICES.get(index_name, {})
     live_spot = live_price_service.get_live_spot(index_name)
+
+    kite_connected = kite_service and kite_service.is_authenticated()
+    if kite_connected:
+        kite_lot = market_data.get_lot_size(kite_service, index_name)
+        lot_size = kite_lot if kite_lot else sim.get("lotSize", 25)
+    else:
+        lot_size = sim.get("lotSize", 25)
+
     return {
         "spot": live_spot if live_spot else sim.get("spot", 23000),
         "iv": sim.get("iv", 0.15),
-        "lotSize": sim.get("lotSize", 25),
-        "source": "yahoo" if live_spot else "simulated",
+        "lotSize": lot_size,
+        "source": "kite" if kite_connected else ("yahoo" if live_spot else "simulated"),
     }
 
 
@@ -310,22 +346,24 @@ def _add_frontend_aliases(rec: dict) -> dict:
 
 # ─── Strategy Scanners ───────────────────────────────────────────────────────
 
-def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
+def _scan_covered_calls(holdings: list, settings: dict, dte: int, kite_service=None) -> list:
     """
     Scan for covered call opportunities on F&O-eligible holdings.
 
     A covered call sells a call option against shares already held.
     Requires qty >= lotSize for the stock. Zero additional margin.
+    When kite_service is connected, uses real option chain for premiums.
     """
     recs = []
     T = _time_to_expiry(dte)
     target_delta = float(settings.get("manual_target_delta_calls", 0.15))
+    kite_connected = kite_service and kite_service.is_authenticated()
 
     for holding in holdings:
         symbol = holding.get("symbol", holding.get("tradingsymbol", ""))
         qty = holding.get("qty", holding.get("quantity", 0))
 
-        stock_info = _resolve_stock_info(symbol, holding)
+        stock_info = _resolve_stock_info(symbol, holding, kite_service=kite_service)
         if not stock_info:
             continue
 
@@ -336,6 +374,11 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
         spot = stock_info["ltp"]
         iv = stock_info["iv"]
         avg_cost = holding.get("average_price", holding.get("avgPrice", spot))
+
+        # Determine expiry per-strategy: stocks use monthly expiry
+        expiry_date = None
+        if kite_connected:
+            expiry_date = market_data.get_nearest_expiry(kite_service, symbol)
 
         # Select strike via strike_selector
         step = max(5, _round_to_step(spot * 0.01, 5))  # ~1% of spot, min 5
@@ -353,11 +396,51 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
             # Ensure the call strike is OTM
             strike = _round_to_step(spot * (1 + 0.02), step)
 
-        greeks = compute_greeks(spot, strike, T, RISK_FREE_RATE, iv, "CE")
-        premium = greeks["price"]
-        prob_otm = greeks["prob_otm"]
-        delta_val = greeks["delta"]
-        theta_day = greeks["theta"]
+        # Try real option chain from Kite
+        real_chain = None
+        use_real = False
+        if kite_connected and expiry_date:
+            real_chain = market_data.get_option_chain_live(kite_service, symbol, expiry_date)
+
+        if real_chain and real_chain.get("strikes"):
+            # Find the strike closest to our target delta in the real chain
+            best_strike_data = None
+            best_delta_diff = float("inf")
+            for s_data in real_chain["strikes"]:
+                ce = s_data.get("CE")
+                if not ce or ce.get("premium", 0) <= 0:
+                    continue
+                # Filter low liquidity
+                if ce.get("oi", 0) < 100 or ce.get("volume", 0) < 10:
+                    continue
+                s_strike = s_data["strike"]
+                if s_strike <= spot:
+                    continue  # Only OTM calls
+                s_greeks = compute_greeks(spot, s_strike, T, RISK_FREE_RATE, iv, "CE")
+                delta_diff = abs(abs(s_greeks["delta"]) - target_delta)
+                if delta_diff < best_delta_diff:
+                    best_delta_diff = delta_diff
+                    best_strike_data = (s_strike, ce, s_greeks)
+
+            if best_strike_data:
+                strike, ce_data, greeks = best_strike_data
+                premium = ce_data["premium"]  # Real market premium
+                prob_otm = greeks["prob_otm"]
+                delta_val = greeks["delta"]
+                theta_day = greeks["theta"]
+                use_real = True
+                # Update DTE from chain if available
+                if real_chain.get("dte"):
+                    dte = real_chain["dte"]
+                    T = _time_to_expiry(dte)
+
+        if not use_real:
+            # Fall back to Black-Scholes (current behavior)
+            greeks = compute_greeks(spot, strike, T, RISK_FREE_RATE, iv, "CE")
+            premium = greeks["price"]
+            prob_otm = greeks["prob_otm"]
+            delta_val = greeks["delta"]
+            theta_day = greeks["theta"]
 
         if premium < 0.5:
             continue
@@ -374,6 +457,7 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
         # Capital at risk = stock value (shares are collateral, no extra margin)
         capital_at_risk = spot * trade_qty
         ann_return = _annualized_return(total_premium, capital_at_risk, dte)
+        total_margin = 0  # Covered call — shares are collateral
 
         legs = [_build_leg("SELL", strike, premium, trade_qty, "CE")]
         fees = _fee_estimate(legs)
@@ -397,6 +481,7 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
             "legs": legs,
             "premium_income": round(total_premium, 2),
             "margin_needed": 0,
+            "total_margin": total_margin,
             "max_loss": round((spot - avg_cost) * trade_qty, 2),
             "prob_otm": round(prob_otm, 4),
             "delta": round(delta_val, 4),
@@ -409,28 +494,36 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int) -> list:
             "dte": dte,
             "lots": lots,
             "spot": spot,
+            "holding_qty": qty,
         }))
 
     return recs
 
 
-def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int) -> list:
+def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_service=None) -> list:
     """
     Scan for cash-secured put opportunities on NIFTY and BANKNIFTY.
 
     Uses pledged collateral (cash_balance) to cover margin.
     Strike selected by target delta for puts.
+    When kite_service is connected, uses real option chain for premiums.
     """
     recs = []
     T = _time_to_expiry(dte)
     target_delta = float(settings.get("manual_target_delta_puts", 0.20))
+    kite_connected = kite_service and kite_service.is_authenticated()
 
     for index_name in SIMULATION_INDICES:
-        idx = _resolve_index_info(index_name)
+        idx = _resolve_index_info(index_name, kite_service=kite_service)
         spot = idx["spot"]
         iv = idx["iv"]
         lot_size = idx["lotSize"]
         step = INDEX_STRIKE_STEP.get(index_name, 50)
+
+        # Determine expiry per-strategy: indices use weekly expiry
+        expiry_date = None
+        if kite_connected:
+            expiry_date = market_data.get_nearest_expiry(kite_service, index_name)
 
         strike = select_strike_price(
             spot=spot,
@@ -443,11 +536,48 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int) -> li
         if strike >= spot:
             strike = _round_to_step(spot * (1 - 0.02), step)
 
-        greeks = compute_greeks(spot, strike, T, RISK_FREE_RATE, iv, "PE")
-        premium = greeks["price"]
-        prob_otm = greeks["prob_otm"]
-        delta_val = greeks["delta"]
-        theta_day = greeks["theta"]
+        # Try real option chain from Kite
+        real_chain = None
+        use_real = False
+        if kite_connected and expiry_date:
+            real_chain = market_data.get_option_chain_live(kite_service, index_name, expiry_date)
+
+        if real_chain and real_chain.get("strikes"):
+            best_strike_data = None
+            best_delta_diff = float("inf")
+            for s_data in real_chain["strikes"]:
+                pe = s_data.get("PE")
+                if not pe or pe.get("premium", 0) <= 0:
+                    continue
+                # Filter low liquidity
+                if pe.get("oi", 0) < 100 or pe.get("volume", 0) < 10:
+                    continue
+                s_strike = s_data["strike"]
+                if s_strike >= spot:
+                    continue  # Only OTM puts
+                s_greeks = compute_greeks(spot, s_strike, T, RISK_FREE_RATE, iv, "PE")
+                delta_diff = abs(abs(s_greeks["delta"]) - target_delta)
+                if delta_diff < best_delta_diff:
+                    best_delta_diff = delta_diff
+                    best_strike_data = (s_strike, pe, s_greeks)
+
+            if best_strike_data:
+                strike, pe_data, greeks = best_strike_data
+                premium = pe_data["premium"]  # Real market premium
+                prob_otm = greeks["prob_otm"]
+                delta_val = greeks["delta"]
+                theta_day = greeks["theta"]
+                use_real = True
+                if real_chain.get("dte"):
+                    dte = real_chain["dte"]
+                    T = _time_to_expiry(dte)
+
+        if not use_real:
+            greeks = compute_greeks(spot, strike, T, RISK_FREE_RATE, iv, "PE")
+            premium = greeks["price"]
+            prob_otm = greeks["prob_otm"]
+            delta_val = greeks["delta"]
+            theta_day = greeks["theta"]
 
         if premium < 0.5:
             continue
@@ -510,25 +640,32 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int) -> li
     return recs
 
 
-def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int) -> list:
+def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite_service=None) -> list:
     """
     Scan for put credit spread (bull put spread) on indices.
 
     Defined-risk strategy: sell higher put, buy lower put.
     Spread width: 200-300 index points.
     Max loss capped at user's max_loss_per_trade setting.
+    When kite_service is connected, uses real option chain for premiums.
     """
     recs = []
     T = _time_to_expiry(dte)
     max_loss_limit = float(settings.get("max_loss_per_trade", 10000))
     target_delta = float(settings.get("manual_target_delta_puts", 0.20))
+    kite_connected = kite_service and kite_service.is_authenticated()
 
     for index_name in SIMULATION_INDICES:
-        idx = _resolve_index_info(index_name)
+        idx = _resolve_index_info(index_name, kite_service=kite_service)
         spot = idx["spot"]
         iv = idx["iv"]
         lot_size = idx["lotSize"]
         step = INDEX_STRIKE_STEP.get(index_name, 50)
+
+        # Determine expiry per-strategy: indices use weekly expiry
+        expiry_date = None
+        if kite_connected:
+            expiry_date = market_data.get_nearest_expiry(kite_service, index_name)
 
         # Sell put (higher strike, closer to spot)
         sell_strike = select_strike_price(
@@ -542,121 +679,239 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int) -> l
         if sell_strike >= spot:
             sell_strike = _round_to_step(spot * (1 - 0.02), step)
 
-        # Choose spread width within bounds
-        for width in range(SPREAD_WIDTH_MIN, SPREAD_WIDTH_MAX + 1, step):
-            buy_strike = _round_to_step(sell_strike - width, step)
-            actual_width = sell_strike - buy_strike
+        # Try real option chain from Kite
+        real_chain = None
+        use_real = False
+        if kite_connected and expiry_date:
+            real_chain = market_data.get_option_chain_live(kite_service, index_name, expiry_date)
 
-            if actual_width < SPREAD_WIDTH_MIN:
-                continue
+        if real_chain and real_chain.get("strikes"):
+            # Find sell strike closest to target delta in real chain
+            best_sell = None
+            best_delta_diff = float("inf")
+            for s_data in real_chain["strikes"]:
+                pe = s_data.get("PE")
+                if not pe or pe.get("premium", 0) <= 0:
+                    continue
+                if pe.get("oi", 0) < 100 or pe.get("volume", 0) < 10:
+                    continue
+                s_strike = s_data["strike"]
+                if s_strike >= spot:
+                    continue
+                s_greeks = compute_greeks(spot, s_strike, T, RISK_FREE_RATE, iv, "PE")
+                delta_diff = abs(abs(s_greeks["delta"]) - target_delta)
+                if delta_diff < best_delta_diff:
+                    best_delta_diff = delta_diff
+                    best_sell = (s_strike, pe, s_greeks)
 
-            sell_greeks = compute_greeks(spot, sell_strike, T, RISK_FREE_RATE, iv, "PE")
-            buy_greeks = compute_greeks(spot, buy_strike, T, RISK_FREE_RATE, iv, "PE")
+            if best_sell:
+                sell_strike, sell_pe, sell_greeks_real = best_sell
+                sell_premium = sell_pe["premium"]
 
-            sell_premium = sell_greeks["price"]
-            buy_premium = buy_greeks["price"]
-            net_credit = sell_premium - buy_premium
+                # Find buy strike (spread width below sell)
+                chain_map = {s["strike"]: s for s in real_chain["strikes"]}
+                for width in range(SPREAD_WIDTH_MIN, SPREAD_WIDTH_MAX + 1, step):
+                    buy_strike_candidate = _round_to_step(sell_strike - width, step)
+                    actual_width = sell_strike - buy_strike_candidate
+                    if actual_width < SPREAD_WIDTH_MIN:
+                        continue
 
-            if net_credit <= 0:
-                continue
+                    buy_chain = chain_map.get(buy_strike_candidate, {}).get("PE")
+                    if buy_chain and buy_chain.get("premium", 0) > 0:
+                        if buy_chain.get("oi", 0) < 100 or buy_chain.get("volume", 0) < 10:
+                            continue
+                        buy_premium = buy_chain["premium"]
+                        buy_greeks = compute_greeks(spot, buy_strike_candidate, T, RISK_FREE_RATE, iv, "PE")
+                        net_credit = sell_premium - buy_premium
+                        if net_credit <= 0:
+                            continue
 
-            # Max loss per lot = (width - net_credit) * lot_size
-            max_loss_per_lot = (actual_width - net_credit) * lot_size
-            if max_loss_per_lot <= 0:
-                continue
+                        if real_chain.get("dte"):
+                            dte = real_chain["dte"]
+                            T = _time_to_expiry(dte)
 
-            lots = max(1, int(max_loss_limit / max_loss_per_lot))
-            lots = min(lots, 2)  # Safety cap
-            trade_qty = lots * lot_size
-            total_credit = net_credit * trade_qty
-            total_max_loss = max_loss_per_lot * lots
+                        use_real = True
+                        # Build the spread rec with real data
+                        max_loss_per_lot = (actual_width - net_credit) * lot_size
+                        if max_loss_per_lot <= 0:
+                            continue
 
-            if total_max_loss > max_loss_limit:
+                        lots = max(1, int(max_loss_limit / max_loss_per_lot))
+                        lots = min(lots, 2)
+                        trade_qty = lots * lot_size
+                        total_credit = net_credit * trade_qty
+                        total_max_loss = max_loss_per_lot * lots
+
+                        if total_max_loss > max_loss_limit:
+                            lots = max(1, int(max_loss_limit / max_loss_per_lot))
+                            trade_qty = lots * lot_size
+                            total_credit = net_credit * trade_qty
+                            total_max_loss = max_loss_per_lot * lots
+
+                        margin_needed = total_max_loss
+                        prob_otm = sell_greeks_real["prob_otm"]
+                        delta_val = sell_greeks_real["delta"]
+                        theta_day = sell_greeks_real["theta"] - buy_greeks["theta"]
+
+                        otm_pct = (spot - sell_strike) / spot
+                        safety_tag = classify_safety(prob_otm, otm_pct)
+                        if not passes_risk_filter(safety_tag, settings["risk_profile"]):
+                            break
+
+                        ann_return = _annualized_return(total_credit, margin_needed, dte)
+
+                        legs = [
+                            _build_leg("SELL", sell_strike, sell_premium, trade_qty, "PE"),
+                            _build_leg("BUY", buy_strike_candidate, buy_premium, trade_qty, "PE"),
+                        ]
+                        fees = _fee_estimate(legs)
+
+                        alts = generate_strike_alternatives(
+                            spot=spot, option_type="PE", iv=iv, dte=dte, step=step,
+                        )
+
+                        recs.append(_add_frontend_aliases({
+                            "id": generate_id(),
+                            "rank": 0,
+                            "symbol": index_name,
+                            "strategy_type": "PUT_CREDIT_SPREAD",
+                            "strike": sell_strike,
+                            "option_type": "PE",
+                            "legs": legs,
+                            "premium_income": round(total_credit, 2),
+                            "margin_needed": round(margin_needed, 2),
+                            "max_loss": round(total_max_loss, 2),
+                            "prob_otm": round(prob_otm, 4),
+                            "delta": round(delta_val, 4),
+                            "annualized_return": round(ann_return, 4),
+                            "theta_per_day": round(theta_day * trade_qty, 2),
+                            "safety_tag": safety_tag,
+                            "strike_rationale": _strike_rationale(
+                                "PUT_CREDIT_SPREAD", sell_strike, spot, delta_val, prob_otm
+                            ),
+                            "alternatives": alts,
+                            "fee_estimate": fees,
+                            "dte": dte,
+                            "lots": lots,
+                            "spot": spot,
+                            "spread_width": actual_width,
+                        }))
+                        break  # First valid width
+                if use_real:
+                    continue  # Move to next index
+
+        if not use_real:
+            # Fall back to Black-Scholes (original behavior)
+            for width in range(SPREAD_WIDTH_MIN, SPREAD_WIDTH_MAX + 1, step):
+                buy_strike = _round_to_step(sell_strike - width, step)
+                actual_width = sell_strike - buy_strike
+
+                if actual_width < SPREAD_WIDTH_MIN:
+                    continue
+
+                sell_greeks = compute_greeks(spot, sell_strike, T, RISK_FREE_RATE, iv, "PE")
+                buy_greeks = compute_greeks(spot, buy_strike, T, RISK_FREE_RATE, iv, "PE")
+
+                sell_premium = sell_greeks["price"]
+                buy_premium = buy_greeks["price"]
+                net_credit = sell_premium - buy_premium
+
+                if net_credit <= 0:
+                    continue
+
+                max_loss_per_lot = (actual_width - net_credit) * lot_size
+                if max_loss_per_lot <= 0:
+                    continue
+
                 lots = max(1, int(max_loss_limit / max_loss_per_lot))
+                lots = min(lots, 2)
                 trade_qty = lots * lot_size
                 total_credit = net_credit * trade_qty
                 total_max_loss = max_loss_per_lot * lots
 
-            # Margin for spread = max loss (defined risk)
-            margin_needed = total_max_loss
+                if total_max_loss > max_loss_limit:
+                    lots = max(1, int(max_loss_limit / max_loss_per_lot))
+                    trade_qty = lots * lot_size
+                    total_credit = net_credit * trade_qty
+                    total_max_loss = max_loss_per_lot * lots
 
-            prob_otm = sell_greeks["prob_otm"]
-            delta_val = sell_greeks["delta"]
-            theta_day = (sell_greeks["theta"] - buy_greeks["theta"])
+                margin_needed = total_max_loss
 
-            otm_pct = (spot - sell_strike) / spot
-            safety_tag = classify_safety(prob_otm, otm_pct)
+                prob_otm = sell_greeks["prob_otm"]
+                delta_val = sell_greeks["delta"]
+                theta_day = (sell_greeks["theta"] - buy_greeks["theta"])
 
-            if not passes_risk_filter(safety_tag, settings["risk_profile"]):
-                continue
+                otm_pct = (spot - sell_strike) / spot
+                safety_tag = classify_safety(prob_otm, otm_pct)
 
-            ann_return = _annualized_return(total_credit, margin_needed, dte)
+                if not passes_risk_filter(safety_tag, settings["risk_profile"]):
+                    continue
 
-            legs = [
-                _build_leg("SELL", sell_strike, sell_premium, trade_qty, "PE"),
-                _build_leg("BUY", buy_strike, buy_premium, trade_qty, "PE"),
-            ]
-            fees = _fee_estimate(legs)
+                ann_return = _annualized_return(total_credit, margin_needed, dte)
 
-            alts = generate_strike_alternatives(
-                spot=spot,
-                option_type="PE",
-                iv=iv,
-                dte=dte,
-                step=step,
-            )
+                legs = [
+                    _build_leg("SELL", sell_strike, sell_premium, trade_qty, "PE"),
+                    _build_leg("BUY", buy_strike, buy_premium, trade_qty, "PE"),
+                ]
+                fees = _fee_estimate(legs)
 
-            recs.append(_add_frontend_aliases({
-                "id": generate_id(),
-                "rank": 0,
-                "symbol": index_name,
-                "strategy_type": "PUT_CREDIT_SPREAD",
-                "strike": sell_strike,
-                "option_type": "PE",
-                "legs": legs,
-                "premium_income": round(total_credit, 2),
-                "margin_needed": round(margin_needed, 2),
-                "max_loss": round(total_max_loss, 2),
-                "prob_otm": round(prob_otm, 4),
-                "delta": round(delta_val, 4),
-                "annualized_return": round(ann_return, 4),
-                "theta_per_day": round(theta_day * trade_qty, 2),
-                "safety_tag": safety_tag,
-                "strike_rationale": _strike_rationale(
-                    "PUT_CREDIT_SPREAD", sell_strike, spot, delta_val, prob_otm
-                ),
-                "alternatives": alts,
-                "fee_estimate": fees,
-                "dte": dte,
-                "lots": lots,
-                "spot": spot,
-                "spread_width": actual_width,
-            }))
+                alts = generate_strike_alternatives(
+                    spot=spot, option_type="PE", iv=iv, dte=dte, step=step,
+                )
 
-            # Only take the first valid width per index
-            break
+                recs.append(_add_frontend_aliases({
+                    "id": generate_id(),
+                    "rank": 0,
+                    "symbol": index_name,
+                    "strategy_type": "PUT_CREDIT_SPREAD",
+                    "strike": sell_strike,
+                    "option_type": "PE",
+                    "legs": legs,
+                    "premium_income": round(total_credit, 2),
+                    "margin_needed": round(margin_needed, 2),
+                    "max_loss": round(total_max_loss, 2),
+                    "prob_otm": round(prob_otm, 4),
+                    "delta": round(delta_val, 4),
+                    "annualized_return": round(ann_return, 4),
+                    "theta_per_day": round(theta_day * trade_qty, 2),
+                    "safety_tag": safety_tag,
+                    "strike_rationale": _strike_rationale(
+                        "PUT_CREDIT_SPREAD", sell_strike, spot, delta_val, prob_otm
+                    ),
+                    "alternatives": alts,
+                    "fee_estimate": fees,
+                    "dte": dte,
+                    "lots": lots,
+                    "spot": spot,
+                    "spread_width": actual_width,
+                }))
+
+                # Only take the first valid width per index
+                break
 
     return recs
 
 
-def _scan_collars(holdings: list, settings: dict, dte: int) -> list:
+def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -> list:
     """
     Scan for collar opportunities on profitable stock positions.
 
     A collar sells an OTM call and buys an OTM put, ideally for near-zero
     net cost, locking in gains on positions with > 8% unrealized profit.
+    When kite_service is connected, uses real option chain for premiums.
     """
     recs = []
     T = _time_to_expiry(dte)
     target_delta_call = float(settings.get("manual_target_delta_calls", 0.15))
     target_delta_put = float(settings.get("manual_target_delta_puts", 0.20))
+    kite_connected = kite_service and kite_service.is_authenticated()
 
     for holding in holdings:
         symbol = holding.get("symbol", holding.get("tradingsymbol", ""))
         qty = holding.get("qty", holding.get("quantity", 0))
         avg_cost = holding.get("average_price", holding.get("avgPrice", 0))
 
-        stock_info = _resolve_stock_info(symbol, holding)
+        stock_info = _resolve_stock_info(symbol, holding, kite_service=kite_service)
         if not stock_info:
             continue
 
@@ -673,6 +928,11 @@ def _scan_collars(holdings: list, settings: dict, dte: int) -> list:
         gain_pct = (spot - avg_cost) / avg_cost
         if gain_pct < COLLAR_MIN_GAIN_PCT:
             continue
+
+        # Determine expiry per-strategy: stocks use monthly expiry
+        expiry_date = None
+        if kite_connected:
+            expiry_date = market_data.get_nearest_expiry(kite_service, symbol)
 
         step = max(5, _round_to_step(spot * 0.01, 5))
         if spot > 2000:
@@ -702,11 +962,67 @@ def _scan_collars(holdings: list, settings: dict, dte: int) -> list:
         if put_strike >= spot:
             put_strike = _round_to_step(spot * (1 - 0.03), step)
 
-        call_greeks = compute_greeks(spot, call_strike, T, RISK_FREE_RATE, iv, "CE")
-        put_greeks = compute_greeks(spot, put_strike, T, RISK_FREE_RATE, iv, "PE")
+        # Try real option chain from Kite
+        real_chain = None
+        use_real = False
+        if kite_connected and expiry_date:
+            real_chain = market_data.get_option_chain_live(kite_service, symbol, expiry_date)
 
-        call_premium = call_greeks["price"]
-        put_premium = put_greeks["price"]
+        if real_chain and real_chain.get("strikes"):
+            chain_map = {s["strike"]: s for s in real_chain["strikes"]}
+
+            # Find call strike closest to target delta
+            best_call = None
+            best_call_delta_diff = float("inf")
+            for s_data in real_chain["strikes"]:
+                ce = s_data.get("CE")
+                if not ce or ce.get("premium", 0) <= 0:
+                    continue
+                if ce.get("oi", 0) < 100 or ce.get("volume", 0) < 10:
+                    continue
+                s_strike = s_data["strike"]
+                if s_strike <= spot:
+                    continue  # OTM calls only
+                s_greeks = compute_greeks(spot, s_strike, T, RISK_FREE_RATE, iv, "CE")
+                delta_diff = abs(abs(s_greeks["delta"]) - target_delta_call)
+                if delta_diff < best_call_delta_diff:
+                    best_call_delta_diff = delta_diff
+                    best_call = (s_strike, ce, s_greeks)
+
+            # Find put strike closest to target delta
+            best_put = None
+            best_put_delta_diff = float("inf")
+            for s_data in real_chain["strikes"]:
+                pe = s_data.get("PE")
+                if not pe or pe.get("premium", 0) <= 0:
+                    continue
+                if pe.get("oi", 0) < 100 or pe.get("volume", 0) < 10:
+                    continue
+                s_strike = s_data["strike"]
+                if s_strike >= spot:
+                    continue  # OTM puts only
+                s_greeks = compute_greeks(spot, s_strike, T, RISK_FREE_RATE, iv, "PE")
+                delta_diff = abs(abs(s_greeks["delta"]) - target_delta_put)
+                if delta_diff < best_put_delta_diff:
+                    best_put_delta_diff = delta_diff
+                    best_put = (s_strike, pe, s_greeks)
+
+            if best_call and best_put:
+                call_strike, ce_data, call_greeks = best_call
+                put_strike, pe_data, put_greeks = best_put
+                call_premium = ce_data["premium"]
+                put_premium = pe_data["premium"]
+                use_real = True
+                if real_chain.get("dte"):
+                    dte = real_chain["dte"]
+                    T = _time_to_expiry(dte)
+
+        if not use_real:
+            call_greeks = compute_greeks(spot, call_strike, T, RISK_FREE_RATE, iv, "CE")
+            put_greeks = compute_greeks(spot, put_strike, T, RISK_FREE_RATE, iv, "PE")
+            call_premium = call_greeks["price"]
+            put_premium = put_greeks["price"]
+
         net_cost = put_premium - call_premium  # Positive means debit
 
         lots = qty // lot_size
@@ -803,6 +1119,7 @@ def scan_strategies(
     holdings: list,
     cash_balance: float,
     settings: dict | None = None,
+    kite_service=None,
 ) -> list:
     """
     Main scanner entry point. Scans all enabled strategy types across
@@ -817,6 +1134,8 @@ def scan_strategies(
                       risk_profile, max_loss_per_trade, preferred_dte,
                       manual_target_delta_puts, manual_target_delta_calls,
                       allowed_strategies (comma-separated string or set).
+        kite_service: Optional KiteService instance. When authenticated,
+                      enables real option chains and live lot sizes.
 
     Returns:
         List of recommendation dicts, sorted by rank (1 = best).
@@ -830,31 +1149,46 @@ def scan_strategies(
     dte = _get_dte(resolved)
     allowed = resolved["allowed_strategies"]
 
-    # Calculate expiry date for all strategies
-    from kite_service import KiteService
-    expiry_date = KiteService._next_thursday()
-    expiry_str = expiry_date.strftime("%d %b").upper()  # e.g. "03 APR"
-    expiry_iso = expiry_date.isoformat()
-
     all_recs = []
 
     if "COVERED_CALL" in allowed:
-        all_recs.extend(_scan_covered_calls(holdings, resolved, dte))
+        all_recs.extend(_scan_covered_calls(holdings, resolved, dte, kite_service=kite_service))
 
     if "CASH_SECURED_PUT" in allowed:
-        all_recs.extend(_scan_cash_secured_puts(cash_balance, resolved, dte))
+        all_recs.extend(_scan_cash_secured_puts(cash_balance, resolved, dte, kite_service=kite_service))
 
     if "PUT_CREDIT_SPREAD" in allowed:
-        all_recs.extend(_scan_put_credit_spreads(cash_balance, resolved, dte))
+        all_recs.extend(_scan_put_credit_spreads(cash_balance, resolved, dte, kite_service=kite_service))
 
     if "COLLAR" in allowed:
-        all_recs.extend(_scan_collars(holdings, resolved, dte))
+        all_recs.extend(_scan_collars(holdings, resolved, dte, kite_service=kite_service))
 
     # Filter out negative premium strategies
     all_recs = [r for r in all_recs if r.get("premium_income", 0) > 0]
 
-    # Add expiry info to all recs and legs
+    # Compute per-strategy expiry and add expiry info to recs and legs
+    kite_connected = kite_service and kite_service.is_authenticated()
     for rec in all_recs:
+        symbol = rec.get("symbol", "")
+        strategy_type = rec.get("strategy_type", "")
+
+        # Each strategy determines its own expiry based on symbol type
+        if kite_connected:
+            expiry_date = market_data.get_nearest_expiry(kite_service, symbol)
+        else:
+            # Fallback: use market_data fallback expiries (weekly for indices, monthly for stocks)
+            fallback_expiries = market_data._fallback_expiries(symbol)
+            expiry_date = fallback_expiries[0] if fallback_expiries else None
+
+        if expiry_date:
+            expiry_str = expiry_date.strftime("%d %b").upper()  # e.g. "03 APR"
+            expiry_iso = expiry_date.isoformat()
+        else:
+            from kite_service import KiteService
+            expiry_date = KiteService._next_thursday()
+            expiry_str = expiry_date.strftime("%d %b").upper()
+            expiry_iso = expiry_date.isoformat()
+
         rec["expiry_date"] = expiry_iso
         rec["expiry_display"] = expiry_str
         if rec.get("legs"):
@@ -863,6 +1197,11 @@ def scan_strategies(
                 leg["expiry_display"] = expiry_str
                 # Build readable instrument name: NIFTY 03 APR 22550 PE
                 leg["instrument"] = f"{rec['symbol']} {expiry_str} {int(leg['strike'])} {leg['option_type']}"
+
+    # Summary: total margin required across all recommendations
+    total_margin_required = sum(r.get("margin_needed", 0) for r in all_recs)
+    for rec in all_recs:
+        rec["total_margin_required"] = round(total_margin_required, 2)
 
     ranked = rank_recommendations(all_recs)
     return ranked
