@@ -9,7 +9,7 @@ import logging
 import os
 import json
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, date
 from flask import Flask, request, jsonify, send_from_directory, g, redirect
 from flask_cors import CORS
 
