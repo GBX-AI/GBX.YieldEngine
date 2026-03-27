@@ -40,8 +40,8 @@ SIMULATION_STOCKS = {
 }
 
 SIMULATION_INDICES = {
-    "NIFTY": {"spot": 23150, "lotSize": 25, "iv": 0.145, "support": 22800, "resistance": 23500},
-    "BANKNIFTY": {"spot": 48900, "lotSize": 15, "iv": 0.162, "support": 47800, "resistance": 50000},
+    "NIFTY": {"spot": 23150, "lotSize": 75, "iv": 0.145, "support": 22800, "resistance": 23500},
+    "BANKNIFTY": {"spot": 48900, "lotSize": 30, "iv": 0.162, "support": 47800, "resistance": 50000},
 }
 
 DEFAULT_SETTINGS = {

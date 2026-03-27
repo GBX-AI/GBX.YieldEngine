@@ -381,7 +381,7 @@ export default function Scanner() {
                       { label: 'Margin', value: fmtCur(rec.margin || rec.margin_needed), color: C.text },
                       { label: 'Ann. Return', value: fmtPct(rec.annualized_return), color: C.amber },
                       { label: 'Theta/day', value: (rec.theta_per_day || rec.theta) != null ? `₹${fmt(rec.theta_per_day || rec.theta)}` : '—', color: C.blue },
-                      { label: 'Expiry', value: rec.dte ? `${rec.dte}d` : '—', color: C.muted },
+                      { label: 'Expiry', value: rec.expiry_display ? `${rec.expiry_display} (${rec.dte}d)` : rec.dte ? `${rec.dte}d` : '—', color: C.muted },
                     ].map((m) => (
                       <div key={m.label}>
                         <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>{m.label}</div>
@@ -414,7 +414,7 @@ export default function Scanner() {
                                 {action}
                               </span>
                               <span style={{ fontWeight: 600, fontSize: 14 }}>
-                                {rec.symbol} {leg.strike} {leg.option_type}
+                                {leg.instrument || `${rec.symbol} ${leg.strike} ${leg.option_type}`}
                               </span>
                               <span style={{ fontFamily: font.mono, fontSize: 13, color: C.muted }}>
                                 Qty: {leg.quantity}

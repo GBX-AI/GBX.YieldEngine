@@ -830,6 +830,12 @@ def scan_strategies(
     dte = _get_dte(resolved)
     allowed = resolved["allowed_strategies"]
 
+    # Calculate expiry date for all strategies
+    from kite_service import KiteService
+    expiry_date = KiteService._next_thursday()
+    expiry_str = expiry_date.strftime("%d %b").upper()  # e.g. "03 APR"
+    expiry_iso = expiry_date.isoformat()
+
     all_recs = []
 
     if "COVERED_CALL" in allowed:
@@ -843,6 +849,20 @@ def scan_strategies(
 
     if "COLLAR" in allowed:
         all_recs.extend(_scan_collars(holdings, resolved, dte))
+
+    # Filter out negative premium strategies
+    all_recs = [r for r in all_recs if r.get("premium_income", 0) > 0]
+
+    # Add expiry info to all recs and legs
+    for rec in all_recs:
+        rec["expiry_date"] = expiry_iso
+        rec["expiry_display"] = expiry_str
+        if rec.get("legs"):
+            for leg in rec["legs"]:
+                leg["expiry_date"] = expiry_iso
+                leg["expiry_display"] = expiry_str
+                # Build readable instrument name: NIFTY 03 APR 22550 PE
+                leg["instrument"] = f"{rec['symbol']} {expiry_str} {int(leg['strike'])} {leg['option_type']}"
 
     ranked = rank_recommendations(all_recs)
     return ranked
