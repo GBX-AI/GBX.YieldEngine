@@ -129,9 +129,17 @@ class _PgWrapper:
 
     def execute(self, sql, params=None):
         import psycopg2.extras
-        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(sql, params or ())
-        return cur
+        try:
+            cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(sql, params or ())
+            return cur
+        except Exception:
+            # PostgreSQL requires rollback after any error before new queries
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def executemany(self, sql, params_list):
         import psycopg2.extras
@@ -278,14 +286,23 @@ def init_db():
     """Create all tables, run migrations, insert default settings."""
     conn = get_db()
     for stmt in _CREATE_TABLE_STMTS:
-        conn.execute(stmt)
+        try:
+            conn.execute(stmt)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"[MODELS] init_db table creation: {e}", flush=True)
 
     for key, value in DEFAULT_SETTINGS.items():
-        conn.execute(
-            "INSERT INTO settings (key, value, user_id) VALUES (%s, %s, '') "
-            "ON CONFLICT (key, user_id) DO NOTHING",
-            (key, value)
-        )
+        try:
+            conn.execute(
+                "INSERT INTO settings (key, value, user_id) VALUES (%s, %s, '') "
+                "ON CONFLICT (key, user_id) DO NOTHING",
+                (key, value)
+            )
+        except Exception as e:
+            conn.rollback()
+            print(f"[MODELS] init_db setting {key}: {e}", flush=True)
 
     conn.commit()
     _migrate_add_user_id()
@@ -300,34 +317,30 @@ def _migrate_add_user_id():
     ]
 
     if _is_pg:
-        # PostgreSQL supports ADD COLUMN IF NOT EXISTS
         for table in tables_needing_user_id:
             try:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS user_id TEXT")
+                conn.commit()
             except Exception:
-                pass
-
-        # Users table: add kite columns
+                conn.rollback()
         for col in ("kite_api_key", "kite_api_secret"):
             try:
                 conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} TEXT")
+                conn.commit()
             except Exception:
-                pass
+                conn.rollback()
     else:
-        # SQLite: no IF NOT EXISTS for ADD COLUMN, swallow errors
         for table in tables_needing_user_id:
             try:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
             except Exception:
                 pass
-
         for col in ("kite_api_key", "kite_api_secret"):
             try:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
             except Exception:
                 pass
-
-    conn.commit()
+        conn.commit()
 
 
 def migrate_orphaned_data(user_id):
@@ -339,7 +352,7 @@ def migrate_orphaned_data(user_id):
         try:
             conn.execute(f"UPDATE {table} SET user_id = %s WHERE user_id IS NULL OR user_id = ''", (user_id,))
         except Exception:
-            pass
+            conn.rollback()
     conn.commit()
 
 
