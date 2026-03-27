@@ -434,7 +434,7 @@ export default function Scanner() {
                                 {leg.instrument || `${rec.symbol} ${leg.strike} ${leg.option_type}`}
                               </span>
                               <span style={{ fontFamily: font.mono, fontSize: 13, color: C.muted }}>
-                                Qty: {leg.quantity}
+                                Qty: {leg.quantity}{rec.lots ? ` (${rec.lots} lot${rec.lots > 1 ? 's' : ''})` : ''}
                               </span>
                               <span style={{ fontFamily: font.mono, fontSize: 14, fontWeight: 600, color: isSell ? C.emerald : C.red, marginLeft: 'auto' }}>
                                 ₹{fmt(leg.premium || leg.price || 0)}

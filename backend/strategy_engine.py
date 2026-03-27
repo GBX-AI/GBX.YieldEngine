@@ -1198,6 +1198,23 @@ def scan_strategies(
                 # Build readable instrument name: NIFTY 03 APR 22550 PE
                 leg["instrument"] = f"{rec['symbol']} {expiry_str} {int(leg['strike'])} {leg['option_type']}"
 
+    # Deduplicate: for each symbol, keep only the best strategy (highest annualized return)
+    # Exception: COVERED_CALL and COLLAR on same stock are different enough to show both
+    seen = {}
+    deduped = []
+    for rec in all_recs:
+        key = f"{rec['symbol']}_{rec['strategy_type']}"
+        if key in seen:
+            # Keep the one with higher annualized return
+            if rec.get("annualized_return", 0) > seen[key].get("annualized_return", 0):
+                deduped = [r for r in deduped if f"{r['symbol']}_{r['strategy_type']}" != key]
+                deduped.append(rec)
+                seen[key] = rec
+        else:
+            deduped.append(rec)
+            seen[key] = rec
+    all_recs = deduped
+
     # Summary: total margin required across all recommendations
     total_margin_required = sum(r.get("margin_needed", 0) for r in all_recs)
     for rec in all_recs:
