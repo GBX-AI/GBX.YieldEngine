@@ -70,7 +70,12 @@ const TYPE_COLORS = {
 
 const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-IN', { maximumFractionDigits: 2 }));
 const fmtCur = (n) => (n == null ? '—' : '₹' + fmt(n));
-const fmtPct = (n) => (n == null ? '—' : `${Number(n).toFixed(1)}%`);
+const fmtPct = (n) => {
+  if (n == null) return '—';
+  const v = Number(n);
+  // API returns prob_otm as 0-1 decimal, annualized_return as percentage
+  return v <= 1 && v >= -1 ? `${(v * 100).toFixed(1)}%` : `${v.toFixed(1)}%`;
+};
 
 export default function Scanner() {
   /* ─── State ─── */
@@ -373,9 +378,10 @@ export default function Scanner() {
                     {[
                       { label: 'Prob OTM', value: fmtPct(rec.prob_otm), color: C.emerald },
                       { label: 'Delta', value: rec.delta != null ? rec.delta.toFixed(3) : '—', color: C.text },
-                      { label: 'Margin', value: fmtCur(rec.margin), color: C.text },
+                      { label: 'Margin', value: fmtCur(rec.margin || rec.margin_needed), color: C.text },
                       { label: 'Ann. Return', value: fmtPct(rec.annualized_return), color: C.amber },
-                      { label: 'Theta/day', value: rec.theta != null ? `₹${fmt(rec.theta)}` : '—', color: C.blue },
+                      { label: 'Theta/day', value: (rec.theta_per_day || rec.theta) != null ? `₹${fmt(rec.theta_per_day || rec.theta)}` : '—', color: C.blue },
+                      { label: 'Expiry', value: rec.dte ? `${rec.dte}d` : '—', color: C.muted },
                     ].map((m) => (
                       <div key={m.label}>
                         <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>{m.label}</div>
@@ -384,48 +390,82 @@ export default function Scanner() {
                     ))}
                   </div>
 
-                  {/* Strike Rationale */}
-                  {rec.rationale && (
+                  {/* Trade Legs — always visible */}
+                  {rec.legs && rec.legs.length > 0 && (
                     <div style={{ padding: '0 24px 16px' }}>
-                      <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, fontStyle: 'italic' }}>
-                        {rec.rationale}
+                      <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>What to do</div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        {rec.legs.map((leg, li) => {
+                          const action = leg.action || leg.side || '';
+                          const isSell = action.toUpperCase() === 'SELL';
+                          return (
+                            <div key={li} style={{
+                              display: 'flex', gap: 12, alignItems: 'center',
+                              padding: '10px 16px', borderRadius: 10,
+                              background: isSell ? 'rgba(248,113,113,0.06)' : 'rgba(110,231,183,0.06)',
+                              border: `1px solid ${isSell ? 'rgba(248,113,113,0.15)' : 'rgba(110,231,183,0.15)'}`,
+                            }}>
+                              <span style={{
+                                padding: '3px 10px', borderRadius: 6, fontSize: 11, fontWeight: 700,
+                                background: isSell ? `${C.red}20` : `${C.emerald}20`,
+                                color: isSell ? C.red : C.emerald,
+                                minWidth: 36, textAlign: 'center',
+                              }}>
+                                {action}
+                              </span>
+                              <span style={{ fontWeight: 600, fontSize: 14 }}>
+                                {rec.symbol} {leg.strike} {leg.option_type}
+                              </span>
+                              <span style={{ fontFamily: font.mono, fontSize: 13, color: C.muted }}>
+                                Qty: {leg.quantity}
+                              </span>
+                              <span style={{ fontFamily: font.mono, fontSize: 14, fontWeight: 600, color: isSell ? C.emerald : C.red, marginLeft: 'auto' }}>
+                                ₹{fmt(leg.premium || leg.price || 0)}
+                              </span>
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   )}
 
-                  {/* Risk Ladder */}
-                  {rec.risk_ladder && rec.risk_ladder.length > 0 && (
+                  {/* Strike Rationale */}
+                  {(rec.strike_rationale || rec.rationale) && (
                     <div style={{ padding: '0 24px 16px' }}>
-                      <div style={{ fontSize: 12, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>Risk Ladder</div>
+                      <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, fontStyle: 'italic' }}>
+                        {rec.strike_rationale || rec.rationale}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Risk Ladder (alternatives) */}
+                  {rec.alternatives && Object.keys(rec.alternatives).length > 0 && (
+                    <div style={{ padding: '0 24px 16px' }}>
+                      <div style={{ fontSize: 12, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>Alternative Strikes</div>
                       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                        {rec.risk_ladder.map((alt) => {
-                          const isSelected = alt.profile === riskProfile;
-                          const profileMeta = RISK_PROFILES.find((r) => r.key === alt.profile);
+                        {Object.entries(rec.alternatives).map(([profile, alt]) => {
+                          const profileMeta = RISK_PROFILES.find((r) => r.key === profile);
                           const color = profileMeta?.color || C.muted;
                           return (
                             <div
-                              key={alt.profile}
+                              key={profile}
                               style={{
-                                background: isSelected ? `${color}15` : 'rgba(148,163,184,0.05)',
-                                border: `1px solid ${isSelected ? color : C.border}`,
+                                background: 'rgba(148,163,184,0.05)',
+                                border: `1px solid ${C.border}`,
                                 borderRadius: 12,
                                 padding: '12px 16px',
                                 minWidth: 160,
-                                position: 'relative',
                               }}
                             >
-                              {isSelected && (
-                                <span style={{ position: 'absolute', top: -6, right: 8, fontSize: 14 }}>★</span>
-                              )}
-                              <div style={{ fontSize: 12, fontWeight: 700, color, marginBottom: 6 }}>
-                                {alt.profile}
+                              <div style={{ fontSize: 12, fontWeight: 700, color, marginBottom: 6, textTransform: 'capitalize' }}>
+                                {profile}
                               </div>
                               <div style={{ fontFamily: font.mono, fontSize: 14, fontWeight: 600, marginBottom: 4 }}>
-                                Strike {fmtCur(alt.strike)}
+                                Strike ₹{fmt(alt.strike)}
                               </div>
                               <div style={{ display: 'flex', gap: 16, fontSize: 12, color: C.muted }}>
-                                <span>Prem: <span style={{ color: C.emerald, fontFamily: font.mono }}>{fmtCur(alt.premium)}</span></span>
-                                <span>Prob: <span style={{ color: C.text, fontFamily: font.mono }}>{fmtPct(alt.prob_otm)}</span></span>
+                                <span>Prem: <span style={{ color: C.emerald, fontFamily: font.mono }}>₹{fmt(alt.premium)}</span></span>
+                                <span>Prob: <span style={{ color: C.text, fontFamily: font.mono }}>{fmtPct(alt.prob_otm / 100)}</span></span>
                               </div>
                             </div>
                           );
@@ -437,43 +477,24 @@ export default function Scanner() {
                   {/* Expanded section */}
                   {expanded && (
                     <div style={{ borderTop: `1px solid ${C.border}`, padding: 24 }}>
-                      {/* Order legs */}
-                      {rec.legs && rec.legs.length > 0 && (
+                      {/* Fee estimate & max loss */}
+                      {(rec.fee_estimate || rec.max_loss) && (
                         <div style={{ marginBottom: 20 }}>
-                          <div style={{ fontSize: 12, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10 }}>Order Legs</div>
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                            {rec.legs.map((leg, li) => (
-                              <div
-                                key={li}
-                                style={{
-                                  display: 'flex', gap: 16, alignItems: 'center',
-                                  padding: '10px 14px', borderRadius: 10,
-                                  background: 'rgba(148,163,184,0.05)',
-                                  fontSize: 14,
-                                }}
-                              >
-                                <span style={{
-                                  padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 700,
-                                  background: leg.side === 'BUY' ? `${C.emerald}20` : `${C.red}20`,
-                                  color: leg.side === 'BUY' ? C.emerald : C.red,
-                                }}>
-                                  {leg.side}
-                                </span>
-                                <span style={{ fontWeight: 600 }}>{leg.instrument || leg.symbol}</span>
-                                <span style={{ fontFamily: font.mono, color: C.muted }}>Qty: {leg.quantity}</span>
-                                <span style={{ fontFamily: font.mono, color: C.muted, marginLeft: 'auto' }}>{fmtCur(leg.price)}</span>
-                              </div>
-                            ))}
+                          <div style={{ display: 'flex', gap: 24, fontSize: 13 }}>
+                            {rec.fee_estimate != null && (
+                              <span style={{ color: C.muted }}>Est. Fees: <span style={{ fontFamily: font.mono, color: C.text }}>₹{fmt(rec.fee_estimate)}</span></span>
+                            )}
+                            {rec.max_loss != null && (
+                              <span style={{ color: C.muted }}>Max Loss: <span style={{ fontFamily: font.mono, color: C.red }}>₹{fmt(rec.max_loss)}</span></span>
+                            )}
+                            {rec.spot != null && (
+                              <span style={{ color: C.muted }}>Spot: <span style={{ fontFamily: font.mono, color: C.text }}>₹{fmt(rec.spot)}</span></span>
+                            )}
                           </div>
                         </div>
                       )}
 
-                      {/* Fees estimate */}
-                      {rec.fees && (
-                        <div style={{ marginBottom: 20, fontSize: 13, color: C.muted }}>
-                          Estimated fees &amp; charges: <span style={{ fontFamily: font.mono, color: C.text }}>{fmtCur(rec.fees)}</span>
-                        </div>
-                      )}
+                      {/* Legs moved above — always visible now */}
 
                       {/* Execute button */}
                       <button
