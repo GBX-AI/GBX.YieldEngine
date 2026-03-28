@@ -914,10 +914,12 @@ def create_app():
             except Exception as e:
                 api_test = f"failed: {type(e).__name__}: {str(e)[:100]}"
 
+        import market_data as md
         return jsonify({
             "has_credentials": bool(creds),
             "has_token": bool(token_data and token_data.get("kite_access_token")),
             "token_date": token_data.get("kite_token_date") if token_data else None,
+            "token_prefix": token_data.get("kite_access_token", "")[:15] + "..." if token_data and token_data.get("kite_access_token") else None,
             "kite_user_id": token_data.get("kite_user_id") if token_data else None,
             "is_authenticated": kite.is_authenticated() if kite else False,
             "is_simulation": kite.is_simulation if kite else True,
@@ -925,6 +927,7 @@ def create_app():
             "api_test": api_test,
             "instruments_count": instruments_count,
             "today": date.today().isoformat(),
+            "market_data_debug": md.get_debug_log(),
         })
 
     @app.route("/api/kite/status", methods=["GET"])

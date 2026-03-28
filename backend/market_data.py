@@ -22,6 +22,13 @@ WEEKLY_EXPIRY_SYMBOLS = {"NIFTY"}
 _instruments_cache = {"data": None, "timestamp": 0}
 INSTRUMENTS_CACHE_TTL = 6 * 3600  # 6 hours
 
+# Debug log for diagnosing instrument fetch issues
+_last_debug = {"log": []}
+
+def get_debug_log():
+    """Return the last instrument fetch debug log."""
+    return _last_debug.get("log", [])
+
 
 def get_nfo_instruments(kite_service):
     """Fetch all NFO instruments from Kite. Cached for 6 hours.
@@ -32,26 +39,32 @@ def get_nfo_instruments(kite_service):
         print(f"[MARKET_DATA] Using cached instruments ({len(_instruments_cache['data'])} instruments)", file=sys.stderr, flush=True)
         return _instruments_cache["data"]
 
+    _debug_log = []
+
     if not kite_service:
-        print("[MARKET_DATA] No kite_service provided", file=sys.stderr, flush=True)
+        _debug_log.append("No kite_service provided")
+        _last_debug["log"] = _debug_log
         return []
 
     if not kite_service.is_authenticated():
-        print(f"[MARKET_DATA] Kite not authenticated. simulation_mode={kite_service.is_simulation}, has_token={bool(kite_service._access_token)}", file=sys.stderr, flush=True)
+        _debug_log.append(f"Kite not authenticated. simulation={kite_service.is_simulation}, has_token={bool(kite_service._access_token)}")
+        _last_debug["log"] = _debug_log
         return []
 
     try:
-        print("[MARKET_DATA] Fetching NFO instruments from Kite...", file=sys.stderr, flush=True)
+        _debug_log.append("Fetching NFO instruments from Kite...")
         instruments = kite_service.get_instruments("NFO")
         if instruments:
             _instruments_cache["data"] = instruments
             _instruments_cache["timestamp"] = now
-            print(f"[MARKET_DATA] Fetched {len(instruments)} NFO instruments from Kite", file=sys.stderr, flush=True)
+            _debug_log.append(f"Fetched {len(instruments)} NFO instruments")
         else:
-            print("[MARKET_DATA] Kite returned 0 instruments", file=sys.stderr, flush=True)
+            _debug_log.append("Kite returned 0 instruments")
+        _last_debug["log"] = _debug_log
         return instruments
     except Exception as e:
-        print(f"[MARKET_DATA] Failed to fetch instruments: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        _debug_log.append(f"FAILED: {type(e).__name__}: {e}")
+        _last_debug["log"] = _debug_log
         return _instruments_cache.get("data") or []
 
 
