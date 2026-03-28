@@ -983,6 +983,10 @@ def create_app():
         port_delta = pr.get_portfolio_delta(kite)
         risk_summary = pr.get_portfolio_risk_summary(recs, margin_data.get("available", 0), port_delta)
 
+        # Data source indicator
+        data_source = "kite" if kite_authenticated else "simulation"
+        token_data = get_user_kite_token(user_id)
+
         return jsonify({
             "recommendations": regular_recs,
             "covered_calls": covered_calls,
@@ -992,6 +996,9 @@ def create_app():
             "total_weekly_income": round(total_net_premium, 2),
             "vix": vix_data,
             "portfolio_risk": risk_summary,
+            "data_source": data_source,
+            "kite_connected": kite_authenticated,
+            "kite_user_id": token_data.get("kite_user_id") if token_data else None,
         })
 
     @app.route("/api/recommendations", methods=["GET", "POST"])

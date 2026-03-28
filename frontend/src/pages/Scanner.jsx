@@ -453,6 +453,7 @@ export default function Scanner() {
   // Summary
   const [totalWeeklyIncome, setTotalWeeklyIncome] = useState(null);
   const [totalMarginRequired, setTotalMarginRequired] = useState(null);
+  const [dataSource, setDataSource] = useState(null);  // "kite" or "simulation"
 
   /* ─── Init ─── */
   useEffect(() => {
@@ -484,6 +485,7 @@ export default function Scanner() {
       setPortfolioRisk(scanData?.portfolio_risk || null);
       setTotalWeeklyIncome(scanData?.total_weekly_income ?? null);
       setTotalMarginRequired(scanData?.total_margin_required ?? null);
+      setDataSource(scanData?.data_source || null);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -532,7 +534,23 @@ export default function Scanner() {
       <div style={{ maxWidth: 1280, margin: '0 auto' }}>
 
         {/* Header */}
-        <h1 style={{ fontSize: 28, fontWeight: 700, margin: '0 0 28px' }}>Scanner</h1>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 28 }}>
+          <h1 style={{ fontSize: 28, fontWeight: 700, margin: 0 }}>Scanner</h1>
+          {dataSource && (
+            <span style={{
+              fontSize: 12, fontWeight: 600, padding: '4px 12px', borderRadius: 999,
+              fontFamily: font.mono,
+              background: dataSource === 'kite' ? 'rgba(110,231,183,0.12)' : 'rgba(252,211,77,0.12)',
+              color: dataSource === 'kite' ? C.emerald : C.amber,
+              border: `1px solid ${dataSource === 'kite' ? 'rgba(110,231,183,0.3)' : 'rgba(252,211,77,0.3)'}`,
+            }}>
+              {dataSource === 'kite' ? 'LIVE — Kite API' : 'SIMULATION — Black-Scholes'}
+            </span>
+          )}
+          {!dataSource && !scanning && (
+            <span style={{ fontSize: 12, color: C.muted }}>Click "Scan Now" to analyze</span>
+          )}
+        </div>
 
         {/* Error */}
         {error && (

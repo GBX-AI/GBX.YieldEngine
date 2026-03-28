@@ -55,10 +55,12 @@ def _log_notification(severity: str, title: str, message: str, user_id: str = No
 
 
 def get_kite_for_user(user_id: str) -> "KiteService":
-    """Factory: construct a KiteService for the given user, loading their token from DB."""
+    """Factory: construct a KiteService for the given user, loading their token from DB.
+    Tries the token even if from yesterday — Kite tokens sometimes work past midnight."""
     api_key, _ = _resolve_kite_credentials(user_id)
     token_data = get_user_kite_token(user_id)
-    if token_data and token_data["kite_token_date"] == date.today().isoformat():
+    if token_data and token_data["kite_access_token"]:
+        # Try the token regardless of date — KiteService._setup_kite will validate
         return KiteService(
             access_token=token_data["kite_access_token"],
             kite_user_id=token_data["kite_user_id"],
@@ -129,16 +131,12 @@ class KiteService:
     # ------------------------------------------------------------------
 
     def is_authenticated(self) -> bool:
-        """Check whether we have a valid, live Kite session."""
+        """Check whether we have a valid Kite session.
+        The actual API call will fail if the token is expired — no date check needed.
+        _setup_kite() sets _simulation_mode=True if token is invalid."""
         if self._simulation_mode:
             return False
         if not self._access_token:
-            return False
-        # Token is only valid for the current trading day
-        if self._token_date != date.today().isoformat():
-            logger.info("Access token from %s is stale (today: %s)", self._token_date, date.today().isoformat())
-            self._access_token = ""
-            self._simulation_mode = True
             return False
         return True
 
