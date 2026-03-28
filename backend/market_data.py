@@ -26,20 +26,32 @@ INSTRUMENTS_CACHE_TTL = 6 * 3600  # 6 hours
 def get_nfo_instruments(kite_service):
     """Fetch all NFO instruments from Kite. Cached for 6 hours.
     Returns list of instrument dicts or empty list if not connected."""
+    import sys
     now = time.time()
     if _instruments_cache["data"] and (now - _instruments_cache["timestamp"]) < INSTRUMENTS_CACHE_TTL:
+        print(f"[MARKET_DATA] Using cached instruments ({len(_instruments_cache['data'])} instruments)", file=sys.stderr, flush=True)
         return _instruments_cache["data"]
 
-    if not kite_service or not kite_service.is_authenticated():
+    if not kite_service:
+        print("[MARKET_DATA] No kite_service provided", file=sys.stderr, flush=True)
+        return []
+
+    if not kite_service.is_authenticated():
+        print(f"[MARKET_DATA] Kite not authenticated. simulation_mode={kite_service.is_simulation}, has_token={bool(kite_service._access_token)}", file=sys.stderr, flush=True)
         return []
 
     try:
+        print("[MARKET_DATA] Fetching NFO instruments from Kite...", file=sys.stderr, flush=True)
         instruments = kite_service.get_instruments("NFO")
-        _instruments_cache["data"] = instruments
-        _instruments_cache["timestamp"] = now
+        if instruments:
+            _instruments_cache["data"] = instruments
+            _instruments_cache["timestamp"] = now
+            print(f"[MARKET_DATA] Fetched {len(instruments)} NFO instruments from Kite", file=sys.stderr, flush=True)
+        else:
+            print("[MARKET_DATA] Kite returned 0 instruments", file=sys.stderr, flush=True)
         return instruments
     except Exception as e:
-        logger.error("Failed to fetch NFO instruments: %s", e)
+        print(f"[MARKET_DATA] Failed to fetch instruments: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         return _instruments_cache.get("data") or []
 
 

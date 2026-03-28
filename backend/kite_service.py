@@ -117,13 +117,15 @@ class KiteService:
 
     def _setup_kite(self, access_token: str):
         """Initialize the KiteConnect instance with a valid token."""
+        import sys
         try:
             from kiteconnect import KiteConnect
             self._kite = KiteConnect(api_key=self._api_key)
             self._kite.set_access_token(access_token)
             self._simulation_mode = False
+            print(f"[KITE] Setup OK — api_key={self._api_key[:8]}..., token={access_token[:10]}...", file=sys.stderr, flush=True)
         except Exception as exc:
-            logger.warning("Failed to setup Kite: %s", exc)
+            print(f"[KITE] Setup FAILED: {exc}", file=sys.stderr, flush=True)
             self._simulation_mode = True
 
     # ------------------------------------------------------------------

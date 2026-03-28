@@ -893,6 +893,40 @@ def create_app():
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+    @app.route("/api/kite/debug", methods=["GET"])
+    @require_auth
+    def api_kite_debug():
+        """Debug endpoint — shows detailed Kite connection info."""
+        user_id = g.current_user["id"]
+        kite = get_kite_for_user(user_id)
+        token_data = get_user_kite_token(user_id)
+        from models import get_user_kite_credentials
+        creds = get_user_kite_credentials(user_id)
+
+        # Try a simple API call to verify token works
+        api_test = "not_tested"
+        instruments_count = 0
+        if kite and kite.is_authenticated():
+            try:
+                instruments = kite.get_instruments("NFO")
+                instruments_count = len(instruments) if instruments else 0
+                api_test = f"success ({instruments_count} NFO instruments)"
+            except Exception as e:
+                api_test = f"failed: {type(e).__name__}: {str(e)[:100]}"
+
+        return jsonify({
+            "has_credentials": bool(creds),
+            "has_token": bool(token_data and token_data.get("kite_access_token")),
+            "token_date": token_data.get("kite_token_date") if token_data else None,
+            "kite_user_id": token_data.get("kite_user_id") if token_data else None,
+            "is_authenticated": kite.is_authenticated() if kite else False,
+            "is_simulation": kite.is_simulation if kite else True,
+            "api_key_prefix": creds["kite_api_key"][:8] + "..." if creds else None,
+            "api_test": api_test,
+            "instruments_count": instruments_count,
+            "today": date.today().isoformat(),
+        })
+
     @app.route("/api/kite/status", methods=["GET"])
     @require_auth
     def api_kite_status():
