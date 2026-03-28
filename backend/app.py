@@ -967,19 +967,31 @@ def create_app():
             f"Found {len(recs)} strategy opportunities and {len(arbs)} arbitrage opportunities.",
             "INFO", "/scanner")
 
+        # Split covered calls into separate section
+        covered_calls = [r for r in recs if r.get("source") == "covered_call_from_holdings"]
+        regular_recs = [r for r in recs if r.get("source") != "covered_call_from_holdings"]
+
         total_margin = sum(r.get("margin_needed", 0) for r in recs)
         total_net_premium = sum(r.get("net_premium", r.get("premium_income", 0)) for r in recs if r.get("net_premium", r.get("premium_income", 0)) > 0)
 
         # VIX from first rec (all have same vix_at_scan)
         vix_data = recs[0].get("vix_signal", {}) if recs else {}
 
+        # Portfolio risk summary
+        import portfolio_risk as pr
+        margin_data = pr.get_available_margin(kite)
+        port_delta = pr.get_portfolio_delta(kite)
+        risk_summary = pr.get_portfolio_risk_summary(recs, margin_data.get("available", 0), port_delta)
+
         return jsonify({
-            "recommendations": recs,
+            "recommendations": regular_recs,
+            "covered_calls": covered_calls,
             "arbitrage": arbs,
             "scanned_at": _get_user_state(user_id)["last_scan"],
             "total_margin_required": round(total_margin, 2),
             "total_weekly_income": round(total_net_premium, 2),
             "vix": vix_data,
+            "portfolio_risk": risk_summary,
         })
 
     @app.route("/api/recommendations", methods=["GET", "POST"])

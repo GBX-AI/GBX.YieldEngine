@@ -31,6 +31,8 @@ from charges_engine import charges_engine
 import live_price_service
 import market_data
 import vix_service
+import portfolio_risk
+from datetime import date
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -337,8 +339,57 @@ def _resolve_index_info(index_name: str, kite_service=None) -> dict:
     }
 
 
+def _calculate_exit_suggestion(rec: dict) -> dict:
+    """Calculate exit timing and target for an opportunity (Prompt 3)."""
+    dte = rec.get("dte", 7)
+    net_premium = rec.get("net_premium", rec.get("premium_income", 0))
+    lot_size = rec.get("lot_size", 1)
+    lots = rec.get("lots", 1)
+    qty = lot_size * lots
+    theta_per_day = rec.get("theta_per_day", 0)
+
+    # Theta in rupees (positive = earning per day for sellers)
+    theta_rupees = round(abs(theta_per_day) * qty, 2) if theta_per_day else 0
+
+    # Exit rules
+    target_exit_pct = 50  # Standard: exit at 50% profit
+    target_exit_premium = round(net_premium * 0.5, 2) if net_premium > 0 else 0
+
+    if dte <= 7:
+        # Weekly: exit at 50% or Thursday EOD
+        target_exit_day = max(1, dte - 1)
+        reason = "Weekly option: target 50% profit or exit Thursday EOD"
+        gamma_warning_dte = 1
+    elif dte <= 14:
+        target_exit_day = max(1, dte - 3)
+        reason = "Short-term: target 50% profit or exit 3 DTE"
+        gamma_warning_dte = 2
+    else:
+        # Monthly: exit at 50% or 5 DTE
+        target_exit_day = max(1, dte - 5)
+        reason = "Monthly option: target 50% profit or exit by 5 DTE"
+        gamma_warning_dte = 3
+
+    today = date.today()
+    target_date = today + timedelta(days=target_exit_day)
+
+    return {
+        "theta_per_day_rupees": theta_rupees,
+        "exit_suggestion": {
+            "target_exit_day": target_exit_day,
+            "target_exit_date": target_date.isoformat(),
+            "target_exit_pct": target_exit_pct,
+            "target_exit_premium": target_exit_premium,
+            "reason": reason,
+            "gamma_warning_dte": gamma_warning_dte,
+            "gamma_warning": dte <= gamma_warning_dte,
+            "notes": f"Exit when premium decays to ₹{target_exit_premium:.0f} or by {target_date.strftime('%a %d %b')}"
+        }
+    }
+
+
 def _enrich_recommendation(rec: dict) -> dict:
-    """Enrich a recommendation with charges, risk profile, and frontend aliases."""
+    """Enrich a recommendation with charges, risk profile, exit timing, and frontend aliases."""
 
     # ── 1. Compute charges (Prompt 1) ──
     legs = rec.get("legs", [])
@@ -416,7 +467,12 @@ def _enrich_recommendation(rec: dict) -> dict:
     rec["risk_reward_ratio"] = round(max_profit / max_loss, 4) if max_loss > 0 else 0
     rec["loss_as_pct_of_margin"] = round((max_loss / rec.get("margin_needed", 1)) * 100, 1) if rec.get("margin_needed") else 0
 
-    # ── 3. Frontend aliases ──
+    # ── 3. Exit suggestion (Prompt 3) ──
+    exit_data = _calculate_exit_suggestion(rec)
+    rec["theta_per_day_rupees"] = exit_data["theta_per_day_rupees"]
+    rec["exit_suggestion"] = exit_data["exit_suggestion"]
+
+    # ── 4. Frontend aliases ──
     rec["premium"] = rec.get("net_premium", rec.get("premium_income", 0))
     rec["premium_income"] = rec.get("net_premium", rec.get("premium_income", 0))
     rec["safety"] = rec.get("safety_tag", "MODERATE")
@@ -576,8 +632,13 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int, kite_service=N
             "fee_estimate": fees,
             "dte": dte,
             "lots": lots,
+            "lot_size": lot_size,
             "spot": spot,
+            "avg_cost": round(avg_cost, 2),
             "holding_qty": qty,
+            "lots_possible": lots,
+            "unrealized_pnl": round((spot - avg_cost) * qty, 2),
+            "source": "covered_call_from_holdings",
         }))
 
     return recs
@@ -1314,6 +1375,13 @@ def scan_strategies(
         rec["vix_at_scan"] = vix_value
         rec["vix_adjusted"] = bool(vix_value)
         rec["vix_signal"] = vix_signal
+
+    # Capital utilization + portfolio delta (Prompt 6)
+    margin_data = portfolio_risk.get_available_margin(kite_service)
+    port_delta = portfolio_risk.get_portfolio_delta(kite_service)
+    if margin_data["available"] > 0:
+        all_recs = portfolio_risk.enrich_with_capital_utilization(all_recs, margin_data["available"])
+    all_recs = portfolio_risk.enrich_with_delta_impact(all_recs, port_delta)
 
     # Summary: total margin required across all recommendations
     total_margin_required = sum(r.get("margin_needed", 0) for r in all_recs)
