@@ -1183,6 +1183,16 @@ def create_app():
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+    @app.route("/api/positions/alerts", methods=["GET"])
+    @require_auth
+    def api_position_alerts():
+        """Get exit alerts for all open options positions."""
+        user_id = g.current_user["id"]
+        kite = get_kite_for_user(user_id)
+        import exit_monitor
+        alerts = exit_monitor.check_positions(kite)
+        return jsonify({"alerts": alerts, "count": len(alerts)})
+
     @app.route("/api/positions/<pid>/adjustments", methods=["GET"])
     @require_auth
     def api_position_adjustments(pid):

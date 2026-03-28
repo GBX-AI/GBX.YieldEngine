@@ -5,7 +5,7 @@ import {
 } from '../api';
 import {
   Search, ChevronDown, ChevronUp, Lock, Unlock,
-  Shield, TrendingUp, AlertTriangle,
+  Shield, TrendingUp, AlertTriangle, Activity,
 } from 'lucide-react';
 
 /* ─── Design tokens ─── */
@@ -20,6 +20,7 @@ const C = {
   amber: '#fcd34d',
   blue: '#38bdf8',
   purple: '#a78bfa',
+  orange: '#fb923c',
 };
 
 const font = { mono: "'IBM Plex Mono', monospace", sans: "'DM Sans', sans-serif" };
@@ -68,6 +69,21 @@ const TYPE_COLORS = {
   ARBITRAGE: C.emerald,
 };
 
+const VIX_COLORS = {
+  LOW: C.emerald,
+  NORMAL: C.amber,
+  HIGH: C.orange,
+  EXTREME: C.red,
+};
+
+const DELTA_BIAS_LABELS = {
+  LONG_HEAVY: { label: 'Long Heavy', color: C.blue },
+  SLIGHTLY_LONG: { label: 'Slightly Long', color: C.emerald },
+  NEUTRAL: { label: 'Neutral', color: C.muted },
+  SLIGHTLY_SHORT: { label: 'Slightly Short', color: C.amber },
+  SHORT_HEAVY: { label: 'Short Heavy', color: C.red },
+};
+
 const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-IN', { maximumFractionDigits: 2 }));
 const fmtCur = (n) => (n == null ? '—' : '₹' + fmt(n));
 const fmtPct = (n) => {
@@ -77,10 +93,339 @@ const fmtPct = (n) => {
   return v <= 1 && v >= -1 ? `${(v * 100).toFixed(1)}%` : `${v.toFixed(1)}%`;
 };
 
+/* ─── Badge component ─── */
+const Badge = ({ children, color, style = {} }) => (
+  <span style={{
+    padding: '4px 10px', borderRadius: 999, fontSize: 11, fontWeight: 700,
+    background: `${color}20`, color, letterSpacing: 0.3, whiteSpace: 'nowrap',
+    ...style,
+  }}>
+    {children}
+  </span>
+);
+
+/* ─── Metric cell ─── */
+const Metric = ({ label, value, color = C.text }) => (
+  <div>
+    <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
+    <div style={{ fontFamily: font.mono, fontSize: 14, fontWeight: 600, color }}>{value}</div>
+  </div>
+);
+
+/* ─── Recommendation Card ─── */
+function RecCard({ rec, idx, expanded, onToggle }) {
+  const id = rec.id || `${rec.symbol}-${rec.strike}-${idx}`;
+  const safetyColor = SAFETY_COLORS[rec.safety || rec.safety_tag] || C.muted;
+  const typeColor = TYPE_COLORS[rec.strategy || rec.strategy_type] || C.muted;
+  const isCoveredCall = (rec.strategy || rec.strategy_type) === 'COVERED_CALL';
+  const exitSug = rec.exit_suggestion;
+  const charges = rec.charges_breakdown;
+
+  const deltaImpactColor = rec.delta_impact != null
+    ? (Math.abs(rec.delta_impact) > 2 ? C.red : Math.abs(rec.delta_impact) > 1 ? C.amber : C.emerald)
+    : C.muted;
+
+  return (
+    <div style={{ ...cardStyle, padding: 0, overflow: 'hidden' }}>
+      {/* ── Card Header (clickable) ── */}
+      <div
+        onClick={() => onToggle(id)}
+        style={{
+          padding: '20px 24px',
+          cursor: 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          flexWrap: 'wrap',
+          transition: 'background 0.15s',
+        }}
+        onMouseEnter={(e) => (e.currentTarget.style.background = 'rgba(148,163,184,0.04)')}
+        onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+      >
+        {/* Rank */}
+        <span style={{
+          width: 32, height: 32, borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: `${C.purple}20`, color: C.purple, fontFamily: font.mono, fontSize: 14, fontWeight: 700, flexShrink: 0,
+        }}>
+          {rec.rank || idx + 1}
+        </span>
+
+        {/* Symbol */}
+        <span style={{ fontWeight: 700, fontSize: 16, minWidth: 80 }}>{rec.symbol}</span>
+
+        {/* Strategy badge */}
+        <Badge color={typeColor}>
+          {(rec.strategy || rec.strategy_type || '').replace(/_/g, ' ')}
+        </Badge>
+
+        {/* Safety badge */}
+        <Badge color={safetyColor}>
+          {(rec.safety || rec.safety_tag || '').replace(/_/g, ' ')}
+        </Badge>
+
+        {/* Spacer */}
+        <span style={{ flex: 1 }} />
+
+        {/* Net Premium */}
+        <span style={{ fontFamily: font.mono, fontWeight: 700, fontSize: 18, color: C.emerald }}>
+          NET {fmtCur(rec.net_premium)}
+        </span>
+
+        {expanded ? <ChevronUp size={18} style={{ color: C.muted }} /> : <ChevronDown size={18} style={{ color: C.muted }} />}
+      </div>
+
+      {/* ── Metrics Row 1 ── */}
+      <div style={{
+        padding: '0 24px 14px',
+        display: 'grid',
+        gridTemplateColumns: 'repeat(5, 1fr)',
+        gap: 12,
+      }}>
+        <Metric label="Net Premium" value={fmtCur(rec.net_premium)} color={C.emerald} />
+        <Metric label="Max Loss" value={fmtCur(rec.max_loss)} color={C.red} />
+        <Metric label="Prob OTM" value={fmtPct(rec.prob_otm)} color={C.emerald} />
+        <Metric label="True Ann. Return" value={fmtPct(rec.annualized_return)} color={C.amber} />
+        <Metric label="Expiry" value={rec.expiry_display ? `${rec.expiry_display} (${rec.dte}d)` : rec.dte ? `${rec.dte}d` : '—'} color={C.muted} />
+      </div>
+
+      {/* ── Metrics Row 2 ── */}
+      <div style={{
+        padding: '0 24px 16px',
+        display: 'grid',
+        gridTemplateColumns: 'repeat(4, 1fr)',
+        gap: 12,
+      }}>
+        <Metric label="Theta/Day" value={rec.theta_per_day_rupees != null ? fmtCur(rec.theta_per_day_rupees) : '—'} color={C.blue} />
+        <Metric
+          label="Margin (% of Free)"
+          value={rec.margin_pct_of_available != null ? fmtPct(rec.margin_pct_of_available) : '—'}
+          color={rec.capital_warning ? C.red : C.text}
+        />
+        <div>
+          <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Delta Impact</div>
+          <Badge color={deltaImpactColor} style={{ fontSize: 13 }}>
+            {rec.delta_impact != null ? (rec.delta_impact > 0 ? '+' : '') + rec.delta_impact.toFixed(2) : '—'}
+          </Badge>
+        </div>
+        <Metric label="R:R Ratio" value={rec.risk_reward_ratio != null ? `1:${rec.risk_reward_ratio.toFixed(1)}` : '—'} color={C.text} />
+      </div>
+
+      {/* ── Trade Legs (always visible) ── */}
+      {rec.legs && rec.legs.length > 0 && (
+        <div style={{ padding: '0 24px 16px' }}>
+          <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>Trade Legs</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {rec.legs.map((leg, li) => {
+              const action = (leg.action || leg.side || '').toUpperCase();
+              const isSell = action === 'SELL';
+              const instrument = leg.instrument || `${rec.symbol} ${leg.strike} ${leg.option_type || ''}`;
+              const expiryPart = leg.expiry_display ? ` ${leg.expiry_display}` : '';
+              const lotsLabel = rec.lots ? ` (${rec.lots} lot${rec.lots > 1 ? 's' : ''})` : '';
+              return (
+                <div key={li} style={{
+                  display: 'flex', gap: 12, alignItems: 'center',
+                  padding: '10px 16px', borderRadius: 10,
+                  background: isSell ? 'rgba(248,113,113,0.06)' : 'rgba(110,231,183,0.06)',
+                  border: `1px solid ${isSell ? 'rgba(248,113,113,0.15)' : 'rgba(110,231,183,0.15)'}`,
+                }}>
+                  <span style={{
+                    padding: '3px 10px', borderRadius: 6, fontSize: 11, fontWeight: 700,
+                    background: isSell ? `${C.red}20` : `${C.emerald}20`,
+                    color: isSell ? C.red : C.emerald,
+                    minWidth: 36, textAlign: 'center',
+                  }}>
+                    {action}
+                  </span>
+                  <span style={{ fontWeight: 600, fontSize: 14 }}>
+                    {instrument}{expiryPart}
+                  </span>
+                  <span style={{ fontFamily: font.mono, fontSize: 13, color: C.muted }}>
+                    Qty: {leg.quantity}{lotsLabel}
+                  </span>
+                  <span style={{ fontFamily: font.mono, fontSize: 14, fontWeight: 600, color: isSell ? C.emerald : C.red, marginLeft: 'auto' }}>
+                    {fmtCur(leg.premium)}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── Exit Guidance (always visible) ── */}
+      {exitSug && (
+        <div style={{ padding: '0 24px 16px' }}>
+          <div style={{
+            padding: '10px 16px', borderRadius: 10,
+            background: 'rgba(56,189,248,0.06)',
+            border: `1px solid rgba(56,189,248,0.15)`,
+            fontSize: 13, color: C.blue, lineHeight: 1.6,
+          }}>
+            Target: Exit by <strong>{exitSug.target_exit_date || '—'}</strong> or when premium reaches <strong>{fmtCur(exitSug.target_exit_premium)}</strong>
+            {exitSug.notes ? ` (${exitSug.notes})` : ''}
+          </div>
+          {exitSug.gamma_warning && (
+            <div style={{
+              marginTop: 6, padding: '8px 16px', borderRadius: 10,
+              background: 'rgba(248,113,113,0.1)',
+              border: `1px solid rgba(248,113,113,0.25)`,
+              fontSize: 13, fontWeight: 600, color: C.red,
+            }}>
+              ⚠ Expiry risk — exit today
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Holding Context (for covered calls, always visible) ── */}
+      {isCoveredCall && rec.holding_qty != null && (
+        <div style={{ padding: '0 24px 16px' }}>
+          <div style={{
+            padding: '10px 16px', borderRadius: 10,
+            background: `${C.purple}08`,
+            border: `1px solid ${C.purple}20`,
+            fontSize: 13, color: C.purple, lineHeight: 1.6,
+            fontFamily: font.mono,
+          }}>
+            You hold {fmt(rec.holding_qty)} shares @ {fmtCur(rec.avg_cost)}
+            {rec.unrealized_pnl != null && (
+              <> | Unrealized P&L: <span style={{ color: rec.unrealized_pnl >= 0 ? C.emerald : C.red }}>{fmtCur(rec.unrealized_pnl)}</span></>
+            )}
+            {rec.lots_possible != null && <> | {rec.lots_possible} lot{rec.lots_possible !== 1 ? 's' : ''} possible</>}
+          </div>
+        </div>
+      )}
+
+      {/* ── Expanded: Charges + Risk Detail ── */}
+      {expanded && (
+        <div style={{ borderTop: `1px solid ${C.border}`, padding: 24 }}>
+          {/* Charges breakdown */}
+          {(rec.gross_premium != null || charges) && (
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10 }}>Charges Breakdown</div>
+              <div style={{
+                display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap',
+                fontFamily: font.mono, fontSize: 13,
+              }}>
+                <span style={{ color: C.text }}>Gross {fmtCur(rec.gross_premium)}</span>
+                {charges && (
+                  <>
+                    <span style={{ color: C.muted }}>→</span>
+                    <span style={{ color: C.muted }}>Brokerage {fmtCur(charges.brokerage)}</span>
+                    <span style={{ color: C.muted }}>→</span>
+                    <span style={{ color: C.muted }}>STT {fmtCur(charges.stt)}</span>
+                    <span style={{ color: C.muted }}>→</span>
+                    <span style={{ color: C.muted }}>Exchange {fmtCur(charges.exchange_charges)}</span>
+                    <span style={{ color: C.muted }}>→</span>
+                    <span style={{ color: C.muted }}>GST {fmtCur(charges.gst)}</span>
+                  </>
+                )}
+                <span style={{ color: C.muted }}>→</span>
+                <span style={{ color: C.emerald, fontWeight: 700 }}>Net {fmtCur(rec.net_premium)}</span>
+              </div>
+            </div>
+          )}
+
+          {/* Risk detail */}
+          <div style={{ display: 'flex', gap: 24, fontSize: 13, flexWrap: 'wrap', marginBottom: 20 }}>
+            <span style={{ color: C.muted }}>
+              Max profit: <span style={{ fontFamily: font.mono, color: C.emerald, fontWeight: 600 }}>{fmtCur(rec.max_profit)}</span>
+            </span>
+            <span style={{ color: C.muted }}>
+              Max loss: <span style={{ fontFamily: font.mono, color: C.red, fontWeight: 600 }}>{fmtCur(rec.max_loss)}</span>
+              {rec.max_loss_point != null && <> at {fmtCur(rec.max_loss_point)}</>}
+            </span>
+            <span style={{ color: C.muted }}>
+              Risk:Reward <span style={{ fontFamily: font.mono, color: C.text, fontWeight: 600 }}>
+                {rec.risk_reward_ratio != null ? `1:${rec.risk_reward_ratio.toFixed(1)}` : '—'}
+              </span>
+            </span>
+            {rec.loss_as_pct_of_margin != null && (
+              <span style={{ color: C.muted }}>
+                Loss as % of margin: <span style={{ fontFamily: font.mono, color: C.red, fontWeight: 600 }}>{fmtPct(rec.loss_as_pct_of_margin)}</span>
+              </span>
+            )}
+          </div>
+
+          {/* VIX context */}
+          {rec.vix_at_scan != null && (
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 16 }}>
+              VIX at scan: <span style={{ fontFamily: font.mono, color: C.text }}>{rec.vix_at_scan}</span>
+              {rec.vix_signal && <> ({rec.vix_signal})</>}
+            </div>
+          )}
+
+          {/* Strike Rationale */}
+          {(rec.strike_rationale || rec.rationale) && (
+            <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, fontStyle: 'italic', marginBottom: 20 }}>
+              {rec.strike_rationale || rec.rationale}
+            </div>
+          )}
+
+          {/* Risk Ladder (alternatives) */}
+          {rec.alternatives && Object.keys(rec.alternatives).length > 0 && (
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 12, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>Alternative Strikes</div>
+              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                {Object.entries(rec.alternatives).map(([profile, alt]) => {
+                  const profileMeta = RISK_PROFILES.find((r) => r.key === profile);
+                  const color = profileMeta?.color || C.muted;
+                  return (
+                    <div
+                      key={profile}
+                      style={{
+                        background: 'rgba(148,163,184,0.05)',
+                        border: `1px solid ${C.border}`,
+                        borderRadius: 12,
+                        padding: '12px 16px',
+                        minWidth: 160,
+                      }}
+                    >
+                      <div style={{ fontSize: 12, fontWeight: 700, color, marginBottom: 6, textTransform: 'capitalize' }}>
+                        {profile}
+                      </div>
+                      <div style={{ fontFamily: font.mono, fontSize: 14, fontWeight: 600, marginBottom: 4 }}>
+                        Strike {fmtCur(alt.strike)}
+                      </div>
+                      <div style={{ display: 'flex', gap: 16, fontSize: 12, color: C.muted }}>
+                        <span>Prem: <span style={{ color: C.emerald, fontFamily: font.mono }}>{fmtCur(alt.premium)}</span></span>
+                        <span>Prob: <span style={{ color: C.text, fontFamily: font.mono }}>{fmtPct(alt.prob_otm / 100)}</span></span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Execute button */}
+          <button
+            disabled={!false}
+            style={{
+              ...btnBase,
+              padding: '12px 28px',
+              fontSize: 15,
+              background: 'rgba(148,163,184,0.15)',
+              color: C.muted,
+              cursor: 'not-allowed',
+            }}
+          >
+            <Lock size={16} /> Read-Only Mode
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════ */
 export default function Scanner() {
   /* ─── State ─── */
   const [allRecommendations, setAllRecommendations] = useState([]);
+  const [coveredCalls, setCoveredCalls] = useState([]);
   const [arbitrage, setArbitrage] = useState([]);
+  const [vix, setVix] = useState(null);
+  const [portfolioRisk, setPortfolioRisk] = useState(null);
   const [riskProfile, setRiskProfileState] = useState('MODERATE');
   const [permission, setPermission] = useState('READONLY');
   const [scanning, setScanning] = useState(false);
@@ -92,17 +437,13 @@ export default function Scanner() {
   const [strategyFilter, setStrategyFilter] = useState('ALL');
 
   // Summary
-  const [summary, setSummary] = useState({ weeklyIncome: null, arbCount: 0, totalMargin: null });
+  const [totalWeeklyIncome, setTotalWeeklyIncome] = useState(null);
+  const [totalMarginRequired, setTotalMarginRequired] = useState(null);
 
   /* ─── Init ─── */
   useEffect(() => {
     getRiskProfile().then((d) => setRiskProfileState(d?.profile || d?.risk_profile || 'MODERATE')).catch(() => {});
     getPermission().then((d) => setPermission(d?.mode || d?.permission || 'READONLY')).catch(() => {});
-    getArbitrage().then((d) => {
-      const arbs = d?.opportunities || d || [];
-      setArbitrage(arbs);
-      setSummary((s) => ({ ...s, arbCount: arbs.length }));
-    }).catch(() => {});
 
     // Auto-scan if holdings exist and no recommendations loaded yet
     getStatus().then((st) => {
@@ -118,17 +459,17 @@ export default function Scanner() {
     setError(null);
     try {
       const scanData = await scan();
-      // Use recommendations directly from scan response (more reliable than separate call)
       const recs = scanData?.recommendations || [];
+      const cc = scanData?.covered_calls || [];
       const arbs = scanData?.arbitrage || [];
+
       setAllRecommendations(recs);
+      setCoveredCalls(cc);
       setArbitrage(arbs);
-      const totalWeekly = recs.reduce((s, r) => s + (r.premium || r.premium_income || 0), 0);
-      setSummary({
-        weeklyIncome: scanData?.total_weekly_income || totalWeekly,
-        arbCount: arbs.length,
-        totalMargin: scanData?.total_margin_required || null,
-      });
+      setVix(scanData?.vix || null);
+      setPortfolioRisk(scanData?.portfolio_risk || null);
+      setTotalWeeklyIncome(scanData?.total_weekly_income ?? null);
+      setTotalMarginRequired(scanData?.total_margin_required ?? null);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -150,9 +491,26 @@ export default function Scanner() {
     return true;
   });
 
+  const filteredCoveredCalls = coveredCalls.filter((r) => {
+    if (safetyFilter !== 'ALL' && (r.safety || r.safety_tag) !== safetyFilter) return false;
+    return true;
+  });
+
   const toggleExpand = (id) => setExpandedId((prev) => (prev === id ? null : id));
 
-  const isExecute = permission === 'EXECUTE';
+  // VIX color
+  const vixColor = vix ? (VIX_COLORS[vix.signal] || C.amber) : C.muted;
+
+  // Delta bias
+  const deltaBias = portfolioRisk?.delta_bias
+    ? (DELTA_BIAS_LABELS[portfolioRisk.delta_bias] || { label: portfolioRisk.delta_bias, color: C.muted })
+    : null;
+
+  // Bottom summary
+  const availableMargin = portfolioRisk?.available_margin;
+  const marginPct = (availableMargin && totalMarginRequired)
+    ? ((totalMarginRequired / availableMargin) * 100).toFixed(1)
+    : null;
 
   /* ─── Render ─── */
   return (
@@ -170,43 +528,50 @@ export default function Scanner() {
           </div>
         )}
 
-        {/* Summary bar */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16, marginBottom: 28 }}>
+        {/* ═══ HEADER BAR — 4 summary cards ═══ */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 28 }}>
+          {/* Safe Weekly Income */}
           <div style={cardStyle}>
-            <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Safe Weekly Income Est.</div>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Safe Weekly Income (Net)</div>
             <div style={{ fontSize: 22, fontWeight: 700, fontFamily: font.mono, color: C.emerald }}>
-              {summary.weeklyIncome != null ? fmtCur(summary.weeklyIncome) : '—'}
+              {totalWeeklyIncome != null ? fmtCur(totalWeeklyIncome) : '—'}
             </div>
           </div>
+
+          {/* Margin Required */}
           <div style={cardStyle}>
             <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Margin Required</div>
             <div style={{ fontSize: 22, fontWeight: 700, fontFamily: font.mono, color: C.amber }}>
-              {summary.totalMargin != null ? fmtCur(summary.totalMargin) : '—'}
+              {totalMarginRequired != null ? fmtCur(totalMarginRequired) : '—'}
             </div>
           </div>
+
+          {/* India VIX */}
           <div style={cardStyle}>
-            <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Arbitrage Opportunities</div>
-            <div style={{ fontSize: 22, fontWeight: 700, fontFamily: font.mono, color: C.blue }}>{summary.arbCount}</div>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>India VIX</div>
+            <div style={{ fontSize: 22, fontWeight: 700, fontFamily: font.mono, color: vixColor }}>
+              {vix ? vix.label : '—'}
+            </div>
+            {vix?.recommendation && (
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 6, lineHeight: 1.4 }}>{vix.recommendation}</div>
+            )}
           </div>
+
+          {/* Portfolio Delta */}
           <div style={cardStyle}>
-            <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Risk Profile</div>
-            <span
-              style={{
-                display: 'inline-block',
-                padding: '6px 14px',
-                borderRadius: 999,
-                fontSize: 13,
-                fontWeight: 700,
-                background: `${RISK_PROFILES.find((r) => r.key === riskProfile)?.color || C.amber}20`,
-                color: RISK_PROFILES.find((r) => r.key === riskProfile)?.color || C.amber,
-              }}
-            >
-              {riskProfile}
-            </span>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Portfolio Delta</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <span style={{ fontSize: 22, fontWeight: 700, fontFamily: font.mono, color: C.text }}>
+                {portfolioRisk?.portfolio_delta != null ? portfolioRisk.portfolio_delta.toFixed(1) : '—'}
+              </span>
+              {deltaBias && (
+                <Badge color={deltaBias.color}>{deltaBias.label}</Badge>
+              )}
+            </div>
           </div>
         </div>
 
-        {/* Filters + Controls */}
+        {/* ═══ FILTERS + CONTROLS ═══ */}
         <div style={{ ...cardStyle, marginBottom: 28 }}>
           {/* Safety tags */}
           <div style={{ marginBottom: 16 }}>
@@ -310,240 +675,89 @@ export default function Scanner() {
           </div>
         )}
 
-        {/* Recommendation cards */}
+        {/* ═══ RECOMMENDATION CARDS ═══ */}
         {!scanning && recommendations.length > 0 && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {recommendations.map((rec, idx) => {
-              const id = rec.id || `${rec.symbol}-${rec.strike}-${idx}`;
-              const expanded = expandedId === id;
-              const safetyColor = SAFETY_COLORS[rec.safety] || C.muted;
-              const typeColor = TYPE_COLORS[rec.strategy] || C.muted;
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginBottom: 32 }}>
+            {recommendations.map((rec, idx) => (
+              <RecCard
+                key={rec.id || `${rec.symbol}-${rec.strike}-${idx}`}
+                rec={rec}
+                idx={idx}
+                expanded={expandedId === (rec.id || `${rec.symbol}-${rec.strike}-${idx}`)}
+                onToggle={toggleExpand}
+              />
+            ))}
+          </div>
+        )}
 
-              return (
-                <div key={id} style={{ ...cardStyle, padding: 0, overflow: 'hidden' }}>
-                  {/* Header row — always visible */}
-                  <div
-                    onClick={() => toggleExpand(id)}
-                    style={{
-                      padding: '20px 24px',
-                      cursor: 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 16,
-                      flexWrap: 'wrap',
-                      transition: 'background 0.15s',
-                    }}
-                    onMouseEnter={(e) => (e.currentTarget.style.background = 'rgba(148,163,184,0.04)')}
-                    onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-                  >
-                    {/* Rank */}
-                    <span
-                      style={{
-                        width: 32, height: 32, borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        background: `${C.purple}20`, color: C.purple, fontFamily: font.mono, fontSize: 14, fontWeight: 700, flexShrink: 0,
-                      }}
-                    >
-                      {rec.rank || idx + 1}
-                    </span>
-
-                    {/* Symbol */}
-                    <span style={{ fontWeight: 700, fontSize: 16, minWidth: 100 }}>{rec.symbol}</span>
-
-                    {/* Strike */}
-                    <span style={{ fontFamily: font.mono, fontSize: 14, color: C.muted }}>
-                      {rec.strike ? `₹${fmt(rec.strike)}` : ''}
-                    </span>
-
-                    {/* Holding qty for covered calls */}
-                    {rec.holding_qty && (
-                      <span style={{ fontSize: 11, color: C.muted, fontFamily: font.mono, background: 'rgba(148,163,184,0.08)', padding: '2px 8px', borderRadius: 4 }}>
-                        Holdings: {rec.holding_qty} shares
-                      </span>
-                    )}
-
-                    {/* Type tag */}
-                    <span style={{
-                      padding: '4px 10px', borderRadius: 999, fontSize: 11, fontWeight: 700,
-                      background: `${typeColor}20`, color: typeColor, letterSpacing: 0.3,
-                    }}>
-                      {(rec.strategy || rec.type || '').replace(/_/g, ' ')}
-                    </span>
-
-                    {/* Safety tag */}
-                    <span style={{
-                      padding: '4px 10px', borderRadius: 999, fontSize: 11, fontWeight: 700,
-                      background: `${safetyColor}20`, color: safetyColor,
-                    }}>
-                      {(rec.safety || '').replace('_', ' ')}
-                    </span>
-
-                    {/* Premium */}
-                    <span style={{ fontFamily: font.mono, fontWeight: 700, fontSize: 16, color: C.emerald, marginLeft: 'auto' }}>
-                      {fmtCur(rec.premium)}
-                    </span>
-
-                    {expanded ? <ChevronUp size={18} style={{ color: C.muted }} /> : <ChevronDown size={18} style={{ color: C.muted }} />}
-                  </div>
-
-                  {/* Metrics row */}
-                  <div style={{
-                    padding: '0 24px 16px',
-                    display: 'grid',
-                    gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
-                    gap: 12,
-                  }}>
-                    {[
-                      { label: 'Prob OTM', value: fmtPct(rec.prob_otm), color: C.emerald },
-                      { label: 'Delta', value: rec.delta != null ? rec.delta.toFixed(3) : '—', color: C.text },
-                      { label: 'Margin', value: fmtCur(rec.margin || rec.margin_needed), color: C.text },
-                      { label: 'Ann. Return', value: fmtPct(rec.annualized_return), color: C.amber },
-                      { label: 'Theta/day', value: (rec.theta_per_day || rec.theta) != null ? `₹${fmt(rec.theta_per_day || rec.theta)}` : '—', color: C.blue },
-                      { label: 'Expiry', value: rec.expiry_display ? `${rec.expiry_display} (${rec.dte}d)` : rec.dte ? `${rec.dte}d` : '—', color: C.muted },
-                    ].map((m) => (
-                      <div key={m.label}>
-                        <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>{m.label}</div>
-                        <div style={{ fontFamily: font.mono, fontSize: 14, fontWeight: 600, color: m.color }}>{m.value}</div>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Trade Legs — always visible */}
-                  {rec.legs && rec.legs.length > 0 && (
-                    <div style={{ padding: '0 24px 16px' }}>
-                      <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>What to do</div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                        {rec.legs.map((leg, li) => {
-                          const action = leg.action || leg.side || '';
-                          const isSell = action.toUpperCase() === 'SELL';
-                          return (
-                            <div key={li} style={{
-                              display: 'flex', gap: 12, alignItems: 'center',
-                              padding: '10px 16px', borderRadius: 10,
-                              background: isSell ? 'rgba(248,113,113,0.06)' : 'rgba(110,231,183,0.06)',
-                              border: `1px solid ${isSell ? 'rgba(248,113,113,0.15)' : 'rgba(110,231,183,0.15)'}`,
-                            }}>
-                              <span style={{
-                                padding: '3px 10px', borderRadius: 6, fontSize: 11, fontWeight: 700,
-                                background: isSell ? `${C.red}20` : `${C.emerald}20`,
-                                color: isSell ? C.red : C.emerald,
-                                minWidth: 36, textAlign: 'center',
-                              }}>
-                                {action}
-                              </span>
-                              <span style={{ fontWeight: 600, fontSize: 14 }}>
-                                {leg.instrument || `${rec.symbol} ${leg.strike} ${leg.option_type}`}
-                              </span>
-                              <span style={{ fontFamily: font.mono, fontSize: 13, color: C.muted }}>
-                                Qty: {leg.quantity}{rec.lots ? ` (${rec.lots} lot${rec.lots > 1 ? 's' : ''})` : ''}
-                              </span>
-                              <span style={{ fontFamily: font.mono, fontSize: 14, fontWeight: 600, color: isSell ? C.emerald : C.red, marginLeft: 'auto' }}>
-                                ₹{fmt(leg.premium || leg.price || 0)}
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Strike Rationale */}
-                  {(rec.strike_rationale || rec.rationale) && (
-                    <div style={{ padding: '0 24px 16px' }}>
-                      <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, fontStyle: 'italic' }}>
-                        {rec.strike_rationale || rec.rationale}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Risk Ladder (alternatives) */}
-                  {rec.alternatives && Object.keys(rec.alternatives).length > 0 && (
-                    <div style={{ padding: '0 24px 16px' }}>
-                      <div style={{ fontSize: 12, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>Alternative Strikes</div>
-                      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                        {Object.entries(rec.alternatives).map(([profile, alt]) => {
-                          const profileMeta = RISK_PROFILES.find((r) => r.key === profile);
-                          const color = profileMeta?.color || C.muted;
-                          return (
-                            <div
-                              key={profile}
-                              style={{
-                                background: 'rgba(148,163,184,0.05)',
-                                border: `1px solid ${C.border}`,
-                                borderRadius: 12,
-                                padding: '12px 16px',
-                                minWidth: 160,
-                              }}
-                            >
-                              <div style={{ fontSize: 12, fontWeight: 700, color, marginBottom: 6, textTransform: 'capitalize' }}>
-                                {profile}
-                              </div>
-                              <div style={{ fontFamily: font.mono, fontSize: 14, fontWeight: 600, marginBottom: 4 }}>
-                                Strike ₹{fmt(alt.strike)}
-                              </div>
-                              <div style={{ display: 'flex', gap: 16, fontSize: 12, color: C.muted }}>
-                                <span>Prem: <span style={{ color: C.emerald, fontFamily: font.mono }}>₹{fmt(alt.premium)}</span></span>
-                                <span>Prob: <span style={{ color: C.text, fontFamily: font.mono }}>{fmtPct(alt.prob_otm / 100)}</span></span>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Expanded section */}
-                  {expanded && (
-                    <div style={{ borderTop: `1px solid ${C.border}`, padding: 24 }}>
-                      {/* Fee estimate & max loss */}
-                      {(rec.fee_estimate || rec.max_loss) && (
-                        <div style={{ marginBottom: 20 }}>
-                          <div style={{ display: 'flex', gap: 24, fontSize: 13 }}>
-                            {rec.fee_estimate != null && (
-                              <span style={{ color: C.muted }}>Est. Fees: <span style={{ fontFamily: font.mono, color: C.text }}>₹{fmt(rec.fee_estimate)}</span></span>
-                            )}
-                            {rec.max_loss != null && (
-                              <span style={{ color: C.muted }}>Max Loss: <span style={{ fontFamily: font.mono, color: C.red }}>₹{fmt(rec.max_loss)}</span></span>
-                            )}
-                            {rec.spot != null && (
-                              <span style={{ color: C.muted }}>Spot: <span style={{ fontFamily: font.mono, color: C.text }}>₹{fmt(rec.spot)}</span></span>
-                            )}
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Legs moved above — always visible now */}
-
-                      {/* Execute button */}
-                      <button
-                        disabled={!isExecute}
-                        style={{
-                          ...btnBase,
-                          padding: '12px 28px',
-                          fontSize: 15,
-                          background: isExecute ? C.emerald : 'rgba(148,163,184,0.15)',
-                          color: isExecute ? '#0a0f1a' : C.muted,
-                          cursor: isExecute ? 'pointer' : 'not-allowed',
-                        }}
-                      >
-                        {isExecute ? <Unlock size={16} /> : <Lock size={16} />}
-                        {isExecute ? 'Execute Trade' : 'Read-Only Mode'}
-                      </button>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+        {/* ═══ COVERED CALLS SECTION ═══ */}
+        {!scanning && filteredCoveredCalls.length > 0 && (
+          <div style={{ marginBottom: 32 }}>
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16,
+              padding: '12px 0', borderBottom: `1px solid ${C.border}`,
+            }}>
+              <Activity size={20} style={{ color: C.purple }} />
+              <h2 style={{ fontSize: 20, fontWeight: 700, margin: 0, color: C.purple }}>
+                Covered Calls — From Your Holdings
+              </h2>
+              <Badge color={C.purple}>{filteredCoveredCalls.length}</Badge>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              {filteredCoveredCalls.map((rec, idx) => (
+                <RecCard
+                  key={rec.id || `cc-${rec.symbol}-${rec.strike}-${idx}`}
+                  rec={rec}
+                  idx={idx}
+                  expanded={expandedId === (rec.id || `cc-${rec.symbol}-${rec.strike}-${idx}`)}
+                  onToggle={toggleExpand}
+                />
+              ))}
+            </div>
           </div>
         )}
 
         {/* Empty state */}
-        {!scanning && recommendations.length === 0 && (
+        {!scanning && recommendations.length === 0 && filteredCoveredCalls.length === 0 && (
           <div style={{ ...cardStyle, textAlign: 'center', padding: 64 }}>
             <Search size={40} style={{ color: C.muted, marginBottom: 16 }} />
             <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>No recommendations yet</div>
             <div style={{ fontSize: 14, color: C.muted }}>
               Import your holdings, set your risk profile, then hit "Scan Now" to find opportunities.
             </div>
+          </div>
+        )}
+
+        {/* ═══ BOTTOM SUMMARY BAR ═══ */}
+        {!scanning && (recommendations.length > 0 || filteredCoveredCalls.length > 0) && (
+          <div style={{
+            ...cardStyle,
+            marginTop: 8,
+            padding: '16px 24px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: 12,
+          }}>
+            <div style={{ fontSize: 14, fontFamily: font.mono }}>
+              <span style={{ color: C.muted }}>All trades combined: </span>
+              <span style={{ color: C.emerald, fontWeight: 700 }}>Net income {fmtCur(totalWeeklyIncome)}</span>
+              <span style={{ color: C.muted }}> | </span>
+              <span style={{ color: C.amber, fontWeight: 700 }}>Margin needed {fmtCur(totalMarginRequired)}</span>
+              {marginPct != null && (
+                <span style={{ color: C.muted }}> ({marginPct}% of free capital)</span>
+              )}
+            </div>
+            {portfolioRisk?.over_deployment_warning && (
+              <div style={{
+                padding: '6px 14px', borderRadius: 8,
+                background: `${C.red}15`, color: C.red,
+                fontSize: 13, fontWeight: 700,
+              }}>
+                ⚠ Over-deployment warning: margin usage exceeds safe threshold
+              </div>
+            )}
           </div>
         )}
       </div>
