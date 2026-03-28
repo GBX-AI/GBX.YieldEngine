@@ -149,15 +149,44 @@ def get_option_chain_live(kite_service, symbol, expiry_date, num_strikes=10):
     symbol_upper = symbol.upper()
     today = date.today()
 
-    # Filter instruments for this symbol + expiry + options only
-    chain_instruments = [
-        i for i in instruments
-        if i.get("name", "").upper() == symbol_upper
-        and i.get("instrument_type") in ("CE", "PE")
-        and i.get("expiry") == expiry_date
-    ]
+    # Normalize expiry_date to date object for comparison
+    if isinstance(expiry_date, str):
+        from datetime import datetime as dt
+        expiry_date = dt.strptime(expiry_date, "%Y-%m-%d").date()
 
+    # Filter instruments for this symbol + expiry + options only
+    # Kite returns expiry as datetime.date — normalize both sides
+    chain_instruments = []
+    for i in instruments:
+        if i.get("name", "").upper() != symbol_upper:
+            continue
+        if i.get("instrument_type") not in ("CE", "PE"):
+            continue
+        inst_expiry = i.get("expiry")
+        if isinstance(inst_expiry, str):
+            try:
+                inst_expiry = date.fromisoformat(inst_expiry)
+            except Exception:
+                continue
+        if inst_expiry == expiry_date:
+            chain_instruments.append(i)
+
+    # Debug: if no match, log what expiries exist
     if not chain_instruments:
+        # Find what expiries actually exist for this symbol
+        available = set()
+        for i in instruments:
+            if i.get("name", "").upper() == symbol_upper and i.get("instrument_type") in ("CE", "PE"):
+                exp = i.get("expiry")
+                if exp:
+                    available.add(str(exp))
+        _last_debug["chain_miss"] = {
+            "symbol": symbol_upper,
+            "requested_expiry": str(expiry_date),
+            "expiry_type": type(expiry_date).__name__,
+            "available_expiries": sorted(list(available))[:5],
+            "sample_inst_expiry_type": type(instruments[0].get("expiry")).__name__ if instruments else "N/A",
+        }
         return None
 
     lot_size = chain_instruments[0].get("lot_size", 1)

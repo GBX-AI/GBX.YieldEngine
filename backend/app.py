@@ -928,6 +928,7 @@ def create_app():
             "instruments_count": instruments_count,
             "today": date.today().isoformat(),
             "market_data_debug": md.get_debug_log(),
+            "chain_miss_debug": md._last_debug.get("chain_miss"),
         })
 
     @app.route("/api/kite/status", methods=["GET"])
