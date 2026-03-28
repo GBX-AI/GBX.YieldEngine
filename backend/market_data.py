@@ -11,8 +11,10 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# Symbols that have weekly expiry (every Thursday)
-WEEKLY_EXPIRY_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"}
+# Symbols that have weekly expiry (every Thursday) — as of Nov 2024
+# NSE discontinued weekly expiry for BANKNIFTY, FINNIFTY, MIDCPNIFTY
+# Only NIFTY retains weekly Thursday expiry on NSE
+WEEKLY_EXPIRY_SYMBOLS = {"NIFTY"}
 
 # All other F&O stocks have monthly expiry (last Thursday of month)
 

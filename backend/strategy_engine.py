@@ -480,6 +480,12 @@ def _enrich_recommendation(rec: dict) -> dict:
     rec["margin"] = rec.get("margin_needed", 0)
     rec["annualized_return"] = rec.get("true_annualized_return", rec.get("annualized_return", 0))
 
+    # Price source metadata
+    if "price_source" not in rec:
+        rec["price_source"] = "simulation"
+    if "fetched_at" not in rec:
+        rec["fetched_at"] = datetime.now().isoformat()
+
     return rec
 
 
@@ -639,6 +645,8 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int, kite_service=N
             "lots_possible": lots,
             "unrealized_pnl": round((spot - avg_cost) * qty, 2),
             "source": "covered_call_from_holdings",
+            "price_source": "kite" if use_real else "simulation",
+            "fetched_at": datetime.now().isoformat(),
         }))
 
     return recs
@@ -779,6 +787,8 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_
             "dte": dte,
             "lots": lots,
             "spot": spot,
+            "price_source": "kite" if use_real else "simulation",
+            "fetched_at": datetime.now().isoformat(),
         }))
 
     return recs
@@ -939,6 +949,8 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                             "lots": lots,
                             "spot": spot,
                             "spread_width": actual_width,
+                            "price_source": "kite" if use_real else "simulation",
+                            "fetched_at": datetime.now().isoformat(),
                         }))
                         break  # First valid width
                 if use_real:
@@ -1028,6 +1040,8 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                     "lots": lots,
                     "spot": spot,
                     "spread_width": actual_width,
+                    "price_source": "simulation",
+                    "fetched_at": datetime.now().isoformat(),
                 }))
 
                 # Only take the first valid width per index
@@ -1231,6 +1245,8 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
             "put_strike": put_strike,
             "net_cost_per_unit": round(net_cost, 2),
             "unrealized_gain_pct": round(gain_pct * 100, 1),
+            "price_source": "kite" if use_real else "simulation",
+            "fetched_at": datetime.now().isoformat(),
         }))
 
     return recs

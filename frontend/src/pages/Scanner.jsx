@@ -277,6 +277,20 @@ function RecCard({ rec, idx, expanded, onToggle }) {
         </div>
       )}
 
+      {/* ── Price Source (always visible) ── */}
+      <div style={{ padding: '0 24px 8px', display: 'flex', gap: 12, fontSize: 11, fontFamily: font.mono, color: C.muted }}>
+        <span>
+          Prices: <span style={{ color: rec.price_source === 'kite' ? C.emerald : C.amber }}>
+            {rec.price_source === 'kite' ? 'Kite (Live)' : 'Simulated (Black-Scholes)'}
+          </span>
+        </span>
+        {rec.fetched_at && (
+          <span>
+            Fetched: {new Date(rec.fetched_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
+          </span>
+        )}
+      </div>
+
       {/* ── Holding Context (for covered calls, always visible) ── */}
       {isCoveredCall && rec.holding_qty != null && (
         <div style={{ padding: '0 24px 16px' }}>
@@ -663,6 +677,21 @@ export default function Scanner() {
             >
               <Search size={16} /> {scanning ? 'Scanning...' : 'Scan Now'}
             </button>
+            {allRecommendations.length > 0 && (
+              <button
+                onClick={handleScan}
+                disabled={scanning}
+                style={{
+                  ...btnBase,
+                  padding: '10px 20px',
+                  fontSize: 13,
+                  background: 'rgba(148,163,184,0.1)',
+                  color: C.muted,
+                }}
+              >
+                Refresh Prices
+              </button>
+            )}
           </div>
         </div>
 
