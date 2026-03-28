@@ -204,10 +204,10 @@ function RecCard({ rec, idx, expanded, onToggle }) {
         <div>
           <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Delta Impact</div>
           <Badge color={deltaImpactColor} style={{ fontSize: 13 }}>
-            {rec.delta_impact != null ? (rec.delta_impact > 0 ? '+' : '') + rec.delta_impact.toFixed(2) : '—'}
+            {rec.delta_impact === 'REDUCES_DELTA' ? 'Reduces' : rec.delta_impact === 'ADDS_DELTA' ? 'Adds' : rec.delta_impact || '—'}
           </Badge>
         </div>
-        <Metric label="R:R Ratio" value={rec.risk_reward_ratio != null ? `1:${rec.risk_reward_ratio.toFixed(1)}` : '—'} color={C.text} />
+        <Metric label="R:R Ratio" value={rec.risk_reward_ratio != null ? `1:${Number(rec.risk_reward_ratio).toFixed(1)}` : '—'} color={C.text} />
       </div>
 
       {/* ── Trade Legs (always visible) ── */}
@@ -337,7 +337,7 @@ function RecCard({ rec, idx, expanded, onToggle }) {
             </span>
             <span style={{ color: C.muted }}>
               Risk:Reward <span style={{ fontFamily: font.mono, color: C.text, fontWeight: 600 }}>
-                {rec.risk_reward_ratio != null ? `1:${rec.risk_reward_ratio.toFixed(1)}` : '—'}
+                {rec.risk_reward_ratio != null ? `1:${Number(rec.risk_reward_ratio).toFixed(1)}` : '—'}
               </span>
             </span>
             {rec.loss_as_pct_of_margin != null && (
