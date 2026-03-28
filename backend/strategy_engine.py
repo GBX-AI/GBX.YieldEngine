@@ -27,8 +27,10 @@ from black_scholes import (
 )
 from strike_selector import select_strike, select_strike_price, generate_alternatives, generate_strike_alternatives
 from fee_calculator import calculate_fees, calculate_trade_fees
+from charges_engine import charges_engine
 import live_price_service
 import market_data
+import vix_service
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -335,12 +337,93 @@ def _resolve_index_info(index_name: str, kite_service=None) -> dict:
     }
 
 
-def _add_frontend_aliases(rec: dict) -> dict:
-    """Add frontend-compatible field aliases to a recommendation."""
-    rec["premium"] = rec.get("premium_income", 0)
+def _enrich_recommendation(rec: dict) -> dict:
+    """Enrich a recommendation with charges, risk profile, and frontend aliases."""
+
+    # ── 1. Compute charges (Prompt 1) ──
+    legs = rec.get("legs", [])
+    lot_size = rec.get("lot_size", 1)
+    lots = rec.get("lots", 1)
+
+    if legs and lot_size:
+        charges = charges_engine.calculate(legs, lot_size, lots)
+        rec["charges"] = charges
+        rec["gross_premium"] = charges["gross_premium_received"] - charges["gross_premium_paid"]
+        rec["net_premium"] = charges["net_premium"]
+        rec["total_charges"] = charges["total_charges"]
+        rec["charges_breakdown"] = charges["charges_breakdown"]
+        rec["breakeven_adjustment"] = charges["effective_breakeven_adjustment"]
+
+        # Recalculate annualized return using net premium
+        margin = rec.get("margin_needed", 0)
+        dte = rec.get("dte", 7)
+        if margin > 0 and dte > 0:
+            rec["true_annualized_return"] = round(
+                (charges["net_premium"] / margin) * (365.0 / dte) * 100, 2
+            )
+        else:
+            rec["true_annualized_return"] = 0
+    else:
+        rec["charges"] = {}
+        rec["net_premium"] = rec.get("premium_income", 0)
+        rec["gross_premium"] = rec.get("premium_income", 0)
+        rec["total_charges"] = 0
+        rec["true_annualized_return"] = round(rec.get("annualized_return", 0) * 100, 2) if rec.get("annualized_return", 0) < 1 else rec.get("annualized_return", 0)
+
+    # ── 2. Risk profile (Prompt 2) ──
+    strategy = rec.get("strategy_type", "")
+    net = rec.get("net_premium", 0)
+    qty = lot_size * lots
+
+    if strategy == "PUT_CREDIT_SPREAD":
+        spread_width = rec.get("spread_width", 0)
+        rec["max_profit"] = round(net, 2)
+        rec["max_loss"] = round((spread_width * qty) - net, 2) if spread_width else 0
+        rec["max_loss_point"] = rec.get("strike", 0) - spread_width if spread_width else 0
+        rec["max_profit_point"] = rec.get("strike", 0)
+
+    elif strategy == "CASH_SECURED_PUT":
+        strike = rec.get("strike", 0)
+        rec["max_profit"] = round(net, 2)
+        rec["max_loss"] = round((strike * qty) - net, 2)
+        rec["max_loss_point"] = 0
+        rec["max_profit_point"] = strike
+        rec["practical_max_loss_point"] = round(strike * 0.5, 2)
+
+    elif strategy == "COVERED_CALL":
+        strike = rec.get("strike", 0)
+        avg_cost = rec.get("avg_cost", rec.get("spot", 0))
+        rec["max_profit"] = round((strike - avg_cost + (net / qty if qty else 0)) * qty, 2)
+        rec["max_loss"] = round((avg_cost - (net / qty if qty else 0)) * qty, 2)
+        rec["max_loss_point"] = 0
+        rec["max_profit_point"] = strike
+
+    elif strategy == "COLLAR":
+        call_strike = rec.get("strike", 0)
+        put_strike = rec.get("put_strike", 0)
+        rec["max_profit"] = round(net, 2) if net > 0 else 0
+        rec["max_loss"] = round((rec.get("spot", 0) - put_strike) * qty, 2) if put_strike else 0
+        rec["max_loss_point"] = put_strike
+        rec["max_profit_point"] = call_strike
+
+    else:
+        rec["max_profit"] = round(max(net, 0), 2)
+        rec["max_loss"] = round(rec.get("max_loss", 0), 2)
+
+    # Risk/reward ratio
+    max_loss = rec.get("max_loss", 0)
+    max_profit = rec.get("max_profit", 0)
+    rec["risk_reward_ratio"] = round(max_profit / max_loss, 4) if max_loss > 0 else 0
+    rec["loss_as_pct_of_margin"] = round((max_loss / rec.get("margin_needed", 1)) * 100, 1) if rec.get("margin_needed") else 0
+
+    # ── 3. Frontend aliases ──
+    rec["premium"] = rec.get("net_premium", rec.get("premium_income", 0))
+    rec["premium_income"] = rec.get("net_premium", rec.get("premium_income", 0))
     rec["safety"] = rec.get("safety_tag", "MODERATE")
     rec["strategy"] = rec.get("strategy_type", "")
     rec["margin"] = rec.get("margin_needed", 0)
+    rec["annualized_return"] = rec.get("true_annualized_return", rec.get("annualized_return", 0))
+
     return rec
 
 
@@ -471,7 +554,7 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int, kite_service=N
             step=step,
         )
 
-        recs.append(_add_frontend_aliases({
+        recs.append(_enrich_recommendation({
             "id": generate_id(),
             "rank": 0,
             "symbol": symbol,
@@ -613,7 +696,7 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_
             step=step,
         )
 
-        recs.append(_add_frontend_aliases({
+        recs.append(_enrich_recommendation({
             "id": generate_id(),
             "rank": 0,
             "symbol": index_name,
@@ -770,7 +853,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                             spot=spot, option_type="PE", iv=iv, dte=dte, step=step,
                         )
 
-                        recs.append(_add_frontend_aliases({
+                        recs.append(_enrich_recommendation({
                             "id": generate_id(),
                             "rank": 0,
                             "symbol": index_name,
@@ -859,7 +942,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                     spot=spot, option_type="PE", iv=iv, dte=dte, step=step,
                 )
 
-                recs.append(_add_frontend_aliases({
+                recs.append(_enrich_recommendation({
                     "id": generate_id(),
                     "rank": 0,
                     "symbol": index_name,
@@ -1060,7 +1143,7 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
             step=step,
         )
 
-        recs.append(_add_frontend_aliases({
+        recs.append(_enrich_recommendation({
             "id": generate_id(),
             "rank": 0,
             "symbol": symbol,
@@ -1149,6 +1232,17 @@ def scan_strategies(
     dte = _get_dte(resolved)
     allowed = resolved["allowed_strategies"]
 
+    # Fetch VIX for market condition awareness (Prompt 4)
+    vix_value = vix_service.get_india_vix(kite_service)
+    vix_signal = vix_service.get_vix_signal(vix_value)
+
+    # Adjust delta targets based on VIX
+    if vix_value:
+        base_delta_puts = float(resolved.get("manual_target_delta_puts", 0.20))
+        base_delta_calls = float(resolved.get("manual_target_delta_calls", 0.15))
+        resolved["manual_target_delta_puts"] = vix_service.get_vix_adjusted_delta_target(vix_value, base_delta_puts)
+        resolved["manual_target_delta_calls"] = vix_service.get_vix_adjusted_delta_target(vix_value, base_delta_calls)
+
     all_recs = []
 
     if "COVERED_CALL" in allowed:
@@ -1214,6 +1308,12 @@ def scan_strategies(
             deduped.append(rec)
             seen[key] = rec
     all_recs = deduped
+
+    # Add VIX info to each recommendation
+    for rec in all_recs:
+        rec["vix_at_scan"] = vix_value
+        rec["vix_adjusted"] = bool(vix_value)
+        rec["vix_signal"] = vix_signal
 
     # Summary: total margin required across all recommendations
     total_margin_required = sum(r.get("margin_needed", 0) for r in all_recs)

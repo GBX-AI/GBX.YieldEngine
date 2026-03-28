@@ -968,14 +968,18 @@ def create_app():
             "INFO", "/scanner")
 
         total_margin = sum(r.get("margin_needed", 0) for r in recs)
-        total_premium = sum(r.get("premium_income", 0) for r in recs if r.get("premium_income", 0) > 0)
+        total_net_premium = sum(r.get("net_premium", r.get("premium_income", 0)) for r in recs if r.get("net_premium", r.get("premium_income", 0)) > 0)
+
+        # VIX from first rec (all have same vix_at_scan)
+        vix_data = recs[0].get("vix_signal", {}) if recs else {}
 
         return jsonify({
             "recommendations": recs,
             "arbitrage": arbs,
             "scanned_at": _get_user_state(user_id)["last_scan"],
             "total_margin_required": round(total_margin, 2),
-            "total_weekly_income": round(total_premium, 2),
+            "total_weekly_income": round(total_net_premium, 2),
+            "vix": vix_data,
         })
 
     @app.route("/api/recommendations", methods=["GET", "POST"])
