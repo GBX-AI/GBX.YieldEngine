@@ -556,7 +556,7 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int, kite_service=N
                 if not ce or ce.get("premium", 0) <= 0:
                     continue
                 # Filter low liquidity
-                if ce.get("oi", 0) < 100 or ce.get("volume", 0) < 10:
+                if ce.get("oi", 0) < 100:
                     continue
                 s_strike = s_data["strike"]
                 if s_strike <= spot:
@@ -702,7 +702,7 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_
                 if not pe or pe.get("premium", 0) <= 0:
                     continue
                 # Filter low liquidity
-                if pe.get("oi", 0) < 100 or pe.get("volume", 0) < 10:
+                if pe.get("oi", 0) < 100:
                     continue
                 s_strike = s_data["strike"]
                 if s_strike >= spot:
@@ -847,7 +847,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                 pe = s_data.get("PE")
                 if not pe or pe.get("premium", 0) <= 0:
                     continue
-                if pe.get("oi", 0) < 100 or pe.get("volume", 0) < 10:
+                if pe.get("oi", 0) < 100:
                     continue
                 s_strike = s_data["strike"]
                 if s_strike >= spot:
@@ -872,7 +872,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
 
                     buy_chain = chain_map.get(buy_strike_candidate, {}).get("PE")
                     if buy_chain and buy_chain.get("premium", 0) > 0:
-                        if buy_chain.get("oi", 0) < 100 or buy_chain.get("volume", 0) < 10:
+                        if buy_chain.get("oi", 0) < 100:
                             continue
                         buy_premium = buy_chain["premium"]
                         buy_greeks = compute_greeks(spot, buy_strike_candidate, T, RISK_FREE_RATE, iv, "PE")
@@ -1136,7 +1136,7 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
                 ce = s_data.get("CE")
                 if not ce or ce.get("premium", 0) <= 0:
                     continue
-                if ce.get("oi", 0) < 100 or ce.get("volume", 0) < 10:
+                if ce.get("oi", 0) < 100:
                     continue
                 s_strike = s_data["strike"]
                 if s_strike <= spot:
@@ -1154,7 +1154,7 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
                 pe = s_data.get("PE")
                 if not pe or pe.get("premium", 0) <= 0:
                     continue
-                if pe.get("oi", 0) < 100 or pe.get("volume", 0) < 10:
+                if pe.get("oi", 0) < 100:
                     continue
                 s_strike = s_data["strike"]
                 if s_strike >= spot:
