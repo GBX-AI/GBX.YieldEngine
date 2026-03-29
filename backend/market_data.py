@@ -87,6 +87,13 @@ def get_available_expiries(kite_service, symbol):
     return sorted(expiries)
 
 
+def get_expiries_within_days(kite_service, symbol, max_days=30):
+    """Get all available expiries within max_days from today."""
+    expiries = get_available_expiries(kite_service, symbol)
+    today = date.today()
+    return [exp for exp in expiries if 0 < (exp - today).days <= max_days]
+
+
 def get_nearest_expiry(kite_service, symbol, min_dte=2):
     """Get the nearest available expiry for a symbol with at least min_dte days.
     On weekends, min_dte=0 so we show next week's options for analysis."""

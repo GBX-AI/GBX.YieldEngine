@@ -1375,18 +1375,52 @@ def scan_strategies(
         resolved["manual_target_delta_calls"] = vix_service.get_vix_adjusted_delta_target(vix_value, base_delta_calls)
 
     all_recs = []
+    kite_connected = kite_service and kite_service.is_authenticated()
+
+    # Scan across all expiries within 30 days
+    # For each index/stock, get all available expiries and scan each
+    index_symbols = list(SIMULATION_INDICES.keys())
+    scanned_expiries = {}  # cache: symbol → [expiry_dates]
+
+    def _get_expiries_for(symbol):
+        if symbol not in scanned_expiries:
+            if kite_connected:
+                expiries = market_data.get_expiries_within_days(kite_service, symbol, max_days=30)
+            else:
+                expiries = [market_data.get_nearest_expiry(kite_service, symbol)]
+            scanned_expiries[symbol] = expiries if expiries else [None]
+        return scanned_expiries[symbol]
 
     if "COVERED_CALL" in allowed:
-        all_recs.extend(_scan_covered_calls(holdings, resolved, dte, kite_service=kite_service))
+        # Covered calls: scan each stock holding across all its expiries
+        for holding in holdings:
+            sym = holding.get("symbol", holding.get("tradingsymbol", "")).upper()
+            if not sym:
+                continue
+            for exp in _get_expiries_for(sym):
+                exp_dte = max(1, (exp - date.today()).days) if exp else dte
+                all_recs.extend(_scan_covered_calls([holding], resolved, exp_dte, kite_service=kite_service))
 
     if "CASH_SECURED_PUT" in allowed:
-        all_recs.extend(_scan_cash_secured_puts(cash_balance, resolved, dte, kite_service=kite_service))
+        for idx in index_symbols:
+            for exp in _get_expiries_for(idx):
+                exp_dte = max(1, (exp - date.today()).days) if exp else dte
+                all_recs.extend(_scan_cash_secured_puts(cash_balance, resolved, exp_dte, kite_service=kite_service))
 
     if "PUT_CREDIT_SPREAD" in allowed:
-        all_recs.extend(_scan_put_credit_spreads(cash_balance, resolved, dte, kite_service=kite_service))
+        for idx in index_symbols:
+            for exp in _get_expiries_for(idx):
+                exp_dte = max(1, (exp - date.today()).days) if exp else dte
+                all_recs.extend(_scan_put_credit_spreads(cash_balance, resolved, exp_dte, kite_service=kite_service))
 
     if "COLLAR" in allowed:
-        all_recs.extend(_scan_collars(holdings, resolved, dte, kite_service=kite_service))
+        for holding in holdings:
+            sym = holding.get("symbol", holding.get("tradingsymbol", "")).upper()
+            if not sym:
+                continue
+            for exp in _get_expiries_for(sym):
+                exp_dte = max(1, (exp - date.today()).days) if exp else dte
+                all_recs.extend(_scan_collars([holding], resolved, exp_dte, kite_service=kite_service))
 
     # Filter out negative premium strategies
     all_recs = [r for r in all_recs if r.get("premium_income", 0) > 0]
@@ -1435,16 +1469,14 @@ def scan_strategies(
                 else:
                     leg["instrument"] = f"{rec['symbol']} {expiry_str} {int(leg['strike'])} {leg['option_type']}"
 
-    # Deduplicate: for each symbol, keep only the best strategy (highest annualized return)
-    # Exception: COVERED_CALL and COLLAR on same stock are different enough to show both
+    # Deduplicate: per symbol + strategy + expiry, keep best annualized return
     seen = {}
     deduped = []
     for rec in all_recs:
-        key = f"{rec['symbol']}_{rec['strategy_type']}"
+        key = f"{rec['symbol']}_{rec['strategy_type']}_{rec.get('expiry_date','')}"
         if key in seen:
-            # Keep the one with higher annualized return
             if rec.get("annualized_return", 0) > seen[key].get("annualized_return", 0):
-                deduped = [r for r in deduped if f"{r['symbol']}_{r['strategy_type']}" != key]
+                deduped = [r for r in deduped if f"{r['symbol']}_{r['strategy_type']}_{r.get('expiry_date','')}" != key]
                 deduped.append(rec)
                 seen[key] = rec
         else:
