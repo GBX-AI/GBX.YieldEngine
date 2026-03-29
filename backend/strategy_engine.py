@@ -62,25 +62,48 @@ STOCK_STRIKE_STEP = 50
 
 # ─── Safety Scoring ──────────────────────────────────────────────────────────
 
-def classify_safety(prob_otm: float, otm_pct: float) -> str:
+def classify_safety(prob_otm: float, otm_pct: float,
+                     risk_reward_ratio: float = None,
+                     max_loss: float = None,
+                     net_premium: float = None) -> str:
     """
-    Assign a safety tag based on probability of expiring OTM and
-    how far out-of-the-money the strike sits.
+    Assign a safety tag based on probability of expiring OTM,
+    how far out-of-the-money the strike sits, and risk/reward metrics.
 
     Args:
         prob_otm: Probability the option expires worthless (0.0–1.0).
         otm_pct:  Distance from spot as a fraction (e.g. 0.05 = 5% OTM).
+        risk_reward_ratio: Optional max_profit / max_loss ratio.
+        max_loss: Optional maximum loss in rupees.
+        net_premium: Optional net premium received in rupees.
 
     Returns:
         One of VERY_SAFE, SAFE, MODERATE, AGGRESSIVE.
     """
     if prob_otm >= 0.90 and otm_pct >= 0.04:
-        return "VERY_SAFE"
-    if prob_otm >= 0.85:
-        return "SAFE"
-    if prob_otm >= 0.75:
-        return "MODERATE"
-    return "AGGRESSIVE"
+        tag = "VERY_SAFE"
+    elif prob_otm >= 0.85:
+        tag = "SAFE"
+    elif prob_otm >= 0.75:
+        tag = "MODERATE"
+    else:
+        tag = "AGGRESSIVE"
+
+    # Post-classification overrides based on risk/reward reality
+    # If risking ₹100 to make ₹5 or less, downgrade by 1 level
+    if risk_reward_ratio is not None and risk_reward_ratio < 0.05:
+        _order = ["VERY_SAFE", "SAFE", "MODERATE", "AGGRESSIVE"]
+        idx = _order.index(tag) if tag in _order else 3
+        if idx < 3:
+            tag = _order[idx + 1]
+
+    # If max_loss > ₹50,000 and net_premium < ₹1,000, never mark SAFE or VERY_SAFE
+    if (max_loss is not None and net_premium is not None
+            and max_loss > 50000 and net_premium < 1000):
+        if tag in ("VERY_SAFE", "SAFE"):
+            tag = "MODERATE"
+
+    return tag
 
 
 def passes_risk_filter(safety_tag: str, risk_profile: str) -> bool:
@@ -133,15 +156,18 @@ def _annualized_return(premium: float, capital_at_risk: float, dte: int) -> floa
 
 
 def _build_leg(action: str, strike: float, premium: float, qty: int,
-               option_type: str = "CE") -> dict:
+               option_type: str = "CE", tradingsymbol: str = None) -> dict:
     """Construct a single leg dict."""
-    return {
+    leg = {
         "action": action,
         "strike": strike,
         "premium": round(premium, 2),
         "quantity": qty,
         "option_type": option_type,
     }
+    if tradingsymbol:
+        leg["tradingsymbol"] = tradingsymbol
+    return leg
 
 
 def _fee_estimate(legs: list) -> float:
@@ -396,28 +422,38 @@ def _enrich_recommendation(rec: dict) -> dict:
     lot_size = rec.get("lot_size", 1)
     lots = rec.get("lots", 1)
 
+    # Calculate gross premium: sum(premium * qty) for SELL legs - sum(premium * qty) for BUY legs
+    gross_premium = 0
+    for leg in legs:
+        leg_total = leg.get("premium", 0) * leg.get("quantity", 0)
+        if leg.get("action") == "SELL":
+            gross_premium += leg_total
+        elif leg.get("action") == "BUY":
+            gross_premium -= leg_total
+    gross_premium = round(gross_premium, 2)
+
     if legs and lot_size:
         charges = charges_engine.calculate(legs, lot_size, lots)
         rec["charges"] = charges
-        rec["gross_premium"] = charges["gross_premium_received"] - charges["gross_premium_paid"]
-        rec["net_premium"] = charges["net_premium"]
+        rec["gross_premium"] = gross_premium
         rec["total_charges"] = charges["total_charges"]
+        rec["net_premium"] = round(gross_premium - charges["total_charges"], 2)
         rec["charges_breakdown"] = charges["charges_breakdown"]
-        rec["breakeven_adjustment"] = charges["effective_breakeven_adjustment"]
+        rec["breakeven_adjustment"] = charges.get("effective_breakeven_adjustment", 0)
 
         # Recalculate annualized return using net premium
         margin = rec.get("margin_needed", 0)
         dte = rec.get("dte", 7)
         if margin > 0 and dte > 0:
             rec["true_annualized_return"] = round(
-                (charges["net_premium"] / margin) * (365.0 / dte) * 100, 2
+                (rec["net_premium"] / margin) * (365.0 / dte) * 100, 2
             )
         else:
             rec["true_annualized_return"] = 0
     else:
         rec["charges"] = {}
-        rec["net_premium"] = rec.get("premium_income", 0)
-        rec["gross_premium"] = rec.get("premium_income", 0)
+        rec["gross_premium"] = gross_premium
+        rec["net_premium"] = gross_premium
         rec["total_charges"] = 0
         rec["true_annualized_return"] = round(rec.get("annualized_return", 0) * 100, 2) if rec.get("annualized_return", 0) < 1 else rec.get("annualized_return", 0)
 
@@ -435,11 +471,15 @@ def _enrich_recommendation(rec: dict) -> dict:
 
     elif strategy == "CASH_SECURED_PUT":
         strike = rec.get("strike", 0)
+        spot = rec.get("spot", 0)
         rec["max_profit"] = round(net, 2)
         rec["max_loss"] = round((strike * qty) - net, 2)
         rec["max_loss_point"] = 0
         rec["max_profit_point"] = strike
         rec["practical_max_loss_point"] = round(strike * 0.5, 2)
+        # Ensure margin_needed is set as ₹ amount (approx 15% of notional for naked put)
+        if not rec.get("margin_needed"):
+            rec["margin_needed"] = round(spot * lot_size * lots * 0.15, 2)
 
     elif strategy == "COVERED_CALL":
         strike = rec.get("strike", 0)
@@ -466,6 +506,17 @@ def _enrich_recommendation(rec: dict) -> dict:
     max_profit = rec.get("max_profit", 0)
     rec["risk_reward_ratio"] = round(max_profit / max_loss, 4) if max_loss > 0 else 0
     rec["loss_as_pct_of_margin"] = round((max_loss / rec.get("margin_needed", 1)) * 100, 1) if rec.get("margin_needed") else 0
+
+    # Re-classify safety with risk/reward awareness
+    original_tag = rec.get("safety_tag", "MODERATE")
+    adjusted_tag = classify_safety(
+        prob_otm=rec.get("prob_otm", 0.5),
+        otm_pct=abs(rec.get("strike", 0) - rec.get("spot", 0)) / rec.get("spot", 1) if rec.get("spot") else 0,
+        risk_reward_ratio=rec["risk_reward_ratio"],
+        max_loss=max_loss,
+        net_premium=net,
+    )
+    rec["safety_tag"] = adjusted_tag
 
     # ── 3. Exit suggestion (Prompt 3) ──
     exit_data = _calculate_exit_suggestion(rec)
@@ -604,7 +655,8 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int, kite_service=N
         ann_return = _annualized_return(total_premium, capital_at_risk, dte)
         total_margin = 0  # Covered call — shares are collateral
 
-        legs = [_build_leg("SELL", strike, premium, trade_qty, "CE")]
+        legs = [_build_leg("SELL", strike, premium, trade_qty, "CE",
+                           tradingsymbol=ce_data.get("tradingsymbol") if use_real else None)]
         fees = _fee_estimate(legs)
 
         # Generate alternative strikes
@@ -737,7 +789,7 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_
         # Margin for naked put — approximate as 15% of notional
         margin_per_lot = spot * lot_size * 0.15
         max_lots = max(1, int(cash_balance / margin_per_lot)) if cash_balance > 0 else 1
-        lots = min(max_lots, 2)  # Cap at 2 lots for safety
+        lots = 1  # Default to 1 lot — let the user decide to add more
         trade_qty = lots * lot_size
         total_premium = premium * trade_qty
         margin_needed = margin_per_lot * lots
@@ -754,7 +806,8 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_
         ann_return = _annualized_return(total_premium, margin_needed, dte)
         max_loss = (strike - 0) * trade_qty  # Theoretical max; practically limited
 
-        legs = [_build_leg("SELL", strike, premium, trade_qty, "PE")]
+        legs = [_build_leg("SELL", strike, premium, trade_qty, "PE",
+                           tradingsymbol=pe_data.get("tradingsymbol") if use_real else None)]
         fees = _fee_estimate(legs)
 
         alts = generate_strike_alternatives(
@@ -775,6 +828,7 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_
             "legs": legs,
             "premium_income": round(total_premium, 2),
             "margin_needed": round(margin_needed, 2),
+            "lot_size": lot_size,
             "max_loss": round(max_loss, 2),
             "prob_otm": round(prob_otm, 4),
             "delta": round(delta_val, 4),
@@ -890,17 +944,10 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                         if max_loss_per_lot <= 0:
                             continue
 
-                        lots = max(1, int(max_loss_limit / max_loss_per_lot))
-                        lots = min(lots, 2)
+                        lots = 1  # Default to 1 lot — let the user decide to add more
                         trade_qty = lots * lot_size
                         total_credit = net_credit * trade_qty
                         total_max_loss = max_loss_per_lot * lots
-
-                        if total_max_loss > max_loss_limit:
-                            lots = max(1, int(max_loss_limit / max_loss_per_lot))
-                            trade_qty = lots * lot_size
-                            total_credit = net_credit * trade_qty
-                            total_max_loss = max_loss_per_lot * lots
 
                         margin_needed = total_max_loss
                         prob_otm = sell_greeks_real["prob_otm"]
@@ -915,8 +962,10 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                         ann_return = _annualized_return(total_credit, margin_needed, dte)
 
                         legs = [
-                            _build_leg("SELL", sell_strike, sell_premium, trade_qty, "PE"),
-                            _build_leg("BUY", buy_strike_candidate, buy_premium, trade_qty, "PE"),
+                            _build_leg("SELL", sell_strike, sell_premium, trade_qty, "PE",
+                                       tradingsymbol=sell_pe.get("tradingsymbol") if sell_pe else None),
+                            _build_leg("BUY", buy_strike_candidate, buy_premium, trade_qty, "PE",
+                                       tradingsymbol=buy_chain.get("tradingsymbol") if buy_chain else None),
                         ]
                         fees = _fee_estimate(legs)
 
@@ -979,17 +1028,10 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                 if max_loss_per_lot <= 0:
                     continue
 
-                lots = max(1, int(max_loss_limit / max_loss_per_lot))
-                lots = min(lots, 2)
+                lots = 1  # Default to 1 lot — let the user decide to add more
                 trade_qty = lots * lot_size
                 total_credit = net_credit * trade_qty
                 total_max_loss = max_loss_per_lot * lots
-
-                if total_max_loss > max_loss_limit:
-                    lots = max(1, int(max_loss_limit / max_loss_per_lot))
-                    trade_qty = lots * lot_size
-                    total_credit = net_credit * trade_qty
-                    total_max_loss = max_loss_per_lot * lots
 
                 margin_needed = total_max_loss
 
@@ -1205,8 +1247,10 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
         theta_day = (call_greeks["theta"] - put_greeks["theta"])
 
         legs = [
-            _build_leg("SELL", call_strike, call_premium, trade_qty, "CE"),
-            _build_leg("BUY", put_strike, put_premium, trade_qty, "PE"),
+            _build_leg("SELL", call_strike, call_premium, trade_qty, "CE",
+                       tradingsymbol=ce_data.get("tradingsymbol") if use_real else None),
+            _build_leg("BUY", put_strike, put_premium, trade_qty, "PE",
+                       tradingsymbol=pe_data.get("tradingsymbol") if use_real else None),
         ]
         fees = _fee_estimate(legs)
 
@@ -1366,8 +1410,12 @@ def scan_strategies(
             for leg in rec["legs"]:
                 leg["expiry_date"] = expiry_iso
                 leg["expiry_display"] = expiry_str
-                # Build readable instrument name: NIFTY 03 APR 22550 PE
-                leg["instrument"] = f"{rec['symbol']} {expiry_str} {int(leg['strike'])} {leg['option_type']}"
+                # Use tradingsymbol from Kite if available (e.g. BANKNIFTY2633051800PE)
+                # Only construct names as fallback for simulation mode
+                if leg.get("tradingsymbol"):
+                    leg["instrument"] = leg["tradingsymbol"]
+                else:
+                    leg["instrument"] = f"{rec['symbol']} {expiry_str} {int(leg['strike'])} {leg['option_type']}"
 
     # Deduplicate: for each symbol, keep only the best strategy (highest annualized return)
     # Exception: COVERED_CALL and COLLAR on same stock are different enough to show both

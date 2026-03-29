@@ -11,13 +11,6 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# Symbols that have weekly expiry (every Thursday) — as of Nov 2024
-# NSE discontinued weekly expiry for BANKNIFTY, FINNIFTY, MIDCPNIFTY
-# Only NIFTY retains weekly Thursday expiry on NSE
-WEEKLY_EXPIRY_SYMBOLS = {"NIFTY"}
-
-# All other F&O stocks have monthly expiry (last Thursday of month)
-
 # Cache for instruments (refreshed every 6 hours — instruments don't change intraday)
 _instruments_cache = {"data": None, "timestamp": 0}
 INSTRUMENTS_CACHE_TTL = 6 * 3600  # 6 hours
@@ -73,8 +66,8 @@ def get_available_expiries(kite_service, symbol):
     Returns sorted list of date objects (nearest first)."""
     instruments = get_nfo_instruments(kite_service)
     if not instruments:
-        # Fallback: generate expected expiries
-        return _fallback_expiries(symbol)
+        # No instruments available — return empty; simulation mode handles its own fallback
+        return []
 
     symbol_upper = symbol.upper()
     today = date.today()
@@ -99,7 +92,8 @@ def get_nearest_expiry(kite_service, symbol):
     expiries = get_available_expiries(kite_service, symbol)
     if expiries:
         return expiries[0]
-    return _fallback_expiries(symbol)[0]
+    # No expiries found — return next Thursday as a reasonable fallback
+    return _next_thursday()
 
 
 def get_lot_size(kite_service, symbol):
@@ -191,12 +185,13 @@ def get_option_chain_live(kite_service, symbol, expiry_date, num_strikes=10):
 
     lot_size = chain_instruments[0].get("lot_size", 1)
 
-    # Get spot price
+    # Get spot price — use correct Kite index quote names
     try:
-        if symbol_upper in WEEKLY_EXPIRY_SYMBOLS:
-            spot_key = f"NSE:{symbol_upper} 50" if symbol_upper == "NIFTY" else f"NSE:{symbol_upper}"
-        else:
-            spot_key = f"NSE:{symbol_upper}"
+        _INDEX_QUOTE_NAMES = {
+            "NIFTY": "NSE:NIFTY 50",
+            "BANKNIFTY": "NSE:NIFTY BANK",
+        }
+        spot_key = _INDEX_QUOTE_NAMES.get(symbol_upper, f"NSE:{symbol_upper}")
         spot_data = kite_service.get_ltp([spot_key])
         spot = list(spot_data.values())[0]["last_price"]
     except Exception:
@@ -282,42 +277,9 @@ def has_fno_options(kite_service, symbol):
 
 
 def _fallback_expiries(symbol):
-    """Generate expected expiry dates when Kite is not connected."""
-    today = date.today()
-    symbol_upper = symbol.upper()
-
-    if symbol_upper in WEEKLY_EXPIRY_SYMBOLS:
-        # Weekly: next 4 Thursdays
-        expiries = []
-        d = today
-        for _ in range(30):
-            d += timedelta(days=1)
-            if d.weekday() == 3:  # Thursday
-                expiries.append(d)
-                if len(expiries) >= 4:
-                    break
-        return expiries
-    else:
-        # Monthly: last Thursday of next 3 months
-        expiries = []
-        for month_offset in range(3):
-            year = today.year
-            month = today.month + month_offset
-            if month > 12:
-                month -= 12
-                year += 1
-            # Find last Thursday of month
-            if month == 12:
-                next_month_first = date(year + 1, 1, 1)
-            else:
-                next_month_first = date(year, month + 1, 1)
-            last_day = next_month_first - timedelta(days=1)
-            # Walk back to Thursday
-            while last_day.weekday() != 3:
-                last_day -= timedelta(days=1)
-            if last_day >= today:
-                expiries.append(last_day)
-        return expiries if expiries else [_next_thursday()]
+    """Fallback when Kite is not connected — return empty list.
+    Simulation mode handles its own expiry generation."""
+    return []
 
 
 def _next_thursday():
