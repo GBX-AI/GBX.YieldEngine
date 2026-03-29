@@ -37,7 +37,7 @@ from datetime import date
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-STRATEGY_TYPES = ("COVERED_CALL", "CASH_SECURED_PUT", "PUT_CREDIT_SPREAD", "COLLAR", "SHORT_STRANGLE")
+STRATEGY_TYPES = ("COVERED_CALL", "CASH_SECURED_PUT", "PUT_CREDIT_SPREAD", "COLLAR", "SHORT_STRANGLE", "IRON_CONDOR")
 
 SAFETY_TAGS = ("VERY_SAFE", "SAFE", "MODERATE", "AGGRESSIVE")
 
@@ -506,6 +506,20 @@ def _enrich_recommendation(rec: dict) -> dict:
         rec["max_loss"] = round((rec.get("spot", 0) - put_strike) * qty, 2) if put_strike else 0
         rec["max_loss_point"] = put_strike
         rec["max_profit_point"] = call_strike
+
+    elif strategy == "IRON_CONDOR":
+        rec["max_profit"] = round(net, 2)
+        # Downside capped by protective put
+        put_width = rec.get("put_spread_width", 0)
+        rec["max_loss"] = round((put_width * qty) - net, 2) if put_width else round(rec.get("max_loss", 0), 2)
+        rec["max_loss_point"] = rec.get("protection_strike", 0)
+        rec["max_profit_point"] = rec.get("strike", 0)  # Both sell strikes
+
+    elif strategy == "SHORT_STRANGLE":
+        rec["max_profit"] = round(net, 2)
+        # Strangle max loss is theoretically unlimited
+        rec["max_loss_point"] = 0
+        rec["max_profit_point"] = rec.get("strike", 0)
 
     else:
         rec["max_profit"] = round(max(net, 0), 2)
@@ -1456,6 +1470,198 @@ def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_se
     return recs
 
 
+# ─── Iron Condor Scanner (Strategy 5b from Trade Strategy doc) ────────────────
+
+def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_service=None) -> list:
+    """
+    Scan for Iron Condor opportunities on NIFTY and BANKNIFTY.
+
+    Strategy 5b from Trade Strategy doc:
+    - Sell Call at spot+3%
+    - Sell Put at spot-3%
+    - Buy Put at spot-6% (downside protection)
+    - Hold to expiry or roll at 50% leg decay
+
+    Max loss is capped on the downside by the protective put.
+    Upside is uncapped (no protective call — this is a jade lizard variant).
+    """
+    recs = []
+    kite_connected = kite_service and kite_service.is_authenticated()
+
+    for index_name in SIMULATION_INDICES:
+        try:
+            idx = _resolve_index_info(index_name, kite_service=kite_service)
+            spot = idx["spot"]
+            iv = idx["iv"]
+            lot_size = idx["lotSize"]
+
+            if not spot or spot <= 0:
+                continue
+
+            # Get expiry
+            expiry_date = None
+            if kite_connected:
+                expiry_date = market_data.get_nearest_expiry(kite_service, index_name)
+            if not expiry_date:
+                expiry_date = market_data._next_thursday()
+
+            actual_dte = max(1, (expiry_date - date.today()).days)
+            if actual_dte <= 0:
+                continue
+
+            T = actual_dte / 365.0
+
+            # Strike selection: +3%, -3%, -6% from spot
+            step = INDEX_STRIKE_STEP.get(index_name, 50)
+            sell_call_strike = _round_to_step(spot * 1.03, step)
+            sell_put_strike = _round_to_step(spot * 0.97, step)
+            buy_put_strike = _round_to_step(spot * 0.94, step)
+
+            # Try real option chain
+            real_chain = None
+            use_real = False
+            sell_call_premium = 0
+            sell_put_premium = 0
+            buy_put_premium = 0
+
+            if kite_connected and expiry_date:
+                real_chain = market_data.get_option_chain_live(kite_service, index_name, expiry_date, num_strikes=20)
+
+            if real_chain and real_chain.get("strikes"):
+                chain_map = {}
+                for s in real_chain["strikes"]:
+                    chain_map[s["strike"]] = s
+
+                # Find nearest strikes in chain
+                def _find_nearest(target, opt_type):
+                    best = None
+                    best_diff = float("inf")
+                    for s in real_chain["strikes"]:
+                        opt = s.get(opt_type)
+                        if not opt or opt.get("premium", 0) <= 0:
+                            continue
+                        if opt.get("oi", 0) < 100:
+                            continue
+                        diff = abs(s["strike"] - target)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best = (s["strike"], opt)
+                    return best
+
+                sc = _find_nearest(sell_call_strike, "CE")
+                sp = _find_nearest(sell_put_strike, "PE")
+                bp = _find_nearest(buy_put_strike, "PE")
+
+                if sc and sp and bp:
+                    sell_call_strike, sell_call_data = sc
+                    sell_put_strike, sell_put_data = sp
+                    buy_put_strike, buy_put_data = bp
+
+                    sell_call_premium = sell_call_data["premium"]
+                    sell_put_premium = sell_put_data["premium"]
+                    buy_put_premium = buy_put_data["premium"]
+                    use_real = True
+
+                    # Update lot_size from chain
+                    if real_chain.get("lot_size"):
+                        lot_size = real_chain["lot_size"]
+
+            if not use_real:
+                # Black-Scholes fallback
+                sell_call_premium = compute_greeks(spot, sell_call_strike, T, RISK_FREE_RATE, iv, "CE")["price"]
+                sell_put_premium = compute_greeks(spot, sell_put_strike, T, RISK_FREE_RATE, iv, "PE")["price"]
+                buy_put_premium = compute_greeks(spot, buy_put_strike, T, RISK_FREE_RATE, iv, "PE")["price"]
+
+            net_premium_per_share = sell_call_premium + sell_put_premium - buy_put_premium
+            if net_premium_per_share <= 0:
+                continue
+
+            total_premium = net_premium_per_share * lot_size
+
+            # Max loss calculation:
+            # Downside: capped at (sell_put_strike - buy_put_strike - net_premium) * lot_size
+            # Upside: uncapped (no protective call) — use 2x premium as practical max
+            put_spread_width = sell_put_strike - buy_put_strike
+            max_loss_downside = (put_spread_width - net_premium_per_share) * lot_size
+            max_loss_upside = total_premium * 3  # Practical estimate for uncapped upside
+
+            # BEP points
+            bep_upper = sell_call_strike + net_premium_per_share
+            bep_lower = sell_put_strike - net_premium_per_share
+
+            # Greeks
+            sc_greeks = compute_greeks(spot, sell_call_strike, T, RISK_FREE_RATE, iv, "CE")
+            sp_greeks = compute_greeks(spot, sell_put_strike, T, RISK_FREE_RATE, iv, "PE")
+            bp_greeks = compute_greeks(spot, buy_put_strike, T, RISK_FREE_RATE, iv, "PE")
+
+            net_delta = sc_greeks["delta"] + sp_greeks["delta"] - bp_greeks["delta"]
+            net_theta = (sc_greeks["theta"] + sp_greeks["theta"] - bp_greeks["theta"]) * lot_size
+            prob_otm = sc_greeks["prob_otm"] * sp_greeks["prob_otm"]
+
+            # Margin: approximate as the put spread width * lot_size (defined risk on put side)
+            margin_needed = put_spread_width * lot_size * 1.2  # 20% buffer
+
+            safety_tag = classify_safety(prob_otm, 0.03)  # 3% OTM on both sides
+            if not passes_risk_filter(safety_tag, settings["risk_profile"]):
+                continue
+
+            ann_return = _annualized_return(total_premium, margin_needed, actual_dte)
+
+            legs = [
+                _build_leg("SELL", sell_call_strike, sell_call_premium, lot_size, "CE",
+                          tradingsymbol=sell_call_data.get("tradingsymbol") if use_real else None),
+                _build_leg("SELL", sell_put_strike, sell_put_premium, lot_size, "PE",
+                          tradingsymbol=sell_put_data.get("tradingsymbol") if use_real else None),
+                _build_leg("BUY", buy_put_strike, buy_put_premium, lot_size, "PE",
+                          tradingsymbol=buy_put_data.get("tradingsymbol") if use_real else None),
+            ]
+
+            recs.append(_enrich_recommendation({
+                "id": generate_id(),
+                "rank": 0,
+                "symbol": index_name,
+                "strategy_type": "IRON_CONDOR",
+                "strike": sell_call_strike,
+                "put_strike": sell_put_strike,
+                "protection_strike": buy_put_strike,
+                "option_type": "CE+PE",
+                "legs": legs,
+                "premium_income": round(total_premium, 2),
+                "margin_needed": round(margin_needed, 2),
+                "max_loss": round(max_loss_downside, 2),
+                "max_loss_upside": round(max_loss_upside, 2),
+                "prob_otm": round(prob_otm, 4),
+                "delta": round(net_delta, 4),
+                "annualized_return": round(ann_return, 4),
+                "theta_per_day": round(net_theta, 2),
+                "safety_tag": safety_tag,
+                "strike_rationale": (
+                    f"IRON_CONDOR: Sell {sell_call_strike}CE + Sell {sell_put_strike}PE + "
+                    f"Buy {buy_put_strike}PE (protection). "
+                    f"Net premium ₹{net_premium_per_share:.2f}/share. "
+                    f"BEP: {bep_lower:.0f} — {bep_upper:.0f}. "
+                    f"Max loss (downside): ₹{max_loss_downside:.0f} (capped by protection)"
+                ),
+                "alternatives": {},
+                "fee_estimate": _fee_estimate(legs),
+                "dte": actual_dte,
+                "lots": 1,
+                "lot_size": lot_size,
+                "spot": spot,
+                "bep_upper": round(bep_upper, 2),
+                "bep_lower": round(bep_lower, 2),
+                "net_premium_per_share": round(net_premium_per_share, 2),
+                "put_spread_width": put_spread_width,
+                "price_source": "kite" if use_real else "simulation",
+                "fetched_at": datetime.now().isoformat(),
+            }))
+
+        except Exception:
+            continue
+
+    return recs
+
+
 # ─── Ranking ──────────────────────────────────────────────────────────────────
 
 def rank_recommendations(recs: list) -> list:
@@ -1574,6 +1780,12 @@ def scan_strategies(
 
     if "SHORT_STRANGLE" in allowed:
         all_recs.extend(_scan_short_strangles(cash_balance, resolved, dte, kite_service=kite_service))
+
+    if "IRON_CONDOR" in allowed:
+        for idx in index_symbols:
+            for exp in _get_expiries_for(idx):
+                exp_dte = max(1, (exp - date.today()).days) if exp else dte
+                all_recs.extend(_scan_iron_condors(cash_balance, resolved, exp_dte, kite_service=kite_service))
 
     # Filter out negative premium strategies
     all_recs = [r for r in all_recs if r.get("premium_income", 0) > 0]
