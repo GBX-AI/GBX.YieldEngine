@@ -1231,12 +1231,22 @@ def create_app():
     @app.route("/api/positions/alerts", methods=["GET"])
     @require_auth
     def api_position_alerts():
-        """Get exit alerts for all open options positions."""
+        """Get exit alerts for all open options positions + manual trades."""
         user_id = g.current_user["id"]
         kite = get_kite_for_user(user_id)
         import exit_monitor
-        alerts = exit_monitor.check_positions(kite)
-        return jsonify({"alerts": alerts, "count": len(alerts)})
+        kite_alerts = exit_monitor.check_positions(kite)
+        manual_alerts = exit_monitor.check_manual_trades(kite, user_id)
+        all_alerts = kite_alerts + manual_alerts
+        # Sort combined: EXIT_NOW first
+        level_order = {"EXIT_NOW": 0, "REVIEW": 1, "HOLD": 2}
+        all_alerts.sort(key=lambda a: level_order.get(a.get("alert_level"), 3))
+        return jsonify({
+            "alerts": all_alerts,
+            "count": len(all_alerts),
+            "kite_positions": len(kite_alerts),
+            "manual_trades": len(manual_alerts),
+        })
 
     # ─── MANUAL TRADE TRACKING ──────────────────────────────────
 

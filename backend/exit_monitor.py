@@ -127,7 +127,33 @@ def check_positions(kite_service) -> list:
                 alert["alert_message"] = f"Premium doubled ({current_price:.2f} vs entry {buy_price:.2f}). Stop loss triggered."
                 alert["suggested_action"] = f"Buy back at ₹{current_price:.2f} to limit loss"
 
-            # RULE 4: DTE <= 2, not confidently OTM
+            # RULE 4: Roll opportunity (50% single-leg decay — Strategy 5c)
+            # When one leg of a strangle/condor decays 50%, close it and
+            # re-enter at nearest strike to current spot
+            elif profit_pct >= 0.5 and dte > 3:
+                # Get current spot for roll target
+                roll_target = None
+                try:
+                    spot_key = f"NSE:{pos.get('name', symbol.split('2')[0] if '2' in symbol else symbol)}"
+                    spot_data = kite_service.get_ltp([spot_key])
+                    roll_spot = list(spot_data.values())[0]["last_price"]
+                    if inst_type == "PE":
+                        roll_target = round(roll_spot * 0.97, -2)  # 3% below new spot
+                    else:
+                        roll_target = round(roll_spot * 1.03, -2)  # 3% above new spot
+                except Exception:
+                    pass
+
+                alert["alert_level"] = "REVIEW"
+                alert["alert_rule"] = "ROLL_OPPORTUNITY"
+                roll_msg = f"Leg decayed {profit_pct*100:.0f}%. Close this leg and re-enter"
+                if roll_target:
+                    roll_msg += f" at ₹{roll_target} strike ({inst_type})"
+                alert["alert_message"] = roll_msg
+                alert["suggested_action"] = f"Buy back at ₹{current_price:.2f}, sell new {inst_type} at strike ₹{roll_target or 'nearest to spot'}"
+                alert["roll_target_strike"] = roll_target
+
+            # RULE 5: DTE <= 2, not confidently OTM
             elif dte <= 2:
                 alert["alert_level"] = "REVIEW"
                 alert["alert_rule"] = "NEAR_EXPIRY"
@@ -166,4 +192,100 @@ def check_positions(kite_service) -> list:
     level_order = {"EXIT_NOW": 0, "REVIEW": 1, "HOLD": 2}
     alerts.sort(key=lambda a: level_order.get(a["alert_level"], 3))
 
+    return alerts
+
+
+def check_manual_trades(kite_service, user_id) -> list:
+    """Check open manual trades against exit rules.
+    Returns alerts for manually tracked trades."""
+    from models import get_open_manual_trades
+
+    trades = get_open_manual_trades(user_id)
+    if not trades:
+        return []
+
+    alerts = []
+    today = date.today()
+
+    for trade in trades:
+        symbol = trade.get("tradingsymbol", "")
+        entry_premium = trade.get("entry_premium", 0)
+        qty = trade.get("quantity", 0)
+        expiry_str = trade.get("expiry_date", "")
+
+        # Get current price
+        current_price = 0
+        if kite_service and kite_service.is_authenticated() and symbol:
+            try:
+                data = kite_service.get_ltp([f"NFO:{symbol}"])
+                current_price = list(data.values())[0]["last_price"]
+            except Exception:
+                pass
+
+        # Calculate DTE
+        dte = 999
+        if expiry_str:
+            try:
+                exp_date = datetime.strptime(expiry_str[:10], "%Y-%m-%d").date()
+                dte = max(0, (exp_date - today).days)
+            except Exception:
+                pass
+
+        # P&L
+        is_short = (trade.get("action") or "").upper() == "SELL"
+        if is_short and entry_premium > 0:
+            pnl_per_share = entry_premium - current_price
+            profit_pct = pnl_per_share / entry_premium if entry_premium else 0
+        else:
+            pnl_per_share = current_price - entry_premium
+            profit_pct = pnl_per_share / entry_premium if entry_premium else 0
+
+        total_pnl = round(pnl_per_share * qty, 2)
+
+        alert = {
+            "trade_id": trade.get("id"),
+            "symbol": trade.get("symbol"),
+            "tradingsymbol": symbol,
+            "strategy_type": trade.get("strategy_type"),
+            "entry_premium": entry_premium,
+            "current_premium": round(current_price, 2),
+            "quantity": qty,
+            "pnl": total_pnl,
+            "pnl_pct": round(profit_pct * 100, 1),
+            "dte": dte,
+            "alert_level": "HOLD",
+            "alert_rule": None,
+            "alert_message": "Position on track",
+            "suggested_action": "Hold",
+            "source": "manual_trade",
+        }
+
+        if is_short and entry_premium > 0:
+            if profit_pct >= 0.5:
+                alert["alert_level"] = "EXIT_NOW"
+                alert["alert_rule"] = "50_PCT_PROFIT"
+                alert["alert_message"] = f"50% profit reached ({profit_pct*100:.0f}%). Book profit."
+                alert["suggested_action"] = f"Buy back at ₹{current_price:.2f}"
+            elif dte <= 1:
+                alert["alert_level"] = "EXIT_NOW"
+                alert["alert_rule"] = "GAMMA_RISK"
+                alert["alert_message"] = f"Expiry in {dte} day(s). Exit now."
+                alert["suggested_action"] = "Close position before expiry"
+            elif current_price >= entry_premium * 2:
+                alert["alert_level"] = "EXIT_NOW"
+                alert["alert_rule"] = "STOP_LOSS"
+                alert["alert_message"] = f"Premium doubled. Stop loss."
+                alert["suggested_action"] = f"Buy back at ₹{current_price:.2f}"
+            elif profit_pct >= 0.3:
+                alert["alert_level"] = "REVIEW"
+                alert["alert_rule"] = "PARTIAL_PROFIT"
+                alert["alert_message"] = f"{profit_pct*100:.0f}% profit. Approaching target."
+            else:
+                alert["alert_message"] = f"{profit_pct*100:.0f}% {'profit' if profit_pct >= 0 else 'loss'}, {dte} DTE"
+                alert["suggested_action"] = f"Target: 50% profit at ₹{entry_premium*0.5:.2f}/share"
+
+        alerts.append(alert)
+
+    level_order = {"EXIT_NOW": 0, "REVIEW": 1, "HOLD": 2}
+    alerts.sort(key=lambda a: level_order.get(a["alert_level"], 3))
     return alerts
