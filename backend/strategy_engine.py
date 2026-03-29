@@ -37,7 +37,7 @@ from datetime import date
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-STRATEGY_TYPES = ("COVERED_CALL", "CASH_SECURED_PUT", "PUT_CREDIT_SPREAD", "COLLAR", "SHORT_STRANGLE", "IRON_CONDOR")
+STRATEGY_TYPES = ("COVERED_CALL", "CASH_SECURED_PUT", "PUT_CREDIT_SPREAD", "COLLAR", "SHORT_STRANGLE", "ATM_SHORT_STRANGLE", "IRON_CONDOR")
 
 SAFETY_TAGS = ("VERY_SAFE", "SAFE", "MODERATE", "AGGRESSIVE")
 
@@ -515,7 +515,7 @@ def _enrich_recommendation(rec: dict) -> dict:
         rec["max_loss_point"] = rec.get("protection_strike", 0)
         rec["max_profit_point"] = rec.get("strike", 0)  # Both sell strikes
 
-    elif strategy == "SHORT_STRANGLE":
+    elif strategy in ("SHORT_STRANGLE", "ATM_SHORT_STRANGLE"):
         rec["max_profit"] = round(net, 2)
         # Strangle max loss is theoretically unlimited
         rec["max_loss_point"] = 0
@@ -1322,17 +1322,23 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
 
 # ─── Short Strangle Scanner (Strategy 1 from Trade Strategy doc) ──────────────
 
-def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_service=None) -> list:
+def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_service=None, mode="OTM") -> list:
     """
-    Scan for OTM Short Strangle opportunities on F&O stocks.
+    Scan for Short Strangle opportunities on F&O stocks.
 
-    Strategy: Sell OTM Call (spot+2%) + OTM Put (spot-2%) on the same stock.
-    Filters from trade strategy document:
-    - CE or PE premium >= 2.5% of strike price
-    - Combined CE+PE premium >= 4% of spot price
-    - Avoid stocks within 5% of 52-week high
-    - Monthly expiry only (stocks don't have weekly)
+    mode="OTM" (Strategy 1): CE at spot+2%, PE at spot-2%, premium >= 2.5%/4%
+    mode="ATM" (Strategy 2): CE and PE at spot, premium >= 3%/5%
     """
+    if mode == "ATM":
+        otm_pct = 0.0   # ATM — at spot
+        min_single_pct = 3.0   # >= 3% of strike
+        min_combined_pct = 5.0  # >= 5% of spot
+        strategy_label = "ATM_SHORT_STRANGLE"
+    else:
+        otm_pct = 0.02  # 2% OTM
+        min_single_pct = 2.5   # >= 2.5% of strike
+        min_combined_pct = 4.0  # >= 4% of spot
+        strategy_label = "SHORT_STRANGLE"
     recs = []
     kite_connected = kite_service and kite_service.is_authenticated()
 
@@ -1376,7 +1382,7 @@ def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_se
                 continue
 
             # Get strangle chain (2% OTM on each side)
-            strangle = market_data.get_strangle_chain(kite_service, symbol, expiry_date, spot, otm_pct=0.02)
+            strangle = market_data.get_strangle_chain(kite_service, symbol, expiry_date, spot, otm_pct=otm_pct)
             if not strangle:
                 continue
 
@@ -1384,12 +1390,14 @@ def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_se
             pe = strangle["pe"]
             lot_size = strangle["lot_size"]
 
-            # Filter: CE or PE premium >= 2.5% of strike
-            if ce["premium"] / ce["strike"] < 0.025 and pe["premium"] / pe["strike"] < 0.025:
+            # Filter: CE or PE premium >= min% of strike
+            ce_pct = (ce["premium"] / ce["strike"]) * 100 if ce["strike"] else 0
+            pe_pct = (pe["premium"] / pe["strike"]) * 100 if pe["strike"] else 0
+            if ce_pct < min_single_pct and pe_pct < min_single_pct:
                 continue
 
-            # Filter: Combined premium >= 4% of spot
-            if strangle["combined_premium_pct"] < 4.0:
+            # Filter: Combined premium >= min% of spot
+            if strangle["combined_premium_pct"] < min_combined_pct:
                 continue
 
             # Calculate greeks for both legs
@@ -1432,7 +1440,7 @@ def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_se
                 "id": generate_id(),
                 "rank": 0,
                 "symbol": symbol,
-                "strategy_type": "SHORT_STRANGLE",
+                "strategy_type": strategy_label,
                 "strike": ce["strike"],  # Show CE strike as primary
                 "put_strike": pe["strike"],
                 "option_type": "CE+PE",
@@ -1779,7 +1787,8 @@ def scan_strategies(
                 all_recs.extend(_scan_collars([holding], resolved, exp_dte, kite_service=kite_service))
 
     if "SHORT_STRANGLE" in allowed:
-        all_recs.extend(_scan_short_strangles(cash_balance, resolved, dte, kite_service=kite_service))
+        all_recs.extend(_scan_short_strangles(cash_balance, resolved, dte, kite_service=kite_service, mode="OTM"))
+        all_recs.extend(_scan_short_strangles(cash_balance, resolved, dte, kite_service=kite_service, mode="ATM"))
 
     if "IRON_CONDOR" in allowed:
         for idx in index_symbols:
