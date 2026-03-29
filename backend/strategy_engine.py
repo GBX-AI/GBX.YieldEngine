@@ -374,12 +374,21 @@ def _calculate_exit_suggestion(rec: dict) -> dict:
     qty = lot_size * lots
     theta_per_day = rec.get("theta_per_day", 0)
 
-    # Theta in rupees (positive = earning per day for sellers)
-    theta_rupees = round(abs(theta_per_day) * qty, 2) if theta_per_day else 0
+    # Theta in rupees — theta_per_day is ALREADY multiplied by trade_qty in scanner
+    # So it's the total theta for the whole position, not per-share
+    theta_rupees = round(abs(theta_per_day), 2) if theta_per_day else 0
 
     # Exit rules
     target_exit_pct = 50  # Standard: exit at 50% profit
-    target_exit_premium = round(net_premium * 0.5, 2) if net_premium > 0 else 0
+    # Calculate per-share exit premium target (50% of entry per-share premium)
+    # Find the sell leg's per-share premium for the exit target
+    sell_premium_per_share = 0
+    for leg in rec.get("legs", []):
+        if (leg.get("action") or "").upper() == "SELL":
+            sell_premium_per_share = leg.get("premium", 0)
+            break
+    target_exit_premium_per_share = round(sell_premium_per_share * 0.5, 2)
+    target_exit_premium_total = round(net_premium * 0.5, 2) if net_premium > 0 else 0
 
     if dte <= 7:
         # Weekly: exit at 50% or Thursday EOD
@@ -405,11 +414,12 @@ def _calculate_exit_suggestion(rec: dict) -> dict:
             "target_exit_day": target_exit_day,
             "target_exit_date": target_date.isoformat(),
             "target_exit_pct": target_exit_pct,
-            "target_exit_premium": target_exit_premium,
+            "target_exit_premium": target_exit_premium_per_share,
+            "target_exit_premium_total": target_exit_premium_total,
             "reason": reason,
             "gamma_warning_dte": gamma_warning_dte,
             "gamma_warning": dte <= gamma_warning_dte,
-            "notes": f"Exit when premium decays to ₹{target_exit_premium:.0f} or by {target_date.strftime('%a %d %b')}"
+            "notes": f"Exit when premium reaches ₹{target_exit_premium_per_share:.2f}/share or by {target_date.strftime('%a %d %b')}"
         }
     }
 
@@ -1380,6 +1390,14 @@ def scan_strategies(
 
     # Filter out negative premium strategies
     all_recs = [r for r in all_recs if r.get("premium_income", 0) > 0]
+
+    # Filter out expired options (DTE <= 0)
+    all_recs = [r for r in all_recs if r.get("dte", 1) > 0]
+
+    # When Kite is connected, filter out simulation-only recs
+    kite_is_live = kite_service and kite_service.is_authenticated()
+    if kite_is_live:
+        all_recs = [r for r in all_recs if r.get("price_source") == "kite"]
 
     # Compute per-strategy expiry and add expiry info to recs and legs
     kite_connected = kite_service and kite_service.is_authenticated()

@@ -213,6 +213,19 @@ _CREATE_TABLE_STMTS = [
         kite_permission TEXT DEFAULT 'readonly',
         created_at TEXT DEFAULT (NOW())
     )""",
+    """CREATE TABLE IF NOT EXISTS manual_trades (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+        symbol TEXT NOT NULL, strategy_type TEXT NOT NULL,
+        tradingsymbol TEXT NOT NULL, action TEXT NOT NULL,
+        strike REAL, option_type TEXT, expiry_date TEXT,
+        entry_premium REAL NOT NULL, quantity INTEGER NOT NULL,
+        lots INTEGER DEFAULT 1, lot_size INTEGER,
+        entry_date TEXT DEFAULT (NOW()),
+        exit_premium REAL, exit_date TEXT,
+        status TEXT DEFAULT 'OPEN',
+        pnl REAL, notes TEXT,
+        rec_data TEXT
+    )""",
     """CREATE TABLE IF NOT EXISTS password_reset_tokens (
         id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
         token_hash TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER DEFAULT 0,
@@ -494,6 +507,58 @@ def mark_reset_token_used(token_id):
 def update_user_password(user_id, password_hash):
     conn = get_db()
     conn.execute("UPDATE users SET password_hash = %s WHERE id = %s", (password_hash, user_id))
+    conn.commit()
+
+
+# ─── Settings ────────────────────────────────────────────────────────────────
+
+# ─── Manual trade tracking ────────────────────────────────────────────────────
+
+def create_manual_trade(user_id, trade_data):
+    """Record a manually executed trade."""
+    conn = get_db()
+    trade_id = generate_id()
+    import json as _json
+    conn.execute(
+        "INSERT INTO manual_trades (id, user_id, symbol, strategy_type, tradingsymbol, action, "
+        "strike, option_type, expiry_date, entry_premium, quantity, lots, lot_size, status, rec_data) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s)",
+        (trade_id, user_id, trade_data["symbol"], trade_data["strategy_type"],
+         trade_data["tradingsymbol"], trade_data["action"],
+         trade_data.get("strike"), trade_data.get("option_type"), trade_data.get("expiry_date"),
+         trade_data["entry_premium"], trade_data["quantity"],
+         trade_data.get("lots", 1), trade_data.get("lot_size"),
+         _json.dumps(trade_data.get("rec_data")) if trade_data.get("rec_data") else None)
+    )
+    conn.commit()
+    return trade_id
+
+
+def get_open_manual_trades(user_id):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM manual_trades WHERE user_id = %s AND status = 'OPEN' ORDER BY entry_date DESC",
+        (user_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_manual_trades(user_id):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM manual_trades WHERE user_id = %s ORDER BY entry_date DESC",
+        (user_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def exit_manual_trade(trade_id, user_id, exit_premium, pnl=None, notes=None):
+    conn = get_db()
+    conn.execute(
+        "UPDATE manual_trades SET status='CLOSED', exit_premium=%s, exit_date=NOW(), pnl=%s, notes=%s "
+        "WHERE id=%s AND user_id=%s",
+        (exit_premium, pnl, notes, trade_id, user_id)
+    )
     conn.commit()
 
 

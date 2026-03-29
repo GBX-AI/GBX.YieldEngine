@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
   scan, getRecommendations, getArbitrage,
   setRiskProfile, getRiskProfile, getPermission, getStatus,
+  createManualTrade,
 } from '../api';
 import {
   Search, ChevronDown, ChevronUp, Lock, Unlock,
@@ -105,9 +106,9 @@ const Badge = ({ children, color, style = {} }) => (
 );
 
 /* ─── Metric cell ─── */
-const Metric = ({ label, value, color = C.text }) => (
+const Metric = ({ label, value, color = C.text, tooltip }) => (
   <div>
-    <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
+    <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4, cursor: tooltip ? 'help' : 'default' }} title={tooltip}>{label}</div>
     <div style={{ fontFamily: font.mono, fontSize: 14, fontWeight: 600, color }}>{value}</div>
   </div>
 );
@@ -120,6 +121,24 @@ function RecCard({ rec, idx, expanded, onToggle }) {
   const isCoveredCall = (rec.strategy || rec.strategy_type) === 'COVERED_CALL';
   const exitSug = rec.exit_suggestion;
   const charges = rec.charges_breakdown;
+
+  const handleMarkExecuted = async (r) => {
+    try {
+      await createManualTrade({
+        symbol: r.symbol,
+        strategy: r.strategy || r.strategy_type,
+        legs: r.legs,
+        net_premium: r.net_premium,
+        margin: r.margin_needed || r.margin,
+        expiry: r.expiry_display || r.expiry,
+        dte: r.dte,
+        exit_suggestion: r.exit_suggestion,
+      });
+      alert(`Trade for ${r.symbol} marked as executed.`);
+    } catch (e) {
+      alert(`Failed to mark trade: ${e.message}`);
+    }
+  };
 
   const deltaImpactColor = rec.delta_impact != null
     ? (Math.abs(rec.delta_impact) > 2 ? C.red : Math.abs(rec.delta_impact) > 1 ? C.amber : C.emerald)
@@ -181,11 +200,11 @@ function RecCard({ rec, idx, expanded, onToggle }) {
         gridTemplateColumns: 'repeat(5, 1fr)',
         gap: 12,
       }}>
-        <Metric label="Net Premium" value={fmtCur(rec.net_premium)} color={C.emerald} />
-        <Metric label="Max Loss" value={fmtCur(rec.max_loss)} color={C.red} />
-        <Metric label="Prob OTM" value={fmtPct(rec.prob_otm)} color={C.emerald} />
-        <Metric label="True Ann. Return" value={fmtPct(rec.annualized_return)} color={C.amber} />
-        <Metric label="Expiry" value={rec.expiry_display ? `${rec.expiry_display} (${rec.dte}d)` : rec.dte ? `${rec.dte}d` : '—'} color={C.muted} />
+        <Metric label="Net Premium" value={fmtCur(rec.net_premium)} color={C.emerald} tooltip="Total income after all charges (brokerage, STT, GST, exchange)" />
+        <Metric label="Max Loss" value={fmtCur(rec.max_loss)} color={C.red} tooltip="Maximum possible loss if option expires in-the-money" />
+        <Metric label="Prob OTM" value={fmtPct(rec.prob_otm)} color={C.emerald} tooltip="Probability the option expires out-of-the-money (worthless) — you keep the premium" />
+        <Metric label="True Ann. Return" value={fmtPct(rec.annualized_return)} color={C.amber} tooltip="Net premium annualized as % of margin, after all charges" />
+        <Metric label="Expiry" value={rec.expiry_display ? `${rec.expiry_display} (${rec.dte}d)` : rec.dte ? `${rec.dte}d` : '—'} color={C.muted} tooltip="Option expiry date from NSE (includes holiday adjustments)" />
       </div>
 
       {/* ── Metrics Row 2 ── */}
@@ -195,19 +214,20 @@ function RecCard({ rec, idx, expanded, onToggle }) {
         gridTemplateColumns: 'repeat(4, 1fr)',
         gap: 12,
       }}>
-        <Metric label="Theta/Day" value={rec.theta_per_day_rupees != null ? fmtCur(rec.theta_per_day_rupees) : '—'} color={C.blue} />
+        <Metric label="Theta/Day" value={rec.theta_per_day_rupees != null ? fmtCur(rec.theta_per_day_rupees) : '—'} color={C.blue} tooltip="Daily time decay in rupees — amount you earn each day from theta" />
         <Metric
-          label="Margin (% of Free)"
-          value={rec.margin_pct_of_available != null ? fmtPct(rec.margin_pct_of_available) : '—'}
+          label="Margin Required"
+          value={rec.margin_needed || rec.margin ? `${fmtCur(rec.margin_needed || rec.margin)} (${rec.margin_pct_of_available != null ? `${rec.margin_pct_of_available}%` : '—'})` : '—'}
           color={rec.capital_warning ? C.red : C.text}
+          tooltip="Estimated margin required to hold this position"
         />
         <div>
-          <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Delta Impact</div>
+          <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4, cursor: 'help' }} title="How this trade affects your portfolio's directional exposure">Delta Impact</div>
           <Badge color={deltaImpactColor} style={{ fontSize: 13 }}>
             {rec.delta_impact === 'REDUCES_DELTA' ? 'Reduces' : rec.delta_impact === 'ADDS_DELTA' ? 'Adds' : rec.delta_impact || '—'}
           </Badge>
         </div>
-        <Metric label="R:R Ratio" value={rec.risk_reward_ratio != null ? `1:${Number(rec.risk_reward_ratio).toFixed(1)}` : '—'} color={C.text} />
+        <Metric label="R:R Ratio" value={rec.risk_reward_ratio != null ? `1:${Number(rec.risk_reward_ratio).toFixed(1)}` : '—'} color={C.text} tooltip="Risk to reward — ratio of max profit to max loss" />
       </div>
 
       {/* ── Trade Legs (always visible) ── */}
@@ -218,8 +238,9 @@ function RecCard({ rec, idx, expanded, onToggle }) {
             {rec.legs.map((leg, li) => {
               const action = (leg.action || leg.side || '').toUpperCase();
               const isSell = action === 'SELL';
-              const instrument = leg.instrument || `${rec.symbol} ${leg.strike} ${leg.option_type || ''}`;
-              const expiryPart = leg.expiry_display ? ` ${leg.expiry_display}` : '';
+              const hasTradingSymbol = !!leg.tradingsymbol;
+              const instrument = leg.tradingsymbol || leg.instrument || `${rec.symbol} ${leg.strike} ${leg.option_type || ''}`;
+              const expiryPart = hasTradingSymbol ? '' : (leg.expiry_display ? ` ${leg.expiry_display}` : '');
               const lotsLabel = rec.lots ? ` (${rec.lots} lot${rec.lots > 1 ? 's' : ''})` : '';
               return (
                 <div key={li} style={{
@@ -261,8 +282,8 @@ function RecCard({ rec, idx, expanded, onToggle }) {
             border: `1px solid rgba(56,189,248,0.15)`,
             fontSize: 13, color: C.blue, lineHeight: 1.6,
           }}>
-            Target: Exit by <strong>{exitSug.target_exit_date || '—'}</strong> or when premium reaches <strong>{fmtCur(exitSug.target_exit_premium)}</strong>
-            {exitSug.notes ? ` (${exitSug.notes})` : ''}
+            Target: Exit by <strong>{exitSug.target_exit_date || '—'}</strong> or buy back at <strong>{fmtCur(exitSug.target_exit_premium)}/share</strong>
+            {exitSug.notes && <div style={{ marginTop: 4, fontSize: 12, opacity: 0.85 }}>{exitSug.notes}</div>}
           </div>
           {exitSug.gamma_warning && (
             <div style={{
@@ -276,6 +297,23 @@ function RecCard({ rec, idx, expanded, onToggle }) {
           )}
         </div>
       )}
+
+      {/* ── Mark as Executed ── */}
+      <div style={{ padding: '0 24px 16px' }}>
+        <button
+          onClick={() => handleMarkExecuted(rec)}
+          style={{
+            ...btnBase,
+            padding: '10px 20px',
+            fontSize: 13,
+            background: `${C.emerald}15`,
+            color: C.emerald,
+            border: `1px solid ${C.emerald}30`,
+          }}
+        >
+          Mark as Executed
+        </button>
+      </div>
 
       {/* ── Price Source (always visible) ── */}
       <div style={{ padding: '0 24px 8px', display: 'flex', gap: 12, fontSize: 11, fontFamily: font.mono, color: C.muted }}>

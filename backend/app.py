@@ -1238,6 +1238,45 @@ def create_app():
         alerts = exit_monitor.check_positions(kite)
         return jsonify({"alerts": alerts, "count": len(alerts)})
 
+    # ─── MANUAL TRADE TRACKING ──────────────────────────────────
+
+    @app.route("/api/trades/manual", methods=["GET"])
+    @require_auth
+    def api_get_manual_trades():
+        user_id = g.current_user["id"]
+        from models import get_all_manual_trades
+        trades = get_all_manual_trades(user_id)
+        open_trades = [t for t in trades if t.get("status") == "OPEN"]
+        closed_trades = [t for t in trades if t.get("status") == "CLOSED"]
+        return jsonify({"trades": trades, "open": open_trades, "closed": closed_trades})
+
+    @app.route("/api/trades/manual", methods=["POST"])
+    @require_auth
+    def api_create_manual_trade():
+        """Mark a recommendation as executed."""
+        user_id = g.current_user["id"]
+        data = request.json or {}
+        required = ["symbol", "strategy_type", "tradingsymbol", "action", "entry_premium", "quantity"]
+        for field in required:
+            if not data.get(field):
+                return jsonify({"error": f"{field} is required"}), 400
+        from models import create_manual_trade
+        trade_id = create_manual_trade(user_id, data)
+        return jsonify({"trade_id": trade_id, "status": "OPEN", "message": "Trade recorded"}), 201
+
+    @app.route("/api/trades/manual/<trade_id>/exit", methods=["POST"])
+    @require_auth
+    def api_exit_manual_trade(trade_id):
+        """Mark a trade as exited."""
+        user_id = g.current_user["id"]
+        data = request.json or {}
+        exit_premium = data.get("exit_premium", 0)
+        pnl = data.get("pnl")
+        notes = data.get("notes")
+        from models import exit_manual_trade
+        exit_manual_trade(trade_id, user_id, exit_premium, pnl, notes)
+        return jsonify({"status": "CLOSED", "message": "Trade closed"})
+
     @app.route("/api/positions/<pid>/adjustments", methods=["GET"])
     @require_auth
     def api_position_adjustments(pid):

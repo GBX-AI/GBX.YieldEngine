@@ -177,5 +177,10 @@ export const kiteStatus = () => request('/api/kite/status');
 export const kiteDisconnect = () => request('/api/kite/disconnect', { method: 'POST' });
 export const kiteSaveCredentials = (apiKey, apiSecret, permission = 'readonly') => request('/api/kite/credentials', { method: 'POST', body: JSON.stringify({ api_key: apiKey, api_secret: apiSecret, permission }) });
 
+// Manual Trade Tracking
+export const getManualTrades = () => request('/api/trades/manual');
+export const createManualTrade = (data) => request('/api/trades/manual', { method: 'POST', body: JSON.stringify(data) });
+export const exitManualTrade = (id, data) => request(`/api/trades/manual/${id}/exit`, { method: 'POST', body: JSON.stringify(data) });
+
 // Auth
 export const authMe = () => request('/api/auth/me');
