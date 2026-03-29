@@ -122,21 +122,35 @@ function RecCard({ rec, idx, expanded, onToggle }) {
   const exitSug = rec.exit_suggestion;
   const charges = rec.charges_breakdown;
 
+  const [executed, setExecuted] = useState(false);
+  const [executing, setExecuting] = useState(false);
+
   const handleMarkExecuted = async (r) => {
+    setExecuting(true);
     try {
+      const leg = r.legs?.[0] || {};
       await createManualTrade({
         symbol: r.symbol,
-        strategy: r.strategy || r.strategy_type,
-        legs: r.legs,
-        net_premium: r.net_premium,
-        margin: r.margin_needed || r.margin,
-        expiry: r.expiry_display || r.expiry,
-        dte: r.dte,
-        exit_suggestion: r.exit_suggestion,
+        strategy_type: r.strategy || r.strategy_type,
+        tradingsymbol: leg.tradingsymbol || `${r.symbol}${r.expiry_display}${leg.strike}${leg.option_type}`,
+        action: leg.action || 'SELL',
+        strike: leg.strike,
+        option_type: leg.option_type,
+        expiry_date: r.expiry_date || r.expiry,
+        entry_premium: leg.premium || 0,
+        quantity: leg.quantity || 0,
+        lots: r.lots || 1,
+        lot_size: r.lot_size,
+        rec_data: {
+          net_premium: r.net_premium,
+          margin: r.margin_needed || r.margin,
+          exit_suggestion: r.exit_suggestion,
+          charges: r.total_charges,
+        },
       });
-      alert(`Trade for ${r.symbol} marked as executed.`);
+      setExecuted(true);
     } catch (e) {
-      alert(`Failed to mark trade: ${e.message}`);
+      setExecuting(false);
     }
   };
 
@@ -306,19 +320,23 @@ function RecCard({ rec, idx, expanded, onToggle }) {
 
       {/* ── Mark as Executed ── */}
       <div style={{ padding: '0 24px 16px' }}>
-        <button
-          onClick={() => handleMarkExecuted(rec)}
-          style={{
-            ...btnBase,
-            padding: '10px 20px',
-            fontSize: 13,
-            background: `${C.emerald}15`,
-            color: C.emerald,
-            border: `1px solid ${C.emerald}30`,
-          }}
-        >
-          Mark as Executed
-        </button>
+        <label style={{
+          display: 'inline-flex', alignItems: 'center', gap: 10, cursor: executed ? 'default' : 'pointer',
+          padding: '8px 16px', borderRadius: 10,
+          background: executed ? 'rgba(110,231,183,0.12)' : 'rgba(148,163,184,0.06)',
+          border: `1px solid ${executed ? 'rgba(110,231,183,0.3)' : C.border}`,
+          fontSize: 13, fontWeight: 500, color: executed ? C.emerald : C.muted,
+          opacity: executing ? 0.6 : 1,
+        }}>
+          <input
+            type="checkbox"
+            checked={executed}
+            disabled={executed || executing}
+            onChange={() => !executed && handleMarkExecuted(rec)}
+            style={{ accentColor: C.emerald, width: 16, height: 16, cursor: 'pointer' }}
+          />
+          {executed ? 'Executed — Tracking this trade' : executing ? 'Saving...' : 'I executed this trade'}
+        </label>
       </div>
 
       {/* ── Price Source (always visible) ── */}

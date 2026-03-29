@@ -87,12 +87,24 @@ def get_available_expiries(kite_service, symbol):
     return sorted(expiries)
 
 
-def get_nearest_expiry(kite_service, symbol):
-    """Get the nearest available expiry for a symbol."""
+def get_nearest_expiry(kite_service, symbol, min_dte=2):
+    """Get the nearest available expiry for a symbol with at least min_dte days.
+    On weekends, min_dte=0 so we show next week's options for analysis."""
     expiries = get_available_expiries(kite_service, symbol)
+    today = date.today()
+    is_weekend = today.weekday() >= 5  # Sat=5, Sun=6
+
+    # On weekends, show all future expiries (traders analyze over weekend)
+    effective_min_dte = 0 if is_weekend else min_dte
+
+    for exp in expiries:
+        dte = (exp - today).days
+        if dte >= effective_min_dte:
+            return exp
+
+    # If all expiries are too close, return the last one anyway
     if expiries:
-        return expiries[0]
-    # No expiries found — return next Thursday as a reasonable fallback
+        return expiries[-1]
     return _next_thursday()
 
 

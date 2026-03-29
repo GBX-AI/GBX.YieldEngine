@@ -1391,21 +1391,8 @@ def scan_strategies(
     # Filter out negative premium strategies
     all_recs = [r for r in all_recs if r.get("premium_income", 0) > 0]
 
-    # Filter out expired or near-expired options
-    # DTE <= 1 on weekends/holidays means already expired
-    today = date.today()
-    def _is_tradeable(rec):
-        dte = rec.get("dte", 0)
-        if dte <= 0:
-            return False
-        # If DTE=1 and today is weekend (Sat/Sun), the option has effectively expired
-        if dte <= 1 and today.weekday() >= 5:  # 5=Sat, 6=Sun
-            return False
-        # Filter anything with less than 2 DTE (too close to expiry for new positions)
-        if dte < 2:
-            return False
-        return True
-    all_recs = [r for r in all_recs if _is_tradeable(r)]
+    # Filter out already expired options (DTE <= 0)
+    all_recs = [r for r in all_recs if r.get("dte", 0) > 0]
 
     # When Kite is connected, filter out simulation-only recs
     kite_is_live = kite_service and kite_service.is_authenticated()
