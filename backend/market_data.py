@@ -307,3 +307,104 @@ def _next_thursday():
     if days_ahead <= 0:
         days_ahead += 7
     return today + timedelta(days=days_ahead)
+
+
+# ─── Stock Screening for Strangle Strategy ────────────────────────────────────
+
+def get_52_week_high_low(kite_service, symbol):
+    """Get 52-week high and low for a symbol from Kite quote.
+    Returns {"high": float, "low": float, "current": float} or None."""
+    if not kite_service or not kite_service.is_authenticated():
+        return None
+    try:
+        key = f"NSE:{symbol}"
+        if symbol == "NIFTY":
+            key = "NSE:NIFTY 50"
+        elif symbol in ("BANKNIFTY", "NIFTYBANK"):
+            key = "NSE:NIFTY BANK"
+        quote = kite_service.get_quote([key])
+        q = list(quote.values())[0]
+        ohlc = q.get("ohlc", {})
+        return {
+            "high": q.get("week_52_high", ohlc.get("high", 0)),
+            "low": q.get("week_52_low", ohlc.get("low", 0)),
+            "current": q.get("last_price", 0),
+        }
+    except Exception:
+        return None
+
+
+def is_near_52_week_high(kite_service, symbol, threshold_pct=5):
+    """Check if stock is within threshold_pct% of 52-week high. Returns True if too close."""
+    data = get_52_week_high_low(kite_service, symbol)
+    if not data or not data["high"]:
+        return False  # Can't check, allow
+    distance_pct = ((data["high"] - data["current"]) / data["high"]) * 100
+    return distance_pct <= threshold_pct
+
+
+def get_fno_stock_list(kite_service):
+    """Get list of unique F&O eligible stock symbols from Kite instruments."""
+    instruments = get_nfo_instruments(kite_service)
+    if not instruments:
+        return []
+    stocks = set()
+    for inst in instruments:
+        name = inst.get("name", "").upper()
+        inst_type = inst.get("instrument_type", "")
+        if inst_type in ("CE", "PE") and name and name not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+            stocks.add(name)
+    return sorted(stocks)
+
+
+def get_strangle_chain(kite_service, symbol, expiry_date, spot, otm_pct=0.02):
+    """Find OTM call and put strikes for a strangle.
+
+    Args:
+        otm_pct: how far OTM (0.02 = 2% from spot)
+
+    Returns dict with CE and PE data or None.
+    """
+    chain = get_option_chain_live(kite_service, symbol, expiry_date, num_strikes=15)
+    if not chain or not chain.get("strikes"):
+        return None
+
+    target_ce_strike = spot * (1 + otm_pct)  # Call above spot
+    target_pe_strike = spot * (1 - otm_pct)  # Put below spot
+
+    best_ce = None
+    best_pe = None
+
+    for s in chain["strikes"]:
+        strike = s["strike"]
+        ce = s.get("CE")
+        pe = s.get("PE")
+
+        # Find nearest CE strike above target
+        if ce and strike >= target_ce_strike and ce.get("premium", 0) > 0:
+            if ce.get("oi", 0) >= 100:
+                if best_ce is None or strike < best_ce["strike"]:
+                    best_ce = {**ce, "strike": strike}
+
+        # Find nearest PE strike below target
+        if pe and strike <= target_pe_strike and pe.get("premium", 0) > 0:
+            if pe.get("oi", 0) >= 100:
+                if best_pe is None or strike > best_pe["strike"]:
+                    best_pe = {**pe, "strike": strike}
+
+    if not best_ce or not best_pe:
+        return None
+
+    return {
+        "spot": chain["spot"],
+        "lot_size": chain["lot_size"],
+        "expiry": chain["expiry"],
+        "expiry_display": chain["expiry_display"],
+        "dte": chain["dte"],
+        "ce": best_ce,
+        "pe": best_pe,
+        "combined_premium": best_ce["premium"] + best_pe["premium"],
+        "combined_premium_pct": round(((best_ce["premium"] + best_pe["premium"]) / spot) * 100, 2),
+        "ce_premium_pct": round((best_ce["premium"] / best_ce["strike"]) * 100, 2),
+        "pe_premium_pct": round((best_pe["premium"] / best_pe["strike"]) * 100, 2),
+    }

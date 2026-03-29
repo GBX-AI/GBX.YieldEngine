@@ -37,7 +37,7 @@ from datetime import date
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-STRATEGY_TYPES = ("COVERED_CALL", "CASH_SECURED_PUT", "PUT_CREDIT_SPREAD", "COLLAR")
+STRATEGY_TYPES = ("COVERED_CALL", "CASH_SECURED_PUT", "PUT_CREDIT_SPREAD", "COLLAR", "SHORT_STRANGLE")
 
 SAFETY_TAGS = ("VERY_SAFE", "SAFE", "MODERATE", "AGGRESSIVE")
 
@@ -1306,6 +1306,156 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
     return recs
 
 
+# ─── Short Strangle Scanner (Strategy 1 from Trade Strategy doc) ──────────────
+
+def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_service=None) -> list:
+    """
+    Scan for OTM Short Strangle opportunities on F&O stocks.
+
+    Strategy: Sell OTM Call (spot+2%) + OTM Put (spot-2%) on the same stock.
+    Filters from trade strategy document:
+    - CE or PE premium >= 2.5% of strike price
+    - Combined CE+PE premium >= 4% of spot price
+    - Avoid stocks within 5% of 52-week high
+    - Monthly expiry only (stocks don't have weekly)
+    """
+    recs = []
+    kite_connected = kite_service and kite_service.is_authenticated()
+
+    if not kite_connected:
+        return recs  # Need real market data for strangles
+
+    # Get all F&O stocks
+    fno_stocks = market_data.get_fno_stock_list(kite_service)
+    if not fno_stocks:
+        return recs
+
+    # Limit to reasonable number to avoid timeout
+    # Prioritize stocks the user holds
+    max_stocks = 30
+
+    target_delta = float(settings.get("manual_target_delta_puts", 0.20))
+
+    for symbol in fno_stocks[:max_stocks]:
+        try:
+            # Check 52-week high filter
+            if market_data.is_near_52_week_high(kite_service, symbol, threshold_pct=5):
+                continue
+
+            # Get nearest monthly expiry
+            expiry_date = market_data.get_nearest_expiry(kite_service, symbol)
+            if not expiry_date:
+                continue
+
+            actual_dte = max(1, (expiry_date - date.today()).days)
+            if actual_dte <= 0:
+                continue
+
+            # Get spot price
+            try:
+                spot_data = kite_service.get_ltp([f"NSE:{symbol}"])
+                spot = list(spot_data.values())[0]["last_price"]
+            except Exception:
+                continue
+
+            if not spot or spot <= 0:
+                continue
+
+            # Get strangle chain (2% OTM on each side)
+            strangle = market_data.get_strangle_chain(kite_service, symbol, expiry_date, spot, otm_pct=0.02)
+            if not strangle:
+                continue
+
+            ce = strangle["ce"]
+            pe = strangle["pe"]
+            lot_size = strangle["lot_size"]
+
+            # Filter: CE or PE premium >= 2.5% of strike
+            if ce["premium"] / ce["strike"] < 0.025 and pe["premium"] / pe["strike"] < 0.025:
+                continue
+
+            # Filter: Combined premium >= 4% of spot
+            if strangle["combined_premium_pct"] < 4.0:
+                continue
+
+            # Calculate greeks for both legs
+            T = max(actual_dte, 1) / 365.0
+            iv_estimate = 0.25  # Default IV estimate
+            ce_greeks = compute_greeks(spot, ce["strike"], T, RISK_FREE_RATE, iv_estimate, "CE")
+            pe_greeks = compute_greeks(spot, pe["strike"], T, RISK_FREE_RATE, iv_estimate, "PE")
+
+            total_premium = (ce["premium"] + pe["premium"]) * lot_size
+            margin_needed = spot * lot_size * 0.20  # ~20% for naked strangle
+
+            prob_otm_combined = ce_greeks["prob_otm"] * pe_greeks["prob_otm"]  # Both expire OTM
+            theta_day = (ce_greeks["theta"] + pe_greeks["theta"]) * lot_size
+            net_delta = ce_greeks["delta"] + pe_greeks["delta"]
+
+            # Safety classification
+            otm_pct = min(
+                (ce["strike"] - spot) / spot,
+                (spot - pe["strike"]) / spot
+            )
+            safety_tag = classify_safety(prob_otm_combined, otm_pct)
+
+            if not passes_risk_filter(safety_tag, settings["risk_profile"]):
+                continue
+
+            ann_return = _annualized_return(total_premium, margin_needed, actual_dte)
+
+            legs = [
+                _build_leg("SELL", ce["strike"], ce["premium"], lot_size, "CE",
+                          tradingsymbol=ce.get("tradingsymbol")),
+                _build_leg("SELL", pe["strike"], pe["premium"], lot_size, "PE",
+                          tradingsymbol=pe.get("tradingsymbol")),
+            ]
+
+            # BEP points
+            bep_upper = ce["strike"] + strangle["combined_premium"]
+            bep_lower = pe["strike"] - strangle["combined_premium"]
+
+            recs.append(_enrich_recommendation({
+                "id": generate_id(),
+                "rank": 0,
+                "symbol": symbol,
+                "strategy_type": "SHORT_STRANGLE",
+                "strike": ce["strike"],  # Show CE strike as primary
+                "put_strike": pe["strike"],
+                "option_type": "CE+PE",
+                "legs": legs,
+                "premium_income": round(total_premium, 2),
+                "margin_needed": round(margin_needed, 2),
+                "max_loss": round(margin_needed * 2, 2),  # Undefined for strangle, estimate
+                "prob_otm": round(prob_otm_combined, 4),
+                "delta": round(net_delta, 4),
+                "annualized_return": round(ann_return, 4),
+                "theta_per_day": round(theta_day, 2),
+                "safety_tag": safety_tag,
+                "strike_rationale": (
+                    f"SHORT_STRANGLE: CE {ce['strike']} ({strangle['ce_premium_pct']:.1f}% of strike) + "
+                    f"PE {pe['strike']} ({strangle['pe_premium_pct']:.1f}% of strike). "
+                    f"Combined {strangle['combined_premium_pct']:.1f}% of spot. "
+                    f"BEP: {bep_lower:.0f} — {bep_upper:.0f}"
+                ),
+                "alternatives": {},
+                "fee_estimate": _fee_estimate(legs),
+                "dte": actual_dte,
+                "lots": 1,
+                "lot_size": lot_size,
+                "spot": spot,
+                "bep_upper": round(bep_upper, 2),
+                "bep_lower": round(bep_lower, 2),
+                "combined_premium_pct": strangle["combined_premium_pct"],
+                "price_source": "kite",
+                "fetched_at": datetime.now().isoformat(),
+            }))
+
+        except Exception:
+            continue  # Skip any stock that errors
+
+    return recs
+
+
 # ─── Ranking ──────────────────────────────────────────────────────────────────
 
 def rank_recommendations(recs: list) -> list:
@@ -1421,6 +1571,9 @@ def scan_strategies(
             for exp in _get_expiries_for(sym):
                 exp_dte = max(1, (exp - date.today()).days) if exp else dte
                 all_recs.extend(_scan_collars([holding], resolved, exp_dte, kite_service=kite_service))
+
+    if "SHORT_STRANGLE" in allowed:
+        all_recs.extend(_scan_short_strangles(cash_balance, resolved, dte, kite_service=kite_service))
 
     # Filter out negative premium strategies
     all_recs = [r for r in all_recs if r.get("premium_income", 0) > 0]
