@@ -238,9 +238,10 @@ function RecCard({ rec, idx, expanded, onToggle }) {
             {rec.legs.map((leg, li) => {
               const action = (leg.action || leg.side || '').toUpperCase();
               const isSell = action === 'SELL';
-              const hasTradingSymbol = !!leg.tradingsymbol;
-              const instrument = leg.tradingsymbol || leg.instrument || `${rec.symbol} ${leg.strike} ${leg.option_type || ''}`;
-              const expiryPart = hasTradingSymbol ? '' : (leg.expiry_display ? ` ${leg.expiry_display}` : '');
+              // Show human-readable: "NIFTY 27 MAR 22300 PE" using expiry_display from rec
+              const expDisplay = leg.expiry_display || rec.expiry_display || '';
+              const instrument = `${rec.symbol} ${expDisplay} ${Math.round(leg.strike || 0)} ${leg.option_type || ''}`.trim();
+              const expiryPart = '';  // Already included in instrument
               const lotsLabel = rec.lots ? ` (${rec.lots} lot${rec.lots > 1 ? 's' : ''})` : '';
               return (
                 <div key={li} style={{
@@ -257,8 +258,13 @@ function RecCard({ rec, idx, expanded, onToggle }) {
                   }}>
                     {action}
                   </span>
-                  <span style={{ fontWeight: 600, fontSize: 14 }}>
-                    {instrument}{expiryPart}
+                  <span>
+                    <span style={{ fontWeight: 600, fontSize: 14 }}>{instrument}{expiryPart}</span>
+                    {leg.tradingsymbol && (
+                      <span style={{ fontSize: 10, color: C.muted, marginLeft: 8, fontFamily: font.mono }}>
+                        ({leg.tradingsymbol})
+                      </span>
+                    )}
                   </span>
                   <span style={{ fontFamily: font.mono, fontSize: 13, color: C.muted }}>
                     Qty: {leg.quantity}{lotsLabel}
