@@ -893,6 +893,20 @@ def create_app():
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+    # ─── SENTIMENT ─────────────────────────────────────────────
+
+    @app.route("/api/sentiment", methods=["GET"])
+    @require_auth
+    def api_sentiment():
+        """Get current market sentiment — morning briefing data."""
+        user_id = g.current_user["id"]
+        kite = get_kite_for_user(user_id)
+        import sentiment_engine
+        sentiment = sentiment_engine.get_sentiment(kite)
+        return jsonify(sentiment)
+
+    # ─── PRICE REFRESH ────────────────────────────────────────
+
     @app.route("/api/scan/refresh-prices", methods=["POST"])
     @require_auth
     def api_scan_refresh_prices():

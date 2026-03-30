@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { TrendingUp, TrendingDown, Activity, Search, Download, Eye } from 'lucide-react';
-import { getAnalyticsSummary, getAnalyticsMonthly, getPositions, getDailySummary, getNotifications, scan, getHoldings } from '../api';
+import { getAnalyticsSummary, getAnalyticsMonthly, getPositions, getDailySummary, getNotifications, scan, getHoldings, getSentiment } from '../api';
 
 const c = {
   bg: '#0a0f1a',
@@ -178,6 +178,7 @@ export default function Dashboard() {
   const [daily, setDaily] = useState(null);
   const [notifications, setNotifications] = useState([]);
   const [portfolio, setPortfolio] = useState(null);
+  const [sentiment, setSentiment] = useState(null);
   const [scanning, setScanning] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -185,13 +186,14 @@ export default function Dashboard() {
     let mounted = true;
     const load = async () => {
       try {
-        const [sumRes, monthRes, posRes, dailyRes, notifRes, holdRes] = await Promise.allSettled([
+        const [sumRes, monthRes, posRes, dailyRes, notifRes, holdRes, sentRes] = await Promise.allSettled([
           getAnalyticsSummary(),
           getAnalyticsMonthly(),
           getPositions(),
           getDailySummary(),
           getNotifications(),
           getHoldings(),
+          getSentiment().catch(() => null),
         ]);
         if (!mounted) return;
         if (sumRes.status === 'fulfilled') setSummary(sumRes.value);
@@ -209,6 +211,7 @@ export default function Dashboard() {
           setNotifications(n.slice(0, 5));
         }
         if (holdRes.status === 'fulfilled') setPortfolio(holdRes.value?.summary ?? null);
+        if (sentRes.status === 'fulfilled' && sentRes.value) setSentiment(sentRes.value);
       } catch { /* silent */ }
       if (mounted) setLoading(false);
     };
@@ -266,6 +269,67 @@ export default function Dashboard() {
 
   return (
     <div style={s.page}>
+      {/* Morning Briefing Card */}
+      {sentiment && (
+        <div style={{
+          ...s.card, marginBottom: 24,
+          borderLeft: `4px solid ${sentiment.color}`,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+            <div style={{
+              width: 12, height: 12, borderRadius: '50%',
+              background: sentiment.color,
+              boxShadow: `0 0 8px ${sentiment.color}60`,
+            }} />
+            <div style={{ fontSize: 16, fontWeight: 700, color: sentiment.color }}>
+              Market Sentiment: {sentiment.signal}
+            </div>
+            <div style={{ fontSize: 12, color: c.muted, fontFamily: mono, marginLeft: 'auto' }}>
+              Score: {sentiment.score}/100
+            </div>
+          </div>
+
+          <div style={{ fontSize: 13, color: c.text, marginBottom: 16, lineHeight: 1.6 }}>
+            {sentiment.summary}
+          </div>
+
+          {/* Factor rows */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+            {(sentiment.factors || []).map((f, i) => (
+              <div key={i} style={{
+                padding: '10px 14px', borderRadius: 10,
+                background: f.signal === 'GREEN' ? 'rgba(110,231,183,0.06)' :
+                  f.signal === 'RED' ? 'rgba(248,113,113,0.06)' : 'rgba(252,211,77,0.06)',
+                border: `1px solid ${f.signal === 'GREEN' ? 'rgba(110,231,183,0.15)' :
+                  f.signal === 'RED' ? 'rgba(248,113,113,0.15)' : 'rgba(252,211,77,0.15)'}`,
+              }}>
+                <div style={{ fontSize: 11, color: c.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>
+                  {f.name}
+                </div>
+                <div style={{ fontSize: 14, fontWeight: 600, fontFamily: mono,
+                  color: f.signal === 'GREEN' ? c.emerald : f.signal === 'RED' ? c.red : c.amber,
+                }}>
+                  {f.value}
+                </div>
+                {f.details && (
+                  <div style={{ marginTop: 6, fontSize: 11, color: c.muted }}>
+                    {Object.entries(f.details).map(([k, v]) => (
+                      <div key={k}>{k}: <span style={{ fontFamily: mono }}>{v}</span></div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {sentiment.fetched_at && (
+            <div style={{ marginTop: 12, fontSize: 11, color: c.muted, fontFamily: mono }}>
+              Updated: {new Date(sentiment.fetched_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })} IST
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Portfolio Overview */}
       {portfolioCards.length > 0 && (
         <>
