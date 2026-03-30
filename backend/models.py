@@ -74,7 +74,7 @@ DEFAULT_SETTINGS = {
     "auto_gtt_on_entry": "true",
     "intraday_drop_alert_pct": "1.5",
     "close_itm_before_expiry": "true",
-    "allowed_strategies": "COVERED_CALL,CASH_SECURED_PUT,PUT_CREDIT_SPREAD,COLLAR,SHORT_STRANGLE,IRON_CONDOR,CASH_FUTURES_ARB",
+    "allowed_strategies": "COVERED_CALL,CASH_SECURED_PUT,PUT_CREDIT_SPREAD,COLLAR,SHORT_STRANGLE,IRON_CONDOR,RSI_OPTION_SELL,CASH_FUTURES_ARB",
 }
 
 

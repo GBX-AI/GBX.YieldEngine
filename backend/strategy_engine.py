@@ -37,7 +37,7 @@ from datetime import date
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-STRATEGY_TYPES = ("COVERED_CALL", "CASH_SECURED_PUT", "PUT_CREDIT_SPREAD", "COLLAR", "SHORT_STRANGLE", "ATM_SHORT_STRANGLE", "IRON_CONDOR")
+STRATEGY_TYPES = ("COVERED_CALL", "CASH_SECURED_PUT", "PUT_CREDIT_SPREAD", "COLLAR", "SHORT_STRANGLE", "ATM_SHORT_STRANGLE", "IRON_CONDOR", "RSI_OPTION_SELL")
 
 SAFETY_TAGS = ("VERY_SAFE", "SAFE", "MODERATE", "AGGRESSIVE")
 
@@ -378,17 +378,19 @@ def _calculate_exit_suggestion(rec: dict) -> dict:
     # So it's the total theta for the whole position, not per-share
     theta_rupees = round(abs(theta_per_day), 2) if theta_per_day else 0
 
-    # Exit rules
-    target_exit_pct = 50  # Standard: exit at 50% profit
-    # Calculate per-share exit premium target (50% of entry per-share premium)
+    # Exit rules — RSI trades use 30% decay target, others 50%
+    custom_exit_pct = rec.get("exit_at_decay_pct")
+    target_exit_pct = custom_exit_pct if custom_exit_pct else 50
+    # Calculate per-share exit premium target
     # Find the sell leg's per-share premium for the exit target
     sell_premium_per_share = 0
     for leg in rec.get("legs", []):
         if (leg.get("action") or "").upper() == "SELL":
             sell_premium_per_share = leg.get("premium", 0)
             break
-    target_exit_premium_per_share = round(sell_premium_per_share * 0.5, 2)
-    target_exit_premium_total = round(net_premium * 0.5, 2) if net_premium > 0 else 0
+    decay_factor = (100 - target_exit_pct) / 100  # 50% target → 0.5 decay, 30% target → 0.7 decay
+    target_exit_premium_per_share = round(sell_premium_per_share * decay_factor, 2)
+    target_exit_premium_total = round(net_premium * decay_factor, 2) if net_premium > 0 else 0
 
     if dte <= 7:
         # Weekly: exit at 50% or Thursday EOD
@@ -1670,6 +1672,155 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
     return recs
 
 
+# ─── RSI-Based Option Selling (Strategy 6B from Trade Strategy doc) ───────────
+
+def _scan_rsi_option_sells(cash_balance: float, settings: dict, dte: int, kite_service=None) -> list:
+    """
+    Scan for RSI-based option selling opportunities.
+
+    Strategy 6B from Trade Strategy doc:
+    - RSI > 70 (overbought) → Sell Call (expect reversal down)
+    - RSI < 30 (oversold) → Sell Put (expect reversal up)
+    - Exit at 30% premium decay (not 50% like other strategies)
+    """
+    recs = []
+    kite_connected = kite_service and kite_service.is_authenticated()
+
+    if not kite_connected:
+        return recs
+
+    # Scan F&O stocks + indices for RSI extremes
+    symbols_to_scan = list(SIMULATION_INDICES.keys())
+    fno_stocks = market_data.get_fno_stock_list(kite_service)
+    symbols_to_scan.extend(fno_stocks[:20])  # Top 20 stocks
+
+    for symbol in symbols_to_scan:
+        try:
+            rsi = market_data.calculate_rsi(kite_service, symbol)
+            signal = market_data.get_rsi_signal(rsi)
+
+            if not signal or signal["action"] is None:
+                continue  # RSI in neutral range, skip
+
+            opt_type = signal["option_type"]  # CE or PE
+
+            # Get expiry
+            expiry_date = market_data.get_nearest_expiry(kite_service, symbol)
+            if not expiry_date:
+                continue
+            actual_dte = max(1, (expiry_date - date.today()).days)
+            if actual_dte <= 0:
+                continue
+
+            # Get spot
+            try:
+                spot_key = f"NSE:{symbol}"
+                if symbol == "NIFTY":
+                    spot_key = "NSE:NIFTY 50"
+                elif symbol in ("BANKNIFTY", "NIFTYBANK"):
+                    spot_key = "NSE:NIFTY BANK"
+                spot_data = kite_service.get_ltp([spot_key])
+                spot = list(spot_data.values())[0]["last_price"]
+            except Exception:
+                continue
+            if not spot:
+                continue
+
+            # Get option chain
+            chain = market_data.get_option_chain_live(kite_service, symbol, expiry_date, num_strikes=10)
+            if not chain or not chain.get("strikes"):
+                continue
+
+            lot_size = chain.get("lot_size", 1)
+
+            # Find 3% OTM strike for the direction
+            if opt_type == "CE":
+                target_strike = spot * 1.03
+            else:
+                target_strike = spot * 0.97
+
+            # Find best matching strike in chain
+            best = None
+            for s in chain["strikes"]:
+                opt = s.get(opt_type)
+                if not opt or opt.get("premium", 0) <= 0 or opt.get("oi", 0) < 100:
+                    continue
+                if opt_type == "CE" and s["strike"] >= target_strike:
+                    if best is None or s["strike"] < best[0]:
+                        best = (s["strike"], opt)
+                elif opt_type == "PE" and s["strike"] <= target_strike:
+                    if best is None or s["strike"] > best[0]:
+                        best = (s["strike"], opt)
+
+            if not best:
+                continue
+
+            strike, opt_data = best
+            premium = opt_data["premium"]
+
+            if premium <= 0:
+                continue
+
+            total_premium = premium * lot_size
+            T = actual_dte / 365.0
+            iv_est = 0.25
+
+            greeks = compute_greeks(spot, strike, T, RISK_FREE_RATE, iv_est, opt_type)
+            margin_needed = spot * lot_size * 0.15
+
+            otm_pct = abs(strike - spot) / spot
+            safety_tag = classify_safety(greeks["prob_otm"], otm_pct)
+
+            if not passes_risk_filter(safety_tag, settings["risk_profile"]):
+                continue
+
+            ann_return = _annualized_return(total_premium, margin_needed, actual_dte)
+
+            legs = [
+                _build_leg("SELL", strike, premium, lot_size, opt_type,
+                          tradingsymbol=opt_data.get("tradingsymbol")),
+            ]
+
+            recs.append(_enrich_recommendation({
+                "id": generate_id(),
+                "rank": 0,
+                "symbol": symbol,
+                "strategy_type": "RSI_OPTION_SELL",
+                "strike": strike,
+                "option_type": opt_type,
+                "legs": legs,
+                "premium_income": round(total_premium, 2),
+                "margin_needed": round(margin_needed, 2),
+                "max_loss": round(strike * lot_size, 2) if opt_type == "PE" else round(total_premium * 3, 2),
+                "prob_otm": round(greeks["prob_otm"], 4),
+                "delta": round(greeks["delta"], 4),
+                "annualized_return": round(ann_return, 4),
+                "theta_per_day": round(greeks["theta"] * lot_size, 2),
+                "safety_tag": safety_tag,
+                "strike_rationale": (
+                    f"RSI_SELL: {signal['label']}. "
+                    f"Sell {opt_type} at {strike} ({otm_pct*100:.1f}% OTM). "
+                    f"Exit at 30% premium decay (₹{premium*0.7:.2f}/share)."
+                ),
+                "alternatives": {},
+                "fee_estimate": _fee_estimate(legs),
+                "dte": actual_dte,
+                "lots": 1,
+                "lot_size": lot_size,
+                "spot": spot,
+                "rsi": rsi,
+                "rsi_signal": signal["signal"],
+                "exit_at_decay_pct": 30,  # Strategy 6B: exit at 30% decay (not 50%)
+                "price_source": "kite",
+                "fetched_at": datetime.now().isoformat(),
+            }))
+
+        except Exception:
+            continue
+
+    return recs
+
+
 # ─── Ranking ──────────────────────────────────────────────────────────────────
 
 def rank_recommendations(recs: list) -> list:
@@ -1795,6 +1946,9 @@ def scan_strategies(
             for exp in _get_expiries_for(idx):
                 exp_dte = max(1, (exp - date.today()).days) if exp else dte
                 all_recs.extend(_scan_iron_condors(cash_balance, resolved, exp_dte, kite_service=kite_service))
+
+    if "RSI_OPTION_SELL" in allowed:
+        all_recs.extend(_scan_rsi_option_sells(cash_balance, resolved, dte, kite_service=kite_service))
 
     # Filter out negative premium strategies
     all_recs = [r for r in all_recs if r.get("premium_income", 0) > 0]

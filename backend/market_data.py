@@ -301,6 +301,124 @@ def _fallback_expiries(symbol):
     return []
 
 
+# ─── RSI Calculation ──────────────────────────────────────────────────────────
+
+_rsi_cache = {"data": {}, "timestamp": 0}
+RSI_CACHE_TTL = 3600  # 1 hour — RSI doesn't change intraday much
+
+
+def calculate_rsi(kite_service, symbol, period=14):
+    """Calculate RSI for a symbol using Kite historical data (daily candles).
+    Returns RSI value (0-100) or None if unavailable."""
+    import time as _time
+
+    cache_key = f"{symbol}_{period}"
+    now = _time.time()
+    if cache_key in _rsi_cache["data"] and (now - _rsi_cache["timestamp"]) < RSI_CACHE_TTL:
+        return _rsi_cache["data"][cache_key]
+
+    if not kite_service or not kite_service.is_authenticated():
+        return None
+
+    try:
+        # Need instrument_token for historical data
+        instruments = get_nfo_instruments(kite_service)
+
+        # For stocks, get equity instrument token from NSE
+        # Try kite.ltp first to check the symbol works
+        quote_key = f"NSE:{symbol}"
+        if symbol == "NIFTY":
+            quote_key = "NSE:NIFTY 50"
+        elif symbol in ("BANKNIFTY", "NIFTYBANK"):
+            quote_key = "NSE:NIFTY BANK"
+
+        quote = kite_service.get_quote([quote_key])
+        if not quote:
+            return None
+
+        q = list(quote.values())[0]
+        instrument_token = q.get("instrument_token")
+        if not instrument_token:
+            return None
+
+        # Fetch last 30 days of daily candles (need period+1 extra for calculation)
+        from_date = (date.today() - timedelta(days=45)).strftime("%Y-%m-%d")
+        to_date = date.today().strftime("%Y-%m-%d")
+
+        history = kite_service._kite.historical_data(
+            instrument_token, from_date, to_date, "day"
+        )
+
+        if not history or len(history) < period + 1:
+            return None
+
+        # Extract closing prices
+        closes = [candle["close"] for candle in history]
+
+        # Calculate RSI
+        gains = []
+        losses = []
+        for i in range(1, len(closes)):
+            change = closes[i] - closes[i - 1]
+            gains.append(max(change, 0))
+            losses.append(max(-change, 0))
+
+        if len(gains) < period:
+            return None
+
+        # Initial averages
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+
+        # Smoothed averages (Wilder's method)
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+        if avg_loss == 0:
+            rsi = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi = round(100 - (100 / (1 + rs)), 1)
+
+        _rsi_cache["data"][cache_key] = rsi
+        _rsi_cache["timestamp"] = now
+        return rsi
+
+    except Exception:
+        return None
+
+
+def get_rsi_signal(rsi):
+    """Interpret RSI value for option selling.
+    Returns dict with signal, action, and option_type."""
+    if rsi is None:
+        return None
+    if rsi >= 70:
+        return {
+            "rsi": rsi,
+            "signal": "OVERBOUGHT",
+            "action": "SELL",
+            "option_type": "CE",
+            "label": f"RSI {rsi} — Overbought, sell calls",
+        }
+    if rsi <= 30:
+        return {
+            "rsi": rsi,
+            "signal": "OVERSOLD",
+            "action": "SELL",
+            "option_type": "PE",
+            "label": f"RSI {rsi} — Oversold, sell puts",
+        }
+    return {
+        "rsi": rsi,
+        "signal": "NEUTRAL",
+        "action": None,
+        "option_type": None,
+        "label": f"RSI {rsi} — Neutral range",
+    }
+
+
 def _next_thursday():
     today = date.today()
     days_ahead = 3 - today.weekday()
