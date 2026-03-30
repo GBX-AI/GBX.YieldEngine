@@ -2007,16 +2007,15 @@ def _scan_calendar_spreads(cash_balance: float, settings: dict, dte: int, kite_s
 
 def rank_recommendations(recs: list) -> list:
     """
-    Rank recommendations by safety first, then by annualized return (descending).
-
-    Safety ordering: VERY_SAFE > SAFE > MODERATE > AGGRESSIVE.
-    Within the same safety tier, higher annualized return ranks first.
+    Rank recommendations by safety first, then by risk-adjusted return.
+    When sentiment is RED, risk-adjusted return is used (penalizes risky trades).
+    Otherwise uses raw annualized return.
     """
     sorted_recs = sorted(
         recs,
         key=lambda r: (
-            SAFETY_TAG_ORDER.get(r["safety_tag"], 99),
-            -r["annualized_return"],
+            SAFETY_TAG_ORDER.get(r.get("safety_tag", "MODERATE"), 99),
+            -(r.get("risk_adjusted_return") or r.get("annualized_return", 0)),
         ),
     )
     for i, rec in enumerate(sorted_recs, start=1):
@@ -2197,11 +2196,40 @@ def scan_strategies(
             seen[key] = rec
     all_recs = deduped
 
-    # Add VIX info to each recommendation
+    # Fetch sentiment for risk adjustment
+    try:
+        import sentiment_engine
+        sentiment = sentiment_engine.get_sentiment(kite_service)
+        sentiment_signal = sentiment.get("signal", "YELLOW") if sentiment else "YELLOW"
+        sentiment_score = sentiment.get("score", 50) if sentiment else 50
+    except Exception:
+        sentiment_signal = "YELLOW"
+        sentiment_score = 50
+
+    # Risk adjustment factors
+    RISK_FACTOR = {"GREEN": 1.0, "YELLOW": 0.7, "RED": 0.4}
+    risk_factor = RISK_FACTOR.get(sentiment_signal, 0.7)
+
+    # Sentiment context notes per signal
+    SENTIMENT_NOTES = {
+        "GREEN": "Market conditions favourable — standard position sizing",
+        "YELLOW": "Mixed signals — proceed with caution, consider smaller size",
+        "RED": "Elevated risk — premiums are rich but volatility high. Use minimum lots.",
+    }
+
+    # Add VIX + sentiment info to each recommendation
     for rec in all_recs:
         rec["vix_at_scan"] = vix_value
         rec["vix_adjusted"] = bool(vix_value)
         rec["vix_signal"] = vix_signal
+        rec["sentiment_signal"] = sentiment_signal
+        rec["sentiment_score"] = sentiment_score
+
+        # Risk-adjusted annualized return
+        ann_return = rec.get("annualized_return", 0)
+        rec["risk_adjusted_return"] = round(ann_return * risk_factor, 2)
+        rec["risk_factor"] = risk_factor
+        rec["sentiment_note"] = SENTIMENT_NOTES.get(sentiment_signal, "")
 
     # Fetch real margins from Kite for sell legs (if connected)
     if kite_is_live:

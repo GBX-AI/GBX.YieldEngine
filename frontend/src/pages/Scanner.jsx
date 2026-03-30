@@ -113,7 +113,10 @@ const Badge = ({ children, color, style = {} }) => (
 /* ─── Metric cell ─── */
 const Metric = ({ label, value, color = C.text, tooltip }) => (
   <div>
-    <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4, cursor: tooltip ? 'help' : 'default' }} title={tooltip}>{label}</div>
+    <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4, cursor: tooltip ? 'help' : 'default' }} title={tooltip}>
+      {label}
+      {tooltip && <span style={{ marginLeft: 4, fontSize: 10, color: 'rgba(148,163,184,0.5)', cursor: 'help' }} title={tooltip}>&#9432;</span>}
+    </div>
     <div style={{ fontFamily: font.mono, fontSize: 14, fontWeight: 600, color }}>{value}</div>
   </div>
 );
@@ -222,7 +225,14 @@ function RecCard({ rec, idx, expanded, onToggle }) {
         <Metric label="Net Premium" value={fmtCur(rec.net_premium)} color={C.emerald} tooltip="Total income after all charges (brokerage, STT, GST, exchange)" />
         <Metric label="Max Loss" value={fmtCur(rec.max_loss)} color={C.red} tooltip="Maximum possible loss if option expires in-the-money" />
         <Metric label="Prob OTM" value={fmtPct(rec.prob_otm)} color={C.emerald} tooltip="Probability the option expires out-of-the-money (worthless) — you keep the premium" />
-        <Metric label="True Ann. Return" value={fmtPct(rec.annualized_return)} color={C.amber} tooltip="Net premium annualized as % of margin, after all charges" />
+        <Metric
+          label={rec.risk_adjusted_return != null && rec.risk_factor < 1 ? "Risk-Adj. Return" : "True Ann. Return"}
+          value={rec.risk_adjusted_return != null && rec.risk_factor < 1
+            ? `${fmtPct(rec.risk_adjusted_return)} (raw: ${fmtPct(rec.annualized_return)})`
+            : fmtPct(rec.annualized_return)}
+          color={C.amber}
+          tooltip={`Annualized return after charges${rec.risk_factor < 1 ? `. Adjusted by ${(rec.risk_factor * 100).toFixed(0)}% for ${rec.sentiment_signal || 'market'} sentiment` : ''}`}
+        />
         <Metric label="Expiry" value={rec.expiry_display ? `${rec.expiry_display} (${rec.dte}d)` : rec.dte ? `${rec.dte}d` : '—'} color={C.muted} tooltip="Option expiry date from NSE (includes holiday adjustments)" />
       </div>
 
@@ -241,7 +251,7 @@ function RecCard({ rec, idx, expanded, onToggle }) {
           tooltip="Estimated margin required to hold this position"
         />
         <div>
-          <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4, cursor: 'help' }} title="How this trade affects your portfolio's directional exposure">Delta Impact</div>
+          <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4, cursor: 'help' }} title="How this trade affects your portfolio's directional exposure">Delta Impact <span style={{ fontSize: 10, color: 'rgba(148,163,184,0.5)' }}>&#9432;</span></div>
           <Badge color={deltaImpactColor} style={{ fontSize: 13 }}>
             {rec.delta_impact === 'REDUCES_DELTA' ? 'Reduces' : rec.delta_impact === 'ADDS_DELTA' ? 'Adds' : rec.delta_impact || '—'}
           </Badge>
@@ -343,6 +353,17 @@ function RecCard({ rec, idx, expanded, onToggle }) {
           {executed ? 'Executed — Tracking this trade' : executing ? 'Saving...' : 'I executed this trade'}
         </label>
       </div>
+
+      {/* ── Sentiment Note (per card) ── */}
+      {rec.sentiment_note && (
+        <div style={{
+          padding: '4px 24px 8px', fontSize: 11, fontStyle: 'italic',
+          color: rec.sentiment_signal === 'RED' ? C.red : rec.sentiment_signal === 'GREEN' ? C.emerald : C.amber,
+        }}>
+          {rec.sentiment_signal === 'RED' ? '⚠ ' : rec.sentiment_signal === 'GREEN' ? '✓ ' : '◆ '}
+          {rec.sentiment_note}
+        </div>
+      )}
 
       {/* ── Price Source (always visible) ── */}
       <div style={{ padding: '0 24px 8px', display: 'flex', gap: 12, fontSize: 11, fontFamily: font.mono, color: C.muted }}>
