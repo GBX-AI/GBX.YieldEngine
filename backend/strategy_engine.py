@@ -32,7 +32,11 @@ import live_price_service
 import market_data
 import vix_service
 import portfolio_risk
-from datetime import date
+from datetime import date, timezone, timedelta as td
+
+_IST = timezone(td(hours=5, minutes=30))
+def _now_ist():
+    return datetime.now(_IST).isoformat()
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -566,7 +570,7 @@ def _enrich_recommendation(rec: dict) -> dict:
     if "price_source" not in rec:
         rec["price_source"] = "simulation"
     if "fetched_at" not in rec:
-        rec["fetched_at"] = datetime.now().isoformat()
+        rec["fetched_at"] = _now_ist()
 
     return rec
 
@@ -729,7 +733,7 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int, kite_service=N
             "unrealized_pnl": round((spot - avg_cost) * qty, 2),
             "source": "covered_call_from_holdings",
             "price_source": "kite" if use_real else "simulation",
-            "fetched_at": datetime.now().isoformat(),
+            "fetched_at": _now_ist(),
         }))
 
     return recs
@@ -873,7 +877,7 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_
             "lots": lots,
             "spot": spot,
             "price_source": "kite" if use_real else "simulation",
-            "fetched_at": datetime.now().isoformat(),
+            "fetched_at": _now_ist(),
         }))
 
     return recs
@@ -1030,7 +1034,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                             "spot": spot,
                             "spread_width": actual_width,
                             "price_source": "kite" if use_real else "simulation",
-                            "fetched_at": datetime.now().isoformat(),
+                            "fetched_at": _now_ist(),
                         }))
                         break  # First valid width
                 if use_real:
@@ -1114,7 +1118,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                     "spot": spot,
                     "spread_width": actual_width,
                     "price_source": "simulation",
-                    "fetched_at": datetime.now().isoformat(),
+                    "fetched_at": _now_ist(),
                 }))
 
                 # Only take the first valid width per index
@@ -1321,7 +1325,7 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
             "net_cost_per_unit": round(net_cost, 2),
             "unrealized_gain_pct": round(gain_pct * 100, 1),
             "price_source": "kite" if use_real else "simulation",
-            "fetched_at": datetime.now().isoformat(),
+            "fetched_at": _now_ist(),
         }))
 
     return recs
@@ -1476,7 +1480,7 @@ def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_se
                 "bep_lower": round(bep_lower, 2),
                 "combined_premium_pct": strangle["combined_premium_pct"],
                 "price_source": "kite",
-                "fetched_at": datetime.now().isoformat(),
+                "fetched_at": _now_ist(),
             }))
 
         except Exception:
@@ -1668,7 +1672,7 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                 "net_premium_per_share": round(net_premium_per_share, 2),
                 "put_spread_width": put_spread_width,
                 "price_source": "kite" if use_real else "simulation",
-                "fetched_at": datetime.now().isoformat(),
+                "fetched_at": _now_ist(),
             }))
 
         except Exception:
@@ -1817,7 +1821,7 @@ def _scan_rsi_option_sells(cash_balance: float, settings: dict, dte: int, kite_s
                 "rsi_signal": signal["signal"],
                 "exit_at_decay_pct": 30,  # Strategy 6B: exit at 30% decay (not 50%)
                 "price_source": "kite",
-                "fetched_at": datetime.now().isoformat(),
+                "fetched_at": _now_ist(),
             }))
 
         except Exception:
@@ -1990,7 +1994,7 @@ def _scan_calendar_spreads(cash_balance: float, settings: dict, dte: int, kite_s
                 "exit_at_profit_pct": 25,  # Strategy 4: exit at 25% profit
                 "exit_at_decay_pct": 40,   # Strategy 4: roll at 40% near decay
                 "price_source": "kite",
-                "fetched_at": datetime.now().isoformat(),
+                "fetched_at": _now_ist(),
             }))
 
         except Exception:

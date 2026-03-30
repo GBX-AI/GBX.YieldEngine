@@ -198,7 +198,10 @@ def generate_id():
 
 
 def now_iso():
-    return datetime.utcnow().isoformat()
+    """Return current IST time as ISO string."""
+    from datetime import timezone, timedelta
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist).isoformat()
 
 
 # ─── Table definitions (use %s placeholders, NOW() for timestamps) ───────────
