@@ -145,6 +145,47 @@ def get_sentiment(kite_service=None):
             "details": {k: f"{v['change_pct']:+.2f}%" for k, v in global_data.items()},
         })
 
+    # ── 5. US Economic Events ──
+    try:
+        import us_events
+        event_data = us_events.get_event_warnings()
+
+        if event_data and event_data.get("has_warning"):
+            # Event warnings override score
+            if event_data["warning_level"] == "RED":
+                score -= 30  # Strong negative override
+                factors.append({
+                    "name": "US Event WARNING",
+                    "value": event_data["warnings"][0]["message"] if event_data["warnings"] else "High-impact US event today",
+                    "signal": "RED",
+                    "weight": 40,
+                })
+            elif event_data["warning_level"] == "YELLOW":
+                score -= 10
+                factors.append({
+                    "name": "US Event Alert",
+                    "value": event_data["warnings"][0]["message"] if event_data["warnings"] else "High-impact US event approaching",
+                    "signal": "YELLOW",
+                    "weight": 20,
+                })
+
+            # Add recent surprise readings
+            for surprise in event_data.get("recent_surprises", [])[:2]:
+                if surprise["severity"] == "HIGH":
+                    s_signal = "GREEN" if surprise["surprise_direction"] == "POSITIVE" else "RED" if surprise["surprise_direction"] == "NEGATIVE" else "YELLOW"
+                    if s_signal == "RED":
+                        score -= 10
+                    elif s_signal == "GREEN":
+                        score += 5
+                    factors.append({
+                        "name": f"US {surprise['indicator']}",
+                        "value": surprise["interpretation"],
+                        "signal": s_signal,
+                        "weight": 15,
+                    })
+    except Exception:
+        pass  # US events are optional — don't crash sentiment
+
     # ── Determine overall signal ──
     score = max(0, min(100, score))
     if score >= 65:
@@ -172,6 +213,14 @@ def get_sentiment(kite_service=None):
     if detail_parts:
         summary += " — " + ", ".join(detail_parts)
 
+    # Get US events data for the result
+    us_event_warnings = None
+    try:
+        import us_events
+        us_event_warnings = us_events.get_event_warnings()
+    except Exception:
+        pass
+
     result = {
         "signal": overall_signal,
         "color": color,
@@ -182,6 +231,7 @@ def get_sentiment(kite_service=None):
         "vix": vix_data,
         "global_indices": global_data,
         "nifty_futures": futures_data,
+        "us_events": us_event_warnings,
         "fetched_at": datetime.now(_IST).isoformat(),
     }
 

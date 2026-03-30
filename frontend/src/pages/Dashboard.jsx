@@ -322,6 +322,53 @@ export default function Dashboard() {
             ))}
           </div>
 
+          {/* US Event Warnings */}
+          {sentiment.us_events?.has_warning && (
+            <div style={{ marginTop: 16 }}>
+              {(sentiment.us_events.warnings || []).map((w, i) => (
+                <div key={i} style={{
+                  padding: '12px 16px', borderRadius: 10, marginBottom: 8,
+                  background: w.level === 'RED' ? 'rgba(248,113,113,0.1)' : 'rgba(252,211,77,0.1)',
+                  border: `1px solid ${w.level === 'RED' ? 'rgba(248,113,113,0.25)' : 'rgba(252,211,77,0.25)'}`,
+                }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: w.level === 'RED' ? c.red : c.amber, marginBottom: 4 }}>
+                    {w.level === 'RED' ? '⚠' : '⚡'} {w.message}
+                  </div>
+                  <div style={{ fontSize: 12, color: c.muted }}>{w.recommendation}</div>
+                </div>
+              ))}
+
+              {/* Recent US Economic Data */}
+              {(sentiment.us_events.recent_surprises || []).filter(s => s.severity === 'HIGH').map((s, i) => (
+                <div key={i} style={{
+                  padding: '10px 16px', borderRadius: 10, marginBottom: 8,
+                  background: s.surprise_direction === 'POSITIVE' ? 'rgba(110,231,183,0.06)' :
+                    s.surprise_direction === 'NEGATIVE' ? 'rgba(248,113,113,0.06)' : 'rgba(148,163,184,0.06)',
+                  border: `1px solid rgba(148,163,184,0.1)`,
+                }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2,
+                    color: s.surprise_direction === 'POSITIVE' ? c.emerald : s.surprise_direction === 'NEGATIVE' ? c.red : c.muted,
+                  }}>
+                    US {s.indicator}: {s.actual} (prev: {s.previous})
+                  </div>
+                  <div style={{ fontSize: 12, color: c.muted }}>{s.interpretation}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Latest US Economic Readings */}
+          {sentiment.us_events?.latest_readings && Object.keys(sentiment.us_events.latest_readings).length > 0 && (
+            <div style={{ marginTop: 12, display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+              {Object.entries(sentiment.us_events.latest_readings).map(([key, r]) => (
+                <div key={key} style={{ fontSize: 11, color: c.muted, fontFamily: mono }}>
+                  {r.short_name}: <span style={{ color: c.text }}>{r.value}{r.unit === 'percent' ? '%' : ''}</span>
+                  <span style={{ color: c.muted }}> ({r.date})</span>
+                </div>
+              ))}
+            </div>
+          )}
+
           {sentiment.fetched_at && (
             <div style={{ marginTop: 12, fontSize: 11, color: c.muted, fontFamily: mono }}>
               Updated: {new Date(sentiment.fetched_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })} IST
