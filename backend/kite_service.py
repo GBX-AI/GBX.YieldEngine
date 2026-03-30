@@ -294,6 +294,30 @@ class KiteService:
                 return self._simulated_margins()
         return self._simulated_margins()
 
+    def get_order_margin(self, tradingsymbol, transaction_type="SELL", quantity=1, product="NRML"):
+        """Get margin required for an order using Kite order_margins API.
+        Returns margin in rupees or None."""
+        if not self.is_authenticated():
+            return None
+        try:
+            params = [{
+                "exchange": "NFO",
+                "tradingsymbol": tradingsymbol,
+                "transaction_type": transaction_type,
+                "variety": "regular",
+                "product": product,
+                "order_type": "MARKET",
+                "quantity": quantity,
+            }]
+            result = self._kite.order_margins(params)
+            if result and len(result) > 0:
+                margin = result[0]
+                total = margin.get("total", 0)
+                return round(total, 2)
+        except Exception as exc:
+            logger.debug("order_margins failed for %s: %s", tradingsymbol, exc)
+        return None
+
     # ------------------------------------------------------------------
     # Positions
     # ------------------------------------------------------------------

@@ -177,6 +177,10 @@ export const kiteStatus = () => request('/api/kite/status');
 export const kiteDisconnect = () => request('/api/kite/disconnect', { method: 'POST' });
 export const kiteSaveCredentials = (apiKey, apiSecret, permission = 'readonly') => request('/api/kite/credentials', { method: 'POST', body: JSON.stringify({ api_key: apiKey, api_secret: apiSecret, permission }) });
 
+// Price Refresh
+export const refreshPrices = (symbols) => request('/api/scan/refresh-prices', { method: 'POST', body: JSON.stringify({ symbols }) });
+export const getMargin = (tradingsymbol, quantity, transaction_type = 'SELL') => request('/api/scan/margin', { method: 'POST', body: JSON.stringify({ tradingsymbol, quantity, transaction_type }) });
+
 // Manual Trade Tracking
 export const getManualTrades = () => request('/api/trades/manual');
 export const createManualTrade = (data) => request('/api/trades/manual', { method: 'POST', body: JSON.stringify(data) });

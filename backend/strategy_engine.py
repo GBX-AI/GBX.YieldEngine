@@ -2199,6 +2199,22 @@ def scan_strategies(
         rec["vix_adjusted"] = bool(vix_value)
         rec["vix_signal"] = vix_signal
 
+    # Fetch real margins from Kite for sell legs (if connected)
+    if kite_is_live:
+        for rec in all_recs:
+            legs = rec.get("legs", [])
+            for leg in legs:
+                ts = leg.get("tradingsymbol")
+                action = (leg.get("action") or "").upper()
+                if ts and action == "SELL":
+                    real_margin = kite_service.get_order_margin(
+                        ts, "SELL", leg.get("quantity", 1)
+                    )
+                    if real_margin:
+                        rec["margin_needed"] = real_margin
+                        rec["margin_source"] = "kite"
+                    break  # Only need margin for the first sell leg
+
     # Capital utilization + portfolio delta (Prompt 6)
     margin_data = portfolio_risk.get_available_margin(kite_service)
     port_delta = portfolio_risk.get_portfolio_delta(kite_service)

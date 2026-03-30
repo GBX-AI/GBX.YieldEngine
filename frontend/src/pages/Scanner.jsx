@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   scan, getRecommendations, getArbitrage,
   setRiskProfile, getRiskProfile, getPermission, getStatus,
-  createManualTrade,
+  createManualTrade, refreshPrices,
 } from '../api';
 import {
   Search, ChevronDown, ChevronUp, Lock, Unlock,
@@ -522,17 +522,19 @@ export default function Scanner() {
   const [totalMarginRequired, setTotalMarginRequired] = useState(null);
   const [dataSource, setDataSource] = useState(null);  // "kite" or "simulation"
 
-  /* ─── Init ─── */
+  /* ─── Init — only scan if no cached results ─── */
   useEffect(() => {
     getRiskProfile().then((d) => setRiskProfileState(d?.profile || d?.risk_profile || 'MODERATE')).catch(() => {});
     getPermission().then((d) => setPermission(d?.mode || d?.permission || 'READONLY')).catch(() => {});
 
-    // Auto-scan if holdings exist and no recommendations loaded yet
-    getStatus().then((st) => {
-      if ((st?.holdings_count ?? 0) > 0) {
-        handleScan();
-      }
-    }).catch(() => {});
+    // Only auto-scan if no results are loaded yet
+    if (allRecommendations.length === 0 && !scanning) {
+      getStatus().then((st) => {
+        if ((st?.holdings_count ?? 0) > 0) {
+          handleScan();
+        }
+      }).catch(() => {});
+    }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ─── Handlers ─── */
@@ -559,6 +561,58 @@ export default function Scanner() {
       setScanning(false);
     }
   }, []);
+
+  /* ─── Auto-refresh prices every 5 seconds for displayed recs ─── */
+  const refreshIntervalRef = useRef(null);
+
+  useEffect(() => {
+    // Only refresh when we have recommendations and data source is kite
+    if (allRecommendations.length === 0 || dataSource !== 'kite') {
+      if (refreshIntervalRef.current) clearInterval(refreshIntervalRef.current);
+      return;
+    }
+
+    const doRefresh = async () => {
+      try {
+        // Collect all tradingsymbols from visible recs
+        const symbols = new Set();
+        [...allRecommendations, ...coveredCalls].forEach(r => {
+          (r.legs || []).forEach(leg => {
+            if (leg.tradingsymbol) symbols.add(leg.tradingsymbol);
+          });
+        });
+        if (symbols.size === 0) return;
+
+        const result = await refreshPrices([...symbols]);
+        if (!result?.prices) return;
+
+        // Update premiums in recommendations
+        const updateRec = (rec) => {
+          let updated = false;
+          const newLegs = (rec.legs || []).map(leg => {
+            const ts = leg.tradingsymbol;
+            if (ts && result.prices[ts]) {
+              updated = true;
+              return { ...leg, premium: result.prices[ts].ltp };
+            }
+            return leg;
+          });
+          if (updated) {
+            return { ...rec, legs: newLegs, fetched_at: result.fetched_at };
+          }
+          return rec;
+        };
+
+        setAllRecommendations(prev => prev.map(updateRec));
+        setCoveredCalls(prev => prev.map(updateRec));
+      } catch {
+        // Silently fail — don't disrupt the UI
+      }
+    };
+
+    refreshIntervalRef.current = setInterval(doRefresh, 5000);
+    return () => { if (refreshIntervalRef.current) clearInterval(refreshIntervalRef.current); };
+  }, [allRecommendations.length, coveredCalls.length, dataSource]);
 
   const handleRiskChange = async (profile) => {
     try {

@@ -893,6 +893,65 @@ def create_app():
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+    @app.route("/api/scan/refresh-prices", methods=["POST"])
+    @require_auth
+    def api_scan_refresh_prices():
+        """Refresh live prices for a list of tradingsymbols.
+        Called every 5 seconds by the Scanner frontend."""
+        user_id = g.current_user["id"]
+        kite = get_kite_for_user(user_id)
+        if not kite or not kite.is_authenticated():
+            return jsonify({"error": "Kite not connected"}), 400
+
+        data = request.json or {}
+        symbols = data.get("symbols", [])  # List of NFO tradingsymbols
+        if not symbols:
+            return jsonify({"prices": {}})
+
+        # Batch fetch LTP for all symbols
+        try:
+            keys = [f"NFO:{s}" for s in symbols[:50]]  # Max 50 at a time
+            quotes = kite.get_quote(keys)
+
+            prices = {}
+            for key, q in quotes.items():
+                ts = key.replace("NFO:", "")
+                prices[ts] = {
+                    "ltp": q.get("last_price", 0),
+                    "bid": q.get("depth", {}).get("buy", [{}])[0].get("price", 0),
+                    "ask": q.get("depth", {}).get("sell", [{}])[0].get("price", 0),
+                    "oi": q.get("oi", 0),
+                    "volume": q.get("volume", 0),
+                    "change": q.get("net_change", 0),
+                    "change_pct": round(q.get("net_change", 0) / q.get("last_price", 1) * 100, 2) if q.get("last_price") else 0,
+                }
+
+            return jsonify({"prices": prices, "fetched_at": now_iso()})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/scan/margin", methods=["POST"])
+    @require_auth
+    def api_scan_get_margin():
+        """Get real margin for a specific tradingsymbol using Kite order_margins API."""
+        user_id = g.current_user["id"]
+        kite = get_kite_for_user(user_id)
+        if not kite or not kite.is_authenticated():
+            return jsonify({"error": "Kite not connected"}), 400
+
+        data = request.json or {}
+        tradingsymbol = data.get("tradingsymbol", "")
+        quantity = data.get("quantity", 1)
+        transaction_type = data.get("transaction_type", "SELL")
+
+        if not tradingsymbol:
+            return jsonify({"error": "tradingsymbol required"}), 400
+
+        margin = kite.get_order_margin(tradingsymbol, transaction_type, quantity)
+        if margin is not None:
+            return jsonify({"margin": margin, "tradingsymbol": tradingsymbol})
+        return jsonify({"error": "Could not fetch margin", "margin": None})
+
     @app.route("/api/kite/debug", methods=["GET"])
     @require_auth
     def api_kite_debug():
