@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   scan, getRecommendations, getArbitrage,
   setRiskProfile, getRiskProfile, getPermission, getStatus,
-  createManualTrade, refreshPrices,
+  createManualTrade, refreshPrices, getSentiment,
 } from '../api';
 import {
   Search, ChevronDown, ChevronUp, Lock, Unlock,
@@ -521,11 +521,13 @@ export default function Scanner() {
   const [totalWeeklyIncome, setTotalWeeklyIncome] = useState(null);
   const [totalMarginRequired, setTotalMarginRequired] = useState(null);
   const [dataSource, setDataSource] = useState(null);  // "kite" or "simulation"
+  const [sentiment, setSentiment] = useState(null);
 
   /* ─── Init — only scan if no cached results ─── */
   useEffect(() => {
     getRiskProfile().then((d) => setRiskProfileState(d?.profile || d?.risk_profile || 'MODERATE')).catch(() => {});
     getPermission().then((d) => setPermission(d?.mode || d?.permission || 'READONLY')).catch(() => {});
+    getSentiment().then(setSentiment).catch(() => {});
 
     // Only auto-scan if no results are loaded yet
     if (allRecommendations.length === 0 && !scanning) {
@@ -672,6 +674,52 @@ export default function Scanner() {
             <span style={{ fontSize: 12, color: C.muted }}>Click "Scan Now" to analyze</span>
           )}
         </div>
+
+        {/* Market Briefing — actionable for trading decisions */}
+        {sentiment && (
+          <div style={{
+            ...cardStyle, marginBottom: 20, padding: 16,
+            borderLeft: `4px solid ${sentiment.color}`,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10 }}>
+              <div style={{ width: 10, height: 10, borderRadius: '50%', background: sentiment.color, boxShadow: `0 0 6px ${sentiment.color}60` }} />
+              <span style={{ fontSize: 14, fontWeight: 700, color: sentiment.color }}>
+                {sentiment.signal === 'GREEN' ? 'Market Favourable — good for selling premium' :
+                 sentiment.signal === 'RED' ? 'Market Risky — reduce exposure or skip' :
+                 'Mixed Signals — proceed with caution'}
+              </span>
+              <span style={{ fontSize: 11, fontFamily: font.mono, color: C.muted, marginLeft: 'auto' }}>
+                Score: {sentiment.score}/100
+              </span>
+            </div>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
+              {(sentiment.factors || []).map((f, i) => (
+                <span key={i} style={{
+                  padding: '3px 10px', borderRadius: 6, fontSize: 11, fontFamily: font.mono,
+                  background: f.signal === 'GREEN' ? 'rgba(110,231,183,0.1)' : f.signal === 'RED' ? 'rgba(248,113,113,0.1)' : 'rgba(252,211,77,0.1)',
+                  color: f.signal === 'GREEN' ? C.emerald : f.signal === 'RED' ? C.red : C.amber,
+                }}>
+                  {f.name}: {typeof f.value === 'string' ? f.value.slice(0, 40) : f.value}
+                </span>
+              ))}
+            </div>
+            {/* US Event Warnings — directly actionable */}
+            {sentiment.us_events?.warnings?.map((w, i) => (
+              <div key={i} style={{
+                padding: '8px 12px', borderRadius: 8, marginBottom: 6,
+                background: w.level === 'RED' ? 'rgba(248,113,113,0.1)' : 'rgba(252,211,77,0.08)',
+                fontSize: 12, color: w.level === 'RED' ? C.red : C.amber,
+              }}>
+                {w.level === 'RED' ? '⚠' : '⚡'} {w.message} — <em>{w.recommendation}</em>
+              </div>
+            ))}
+            <div style={{ fontSize: 11, color: C.muted, fontStyle: 'italic' }}>
+              {sentiment.signal === 'GREEN' ? 'Scan results below are suitable for fresh positions.' :
+               sentiment.signal === 'RED' ? 'Consider skipping new positions or using minimum lot sizes only.' :
+               'Review each recommendation carefully before executing.'}
+            </div>
+          </div>
+        )}
 
         {/* Error */}
         {error && (

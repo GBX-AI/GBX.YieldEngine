@@ -53,30 +53,31 @@ def get_sentiment(kite_service=None):
     factors = []
     score = 50  # Start neutral
 
-    # ── 1. Gift Nifty from Kite ──
-    gift_nifty = _fetch_gift_nifty(kite_service)
-    if gift_nifty:
-        change_pct = gift_nifty.get("change_pct", 0)
+    # ── 1. NIFTY Direction (Gift Nifty proxy — futures vs previous close) ──
+    nifty_direction = _fetch_nifty_direction(kite_service)
+    if nifty_direction:
+        change_pct = nifty_direction.get("change_pct", 0)
         if change_pct >= 0.5:
             signal = "GREEN"
             score += 15
-        elif change_pct <= -0.5:
-            signal = "RED"
-            score -= 15
         elif change_pct <= -1.0:
             signal = "RED"
             score -= 25
+        elif change_pct <= -0.5:
+            signal = "RED"
+            score -= 15
         else:
             signal = "YELLOW"
 
         factors.append({
-            "name": "Gift Nifty",
-            "value": f"{gift_nifty['value']:,.1f} ({change_pct:+.2f}%)",
+            "name": "NIFTY Direction",
+            "value": f"{nifty_direction['value']:,.1f} ({change_pct:+.2f}%)",
             "signal": signal,
             "weight": 30,
+            "details": nifty_direction.get("details"),
         })
     else:
-        factors.append({"name": "Gift Nifty", "value": "Unavailable", "signal": "YELLOW", "weight": 0})
+        factors.append({"name": "NIFTY Direction", "value": "Unavailable", "signal": "YELLOW", "weight": 0})
 
     # ── 2. India VIX ──
     vix_data = _fetch_vix(kite_service)
@@ -227,7 +228,7 @@ def get_sentiment(kite_service=None):
         "summary": summary,
         "score": score,
         "factors": factors,
-        "gift_nifty": gift_nifty,
+        "nifty_direction": nifty_direction,
         "vix": vix_data,
         "global_indices": global_data,
         "nifty_futures": futures_data,
@@ -240,42 +241,49 @@ def get_sentiment(kite_service=None):
     return result
 
 
-def _fetch_gift_nifty(kite_service):
-    """Fetch Gift Nifty from Kite."""
+def _fetch_nifty_direction(kite_service):
+    """Fetch NIFTY spot change from previous close — proxy for Gift Nifty.
+    Gift Nifty is not available via Kite API, but NIFTY spot change
+    gives the same directional signal."""
     if not kite_service or not kite_service.is_authenticated():
         return None
 
-    # Try different symbol formats for Gift Nifty
-    symbols_to_try = [
-        "NSE:GIFT NIFTY",
-        "INDICES:GIFT NIFTY",
-        "NSE:GIFTNIFTY",
-        "NSE:NIFTY GIF",
-    ]
+    try:
+        data = kite_service.get_quote(["NSE:NIFTY 50"])
+        if not data:
+            return None
 
-    for sym in symbols_to_try:
-        try:
-            data = kite_service.get_quote([sym])
-            if data:
-                q = list(data.values())[0]
-                ltp = q.get("last_price", 0)
-                prev_close = q.get("ohlc", {}).get("close", 0) or q.get("previous_close", 0)
-                if ltp and prev_close:
-                    change_pct = ((ltp - prev_close) / prev_close) * 100
-                    return {
-                        "value": ltp,
-                        "prev_close": prev_close,
-                        "change_pct": round(change_pct, 2),
-                        "open": q.get("ohlc", {}).get("open", 0),
-                        "high": q.get("ohlc", {}).get("high", 0),
-                        "low": q.get("ohlc", {}).get("low", 0),
-                        "source": "kite",
-                        "symbol_used": sym,
-                    }
-        except Exception:
-            continue
+        q = list(data.values())[0]
+        ltp = q.get("last_price", 0)
+        prev_close = q.get("ohlc", {}).get("close", 0)
+        open_price = q.get("ohlc", {}).get("open", 0)
+        day_high = q.get("ohlc", {}).get("high", 0)
+        day_low = q.get("ohlc", {}).get("low", 0)
 
-    return None
+        if not ltp or not prev_close:
+            return None
+
+        change_pct = ((ltp - prev_close) / prev_close) * 100
+        gap_pct = ((open_price - prev_close) / prev_close) * 100 if open_price and prev_close else 0
+
+        return {
+            "value": ltp,
+            "prev_close": prev_close,
+            "change_pct": round(change_pct, 2),
+            "gap_pct": round(gap_pct, 2),
+            "open": open_price,
+            "high": day_high,
+            "low": day_low,
+            "source": "kite",
+            "details": {
+                "Spot": f"{ltp:,.1f}",
+                "Prev Close": f"{prev_close:,.1f}",
+                "Gap": f"{gap_pct:+.2f}%",
+                "Day Range": f"{day_low:,.1f} — {day_high:,.1f}",
+            },
+        }
+    except Exception:
+        return None
 
 
 def _fetch_vix(kite_service):
