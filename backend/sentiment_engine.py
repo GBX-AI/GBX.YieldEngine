@@ -204,9 +204,9 @@ def get_sentiment(kite_service=None):
 
     # Build summary details
     detail_parts = []
-    if gift_nifty:
-        direction = "up" if gift_nifty.get("change_pct", 0) >= 0 else "down"
-        detail_parts.append(f"Gift Nifty {direction} {abs(gift_nifty.get('change_pct', 0)):.1f}%")
+    if nifty_direction:
+        direction = "up" if nifty_direction.get("change_pct", 0) >= 0 else "down"
+        detail_parts.append(f"NIFTY {direction} {abs(nifty_direction.get('change_pct', 0)):.1f}%")
     if vix_data:
         detail_parts.append(f"VIX at {vix_data['value']:.1f}")
     if global_data:
