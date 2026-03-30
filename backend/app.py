@@ -966,6 +966,39 @@ def create_app():
             return jsonify({"margin": margin, "tradingsymbol": tradingsymbol})
         return jsonify({"error": "Could not fetch margin", "margin": None})
 
+    def _search_gift_nifty(kite):
+        """Search all exchanges for Gift Nifty symbol."""
+        results = []
+        # Try different exchanges and symbol names
+        test_symbols = [
+            "NSE:GIFT NIFTY", "NSE:GIFTNIFTY", "NSE:GIFT_NIFTY",
+            "BCD:GIFTNIFTY", "BCD:GIFT NIFTY", "MCX:GIFTNIFTY",
+            "BSE:GIFT NIFTY", "BSE:GIFTNIFTY",
+            "CDS:GIFTNIFTY", "BFO:GIFTNIFTY",
+        ]
+        for sym in test_symbols:
+            try:
+                data = kite.get_quote([sym])
+                if data:
+                    q = list(data.values())[0]
+                    ltp = q.get("last_price", 0)
+                    if ltp:
+                        results.append({"symbol": sym, "ltp": ltp, "name": q.get("name", "")})
+            except Exception:
+                pass
+
+        # Also search NFO instruments for GIFT
+        try:
+            import market_data as md
+            instruments = md.get_nfo_instruments(kite)
+            gift_insts = [i for i in (instruments or []) if "GIFT" in (i.get("tradingsymbol", "") + i.get("name", "")).upper()][:5]
+            for i in gift_insts:
+                results.append({"symbol": f"{i.get('exchange','NFO')}:{i['tradingsymbol']}", "name": i.get("name", ""), "type": i.get("instrument_type", "")})
+        except Exception:
+            pass
+
+        return results
+
     @app.route("/api/kite/debug", methods=["GET"])
     @require_auth
     def api_kite_debug():
@@ -1001,6 +1034,8 @@ def create_app():
             "instruments_count": instruments_count,
             "today": date.today().isoformat(),
             "market_data_debug": md.get_debug_log(),
+            # Search for Gift Nifty in all exchanges
+            "gift_nifty_search": _search_gift_nifty(kite) if kite and kite.is_authenticated() else None,
             "chain_miss_debug": md._last_debug.get("chain_miss"),
         })
 
