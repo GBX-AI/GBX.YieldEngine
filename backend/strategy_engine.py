@@ -37,7 +37,7 @@ from datetime import date
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-STRATEGY_TYPES = ("COVERED_CALL", "CASH_SECURED_PUT", "PUT_CREDIT_SPREAD", "COLLAR", "SHORT_STRANGLE", "ATM_SHORT_STRANGLE", "IRON_CONDOR", "RSI_OPTION_SELL")
+STRATEGY_TYPES = ("COVERED_CALL", "CASH_SECURED_PUT", "PUT_CREDIT_SPREAD", "COLLAR", "SHORT_STRANGLE", "ATM_SHORT_STRANGLE", "IRON_CONDOR", "RSI_OPTION_SELL", "CALENDAR_SPREAD")
 
 SAFETY_TAGS = ("VERY_SAFE", "SAFE", "MODERATE", "AGGRESSIVE")
 
@@ -516,6 +516,11 @@ def _enrich_recommendation(rec: dict) -> dict:
         rec["max_loss"] = round((put_width * qty) - net, 2) if put_width else round(rec.get("max_loss", 0), 2)
         rec["max_loss_point"] = rec.get("protection_strike", 0)
         rec["max_profit_point"] = rec.get("strike", 0)  # Both sell strikes
+
+    elif strategy == "CALENDAR_SPREAD":
+        rec["max_profit"] = round(net * 0.25, 2)  # 25% target profit
+        rec["max_loss"] = round(rec.get("net_debit_per_share", 0) * qty, 2)  # Net debit paid
+        rec["max_loss_point"] = rec.get("strike", 0)  # ATM = max risk
 
     elif strategy in ("SHORT_STRANGLE", "ATM_SHORT_STRANGLE"):
         rec["max_profit"] = round(net, 2)
@@ -1821,6 +1826,179 @@ def _scan_rsi_option_sells(cash_balance: float, settings: dict, dte: int, kite_s
     return recs
 
 
+# ─── Calendar Spread Scanner (Strategy 4 from Trade Strategy doc) ─────────────
+
+def _scan_calendar_spreads(cash_balance: float, settings: dict, dte: int, kite_service=None) -> list:
+    """
+    Scan for Calendar Spread opportunities on F&O stocks.
+
+    Strategy 4 from Trade Strategy doc:
+    - Sell current month's highest-premium option (CE side if call premium > put)
+    - Buy same strike, next month option
+    - Net cost = next_month_premium - current_month_premium (debit spread)
+    - Exit A: at 25% profit on total position
+    - Exit B: when current month decays 40%, roll
+    """
+    recs = []
+    kite_connected = kite_service and kite_service.is_authenticated()
+
+    if not kite_connected:
+        return recs
+
+    # Scan F&O stocks
+    fno_stocks = market_data.get_fno_stock_list(kite_service)
+    if not fno_stocks:
+        return recs
+
+    for symbol in fno_stocks[:20]:
+        try:
+            # Get available expiries — need at least 2
+            expiries = market_data.get_available_expiries(kite_service, symbol)
+            if len(expiries) < 2:
+                continue
+
+            near_expiry = expiries[0]  # Current month
+            far_expiry = expiries[1]   # Next month
+
+            near_dte = max(1, (near_expiry - date.today()).days)
+            far_dte = max(1, (far_expiry - date.today()).days)
+
+            if near_dte <= 0:
+                continue
+
+            # Get spot
+            try:
+                spot_data = kite_service.get_ltp([f"NSE:{symbol}"])
+                spot = list(spot_data.values())[0]["last_price"]
+            except Exception:
+                continue
+            if not spot:
+                continue
+
+            # Get option chains for both expiries
+            near_chain = market_data.get_option_chain_live(kite_service, symbol, near_expiry, num_strikes=10)
+            far_chain = market_data.get_option_chain_live(kite_service, symbol, far_expiry, num_strikes=10)
+
+            if not near_chain or not far_chain:
+                continue
+
+            lot_size = near_chain.get("lot_size", 1)
+
+            # Find ATM strike with highest premium in near month
+            # Check which side (CE or PE) has higher premium
+            best_near = None
+            for s in near_chain["strikes"]:
+                for opt_type in ("CE", "PE"):
+                    opt = s.get(opt_type)
+                    if not opt or opt.get("premium", 0) <= 0 or opt.get("oi", 0) < 100:
+                        continue
+                    if best_near is None or opt["premium"] > best_near[2]:
+                        best_near = (s["strike"], opt_type, opt["premium"], opt)
+
+            if not best_near:
+                continue
+
+            strike, opt_type, near_premium, near_opt = best_near
+
+            # Find same strike in far month
+            far_opt = None
+            for s in far_chain["strikes"]:
+                if s["strike"] == strike:
+                    far_opt = s.get(opt_type)
+                    break
+
+            if not far_opt or far_opt.get("premium", 0) <= 0:
+                continue
+
+            far_premium = far_opt["premium"]
+
+            # Calendar spread: sell near, buy far — net debit
+            net_debit_per_share = far_premium - near_premium
+            if net_debit_per_share <= 0:
+                # Credit calendar — unusual but possible
+                continue
+
+            total_debit = net_debit_per_share * lot_size
+            # Max profit ≈ near premium collected (when near expires worthless and far retains value)
+            max_profit_estimate = near_premium * lot_size
+            # Max loss = net debit paid
+            max_loss = total_debit
+
+            # Premium filter from doc: option premium >= 3% of strike
+            if near_premium / strike < 0.03:
+                continue
+
+            # 52-week high check
+            if market_data.is_near_52_week_high(kite_service, symbol, threshold_pct=5):
+                continue
+
+            T_near = near_dte / 365.0
+            iv_est = 0.25
+            greeks = compute_greeks(spot, strike, T_near, RISK_FREE_RATE, iv_est, opt_type)
+
+            # Margin ≈ debit paid (defined risk)
+            margin_needed = total_debit * 1.2  # 20% buffer
+
+            ann_return = _annualized_return(max_profit_estimate * 0.25, margin_needed, near_dte)  # 25% target
+
+            safety_tag = classify_safety(greeks["prob_otm"], abs(strike - spot) / spot)
+            if not passes_risk_filter(safety_tag, settings["risk_profile"]):
+                continue
+
+            legs = [
+                _build_leg("SELL", strike, near_premium, lot_size, opt_type,
+                          tradingsymbol=near_opt.get("tradingsymbol")),
+                _build_leg("BUY", strike, far_premium, lot_size, opt_type,
+                          tradingsymbol=far_opt.get("tradingsymbol")),
+            ]
+
+            near_display = near_expiry.strftime("%d %b").upper()
+            far_display = far_expiry.strftime("%d %b").upper()
+
+            recs.append(_enrich_recommendation({
+                "id": generate_id(),
+                "rank": 0,
+                "symbol": symbol,
+                "strategy_type": "CALENDAR_SPREAD",
+                "strike": strike,
+                "option_type": opt_type,
+                "legs": legs,
+                "premium_income": round(max_profit_estimate, 2),  # Potential profit
+                "margin_needed": round(margin_needed, 2),
+                "max_loss": round(max_loss, 2),
+                "prob_otm": round(greeks["prob_otm"], 4),
+                "delta": round(greeks["delta"], 4),
+                "annualized_return": round(ann_return, 4),
+                "theta_per_day": round(greeks["theta"] * lot_size, 2),
+                "safety_tag": safety_tag,
+                "strike_rationale": (
+                    f"CALENDAR_SPREAD: Sell {near_display} {strike}{opt_type} @₹{near_premium:.2f}, "
+                    f"Buy {far_display} {strike}{opt_type} @₹{far_premium:.2f}. "
+                    f"Net debit ₹{net_debit_per_share:.2f}/share. "
+                    f"Exit at 25% profit or roll at 40% near-month decay."
+                ),
+                "alternatives": {},
+                "fee_estimate": _fee_estimate(legs),
+                "dte": near_dte,
+                "far_dte": far_dte,
+                "lots": 1,
+                "lot_size": lot_size,
+                "spot": spot,
+                "near_expiry": near_display,
+                "far_expiry": far_display,
+                "net_debit_per_share": round(net_debit_per_share, 2),
+                "exit_at_profit_pct": 25,  # Strategy 4: exit at 25% profit
+                "exit_at_decay_pct": 40,   # Strategy 4: roll at 40% near decay
+                "price_source": "kite",
+                "fetched_at": datetime.now().isoformat(),
+            }))
+
+        except Exception:
+            continue
+
+    return recs
+
+
 # ─── Ranking ──────────────────────────────────────────────────────────────────
 
 def rank_recommendations(recs: list) -> list:
@@ -1949,6 +2127,9 @@ def scan_strategies(
 
     if "RSI_OPTION_SELL" in allowed:
         all_recs.extend(_scan_rsi_option_sells(cash_balance, resolved, dte, kite_service=kite_service))
+
+    if "CALENDAR_SPREAD" in allowed:
+        all_recs.extend(_scan_calendar_spreads(cash_balance, resolved, dte, kite_service=kite_service))
 
     # Filter out negative premium strategies
     all_recs = [r for r in all_recs if r.get("premium_income", 0) > 0]

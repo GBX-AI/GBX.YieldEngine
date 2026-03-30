@@ -49,7 +49,7 @@ const btnBase = {
 
 /* ─── Constants ─── */
 const SAFETY_TAGS = ['ALL', 'VERY_SAFE', 'SAFE', 'MODERATE'];
-const STRATEGY_TYPES = ['ALL', 'SHORT_STRANGLE', 'ATM_SHORT_STRANGLE', 'IRON_CONDOR', 'RSI_OPTION_SELL', 'COVERED_CALL', 'CASH_SECURED_PUT', 'PUT_CREDIT_SPREAD', 'ARBITRAGE'];
+const STRATEGY_TYPES = ['ALL', 'SHORT_STRANGLE', 'ATM_SHORT_STRANGLE', 'IRON_CONDOR', 'RSI_OPTION_SELL', 'CALENDAR_SPREAD', 'COVERED_CALL', 'CASH_SECURED_PUT', 'PUT_CREDIT_SPREAD', 'ARBITRAGE'];
 const RISK_PROFILES = [
   { key: 'CONSERVATIVE', label: 'Conservative', icon: Shield, color: C.emerald },
   { key: 'MODERATE', label: 'Moderate', icon: TrendingUp, color: C.amber },
@@ -68,6 +68,7 @@ const TYPE_COLORS = {
   ATM_SHORT_STRANGLE: '#e879f9', // purple-pink
   IRON_CONDOR: '#34d399',     // teal
   RSI_OPTION_SELL: '#fb923c', // orange
+  CALENDAR_SPREAD: '#22d3ee', // cyan
   COVERED_CALL: C.purple,
   CASH_SECURED_PUT: C.blue,
   PUT_CREDIT_SPREAD: C.amber,
