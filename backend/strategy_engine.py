@@ -2214,10 +2214,8 @@ def scan_strategies(
     # Filter out already expired options (DTE <= 0)
     all_recs = [r for r in all_recs if r.get("dte", 0) > 0]
 
-    # When Kite is connected, filter out simulation-only recs
-    kite_is_live = kite_service and kite_service.is_authenticated()
-    if kite_is_live:
-        all_recs = [r for r in all_recs if r.get("price_source") == "kite"]
+    # Don't filter by price_source — let confidence/decision handle quality
+    # Simulation-based recs get lower confidence naturally via execution_quality
 
     # Compute per-strategy expiry and add expiry info to recs and legs
     kite_connected = kite_service and kite_service.is_authenticated()
