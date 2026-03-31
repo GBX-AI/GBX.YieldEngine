@@ -5,7 +5,7 @@ bind = "0.0.0.0:" + str(os.getenv("PORT", "8000"))
 # Multiple workers would each try to lock the same DB file
 workers = 1
 threads = 4
-timeout = 120
+timeout = 300  # 5 min — scan with Kite + multiple strategies can take time
 accesslog = "-"
 errorlog = "-"
 loglevel = "info"
