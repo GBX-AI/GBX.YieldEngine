@@ -1495,14 +1495,12 @@ def create_app():
 
     @app.route("/")
     def serve_frontend():
-        return send_from_directory(app.static_folder, "index.html")
+        return jsonify({"status": "running", "service": "yield-engine-api"})
 
     @app.errorhandler(404)
     def not_found(e):
-        # SPA fallback
-        if request.path.startswith("/api/"):
-            return jsonify({"error": "Not found"}), 404
-        return send_from_directory(app.static_folder, "index.html")
+        # API container — always return JSON (frontend is separate container)
+        return jsonify({"error": "Not found"}), 404
 
     return app
 
