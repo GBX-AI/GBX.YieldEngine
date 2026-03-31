@@ -28,6 +28,7 @@ from black_scholes import (
 from strike_selector import select_strike, select_strike_price, generate_alternatives, generate_strike_alternatives
 from fee_calculator import calculate_fees, calculate_trade_fees
 from charges_engine import charges_engine
+from execution_filter import execution_check, get_real_fill_price, calculate_spread_net_credit, calculate_confidence, SLIPPAGE_FACTOR
 import live_price_service
 import market_data
 import vix_service
@@ -457,6 +458,10 @@ def _enrich_recommendation(rec: dict) -> dict:
         rec["charges_breakdown"] = charges["charges_breakdown"]
         rec["breakeven_adjustment"] = charges.get("effective_breakeven_adjustment", 0)
 
+        # Apply slippage to net premium
+        rec["net_credit_adjusted"] = round(rec.get("net_premium", 0) * SLIPPAGE_FACTOR, 2)
+        rec["slippage_pct"] = 10
+
         # Recalculate annualized return using net premium
         margin = rec.get("margin_needed", 0)
         dte = rec.get("dte", 7)
@@ -558,6 +563,19 @@ def _enrich_recommendation(rec: dict) -> dict:
     rec["theta_per_day_rupees"] = exit_data["theta_per_day_rupees"]
     rec["exit_suggestion"] = exit_data["exit_suggestion"]
 
+    # ── 3b. Confidence calculation ──
+    confidence = calculate_confidence({
+        "execution_quality": rec.get("execution_quality", "FAIR"),
+        "net_credit_adjusted": rec.get("net_credit_adjusted", rec.get("net_premium", 0)),
+        "max_loss": rec.get("max_loss", 0),
+        "prob_otm": rec.get("prob_otm", 0),
+        "sentiment_signal": rec.get("sentiment_signal", "YELLOW"),
+    })
+    rec["confidence_score"] = confidence["confidence_score"]
+    rec["decision"] = confidence["decision"]
+    rec["execution_quality"] = confidence["execution_quality"]
+    rec["confidence_reasons"] = confidence["reasons"]
+
     # ── 4. Frontend aliases ──
     rec["premium"] = rec.get("net_premium", rec.get("premium_income", 0))
     rec["premium_income"] = rec.get("net_premium", rec.get("premium_income", 0))
@@ -571,6 +589,13 @@ def _enrich_recommendation(rec: dict) -> dict:
         rec["price_source"] = "simulation"
     if "fetched_at" not in rec:
         rec["fetched_at"] = _now_ist()
+
+    # Mark which fields come from Black-Scholes vs market data
+    rec["bs_derived"] = []
+    if rec.get("price_source") != "kite":
+        rec["bs_derived"].extend(["premium", "greeks", "prob_otm"])
+    else:
+        rec["bs_derived"].extend(["greeks", "prob_otm"])  # Greeks always from BS
 
     return rec
 
@@ -655,7 +680,10 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int, kite_service=N
 
             if best_strike_data:
                 strike, ce_data, greeks = best_strike_data
-                premium = ce_data["premium"]  # Real market premium
+                passed, reason, quality = execution_check(ce_data)
+                if not passed:
+                    continue  # Skip illiquid options
+                premium = ce_data.get("bid", ce_data.get("premium", 0))  # SELL: use bid
                 prob_otm = greeks["prob_otm"]
                 delta_val = greeks["delta"]
                 theta_day = greeks["theta"]
@@ -672,6 +700,7 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int, kite_service=N
             prob_otm = greeks["prob_otm"]
             delta_val = greeks["delta"]
             theta_day = greeks["theta"]
+            quality = "FAIR"
 
         if premium < 0.5:
             continue
@@ -733,6 +762,7 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int, kite_service=N
             "unrealized_pnl": round((spot - avg_cost) * qty, 2),
             "source": "covered_call_from_holdings",
             "price_source": "kite" if use_real else "simulation",
+            "execution_quality": quality if use_real else "FAIR",
             "fetched_at": _now_ist(),
         }))
 
@@ -802,7 +832,10 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_
 
             if best_strike_data:
                 strike, pe_data, greeks = best_strike_data
-                premium = pe_data["premium"]  # Real market premium
+                passed, reason, quality = execution_check(pe_data)
+                if not passed:
+                    continue  # Skip illiquid options
+                premium = pe_data.get("bid", pe_data.get("premium", 0))  # SELL: use bid
                 prob_otm = greeks["prob_otm"]
                 delta_val = greeks["delta"]
                 theta_day = greeks["theta"]
@@ -817,6 +850,7 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_
             prob_otm = greeks["prob_otm"]
             delta_val = greeks["delta"]
             theta_day = greeks["theta"]
+            quality = "FAIR"
 
         if premium < 0.5:
             continue
@@ -877,6 +911,7 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_
             "lots": lots,
             "spot": spot,
             "price_source": "kite" if use_real else "simulation",
+            "execution_quality": quality,
             "fetched_at": _now_ist(),
         }))
 
@@ -949,7 +984,10 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
 
             if best_sell:
                 sell_strike, sell_pe, sell_greeks_real = best_sell
-                sell_premium = sell_pe["premium"]
+                passed, reason, sell_quality = execution_check(sell_pe)
+                if not passed:
+                    continue  # Skip illiquid sell leg
+                sell_premium = sell_pe.get("bid", sell_pe.get("premium", 0))  # SELL: use bid
 
                 # Find buy strike (spread width below sell)
                 chain_map = {s["strike"]: s for s in real_chain["strikes"]}
@@ -963,7 +1001,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                     if buy_chain and buy_chain.get("premium", 0) > 0:
                         if buy_chain.get("oi", 0) < 100:
                             continue
-                        buy_premium = buy_chain["premium"]
+                        buy_premium = buy_chain.get("ask", buy_chain.get("premium", 0))  # BUY: use ask
                         buy_greeks = compute_greeks(spot, buy_strike_candidate, T, RISK_FREE_RATE, iv, "PE")
                         net_credit = sell_premium - buy_premium
                         if net_credit <= 0:
@@ -1034,6 +1072,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                             "spot": spot,
                             "spread_width": actual_width,
                             "price_source": "kite" if use_real else "simulation",
+                            "execution_quality": sell_quality,
                             "fetched_at": _now_ist(),
                         }))
                         break  # First valid width
@@ -1118,6 +1157,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                     "spot": spot,
                     "spread_width": actual_width,
                     "price_source": "simulation",
+                    "execution_quality": "FAIR",
                     "fetched_at": _now_ist(),
                 }))
 
@@ -1245,8 +1285,12 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
             if best_call and best_put:
                 call_strike, ce_data, call_greeks = best_call
                 put_strike, pe_data, put_greeks = best_put
-                call_premium = ce_data["premium"]
-                put_premium = pe_data["premium"]
+                passed_ce, reason_ce, quality_ce = execution_check(ce_data)
+                passed_pe, reason_pe, quality_pe = execution_check(pe_data)
+                if not passed_ce or not passed_pe:
+                    continue  # Skip illiquid options
+                call_premium = ce_data.get("bid", ce_data.get("premium", 0))  # SELL: use bid
+                put_premium = pe_data.get("ask", pe_data.get("premium", 0))  # BUY: use ask
                 use_real = True
                 if real_chain.get("dte"):
                     dte = real_chain["dte"]
@@ -1257,6 +1301,7 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
             put_greeks = compute_greeks(spot, put_strike, T, RISK_FREE_RATE, iv, "PE")
             call_premium = call_greeks["price"]
             put_premium = put_greeks["price"]
+            quality_ce = "FAIR"
 
         net_cost = put_premium - call_premium  # Positive means debit
 
@@ -1325,6 +1370,7 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
             "net_cost_per_unit": round(net_cost, 2),
             "unrealized_gain_pct": round(gain_pct * 100, 1),
             "price_source": "kite" if use_real else "simulation",
+            "execution_quality": quality_ce,
             "fetched_at": _now_ist(),
         }))
 
@@ -1401,9 +1447,19 @@ def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_se
             pe = strangle["pe"]
             lot_size = strangle["lot_size"]
 
+            # Execution check on both legs
+            passed_ce, reason_ce, quality_ce = execution_check(ce)
+            passed_pe, reason_pe, quality_pe = execution_check(pe)
+            if not passed_ce or not passed_pe:
+                continue  # Skip illiquid options
+
+            # Use bid for SELL legs
+            ce_premium_val = ce.get("bid", ce.get("premium", 0))
+            pe_premium_val = pe.get("bid", pe.get("premium", 0))
+
             # Filter: CE or PE premium >= min% of strike
-            ce_pct = (ce["premium"] / ce["strike"]) * 100 if ce["strike"] else 0
-            pe_pct = (pe["premium"] / pe["strike"]) * 100 if pe["strike"] else 0
+            ce_pct = (ce_premium_val / ce["strike"]) * 100 if ce["strike"] else 0
+            pe_pct = (pe_premium_val / pe["strike"]) * 100 if pe["strike"] else 0
             if ce_pct < min_single_pct and pe_pct < min_single_pct:
                 continue
 
@@ -1417,7 +1473,7 @@ def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_se
             ce_greeks = compute_greeks(spot, ce["strike"], T, RISK_FREE_RATE, iv_estimate, "CE")
             pe_greeks = compute_greeks(spot, pe["strike"], T, RISK_FREE_RATE, iv_estimate, "PE")
 
-            total_premium = (ce["premium"] + pe["premium"]) * lot_size
+            total_premium = (ce_premium_val + pe_premium_val) * lot_size
             margin_needed = spot * lot_size * 0.20  # ~20% for naked strangle
 
             prob_otm_combined = ce_greeks["prob_otm"] * pe_greeks["prob_otm"]  # Both expire OTM
@@ -1437,15 +1493,16 @@ def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_se
             ann_return = _annualized_return(total_premium, margin_needed, actual_dte)
 
             legs = [
-                _build_leg("SELL", ce["strike"], ce["premium"], lot_size, "CE",
+                _build_leg("SELL", ce["strike"], ce_premium_val, lot_size, "CE",
                           tradingsymbol=ce.get("tradingsymbol")),
-                _build_leg("SELL", pe["strike"], pe["premium"], lot_size, "PE",
+                _build_leg("SELL", pe["strike"], pe_premium_val, lot_size, "PE",
                           tradingsymbol=pe.get("tradingsymbol")),
             ]
 
             # BEP points
-            bep_upper = ce["strike"] + strangle["combined_premium"]
-            bep_lower = pe["strike"] - strangle["combined_premium"]
+            combined_premium_bid = ce_premium_val + pe_premium_val
+            bep_upper = ce["strike"] + combined_premium_bid
+            bep_lower = pe["strike"] - combined_premium_bid
 
             recs.append(_enrich_recommendation({
                 "id": generate_id(),
@@ -1480,6 +1537,7 @@ def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_se
                 "bep_lower": round(bep_lower, 2),
                 "combined_premium_pct": strangle["combined_premium_pct"],
                 "price_source": "kite",
+                "execution_quality": quality_ce,
                 "fetched_at": _now_ist(),
             }))
 
@@ -1576,10 +1634,16 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                     sell_put_strike, sell_put_data = sp
                     buy_put_strike, buy_put_data = bp
 
-                    sell_call_premium = sell_call_data["premium"]
-                    sell_put_premium = sell_put_data["premium"]
-                    buy_put_premium = buy_put_data["premium"]
-                    use_real = True
+                    passed_sc, reason_sc, quality_sc = execution_check(sell_call_data)
+                    passed_sp, reason_sp, quality_sp = execution_check(sell_put_data)
+                    passed_bp, reason_bp, quality_bp = execution_check(buy_put_data)
+                    if not passed_sc or not passed_sp or not passed_bp:
+                        pass  # Fall through to BS fallback
+                    else:
+                        sell_call_premium = sell_call_data.get("bid", sell_call_data.get("premium", 0))  # SELL: use bid
+                        sell_put_premium = sell_put_data.get("bid", sell_put_data.get("premium", 0))  # SELL: use bid
+                        buy_put_premium = buy_put_data.get("ask", buy_put_data.get("premium", 0))  # BUY: use ask
+                        use_real = True
 
                     # Update lot_size from chain
                     if real_chain.get("lot_size"):
@@ -1672,6 +1736,7 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                 "net_premium_per_share": round(net_premium_per_share, 2),
                 "put_spread_width": put_spread_width,
                 "price_source": "kite" if use_real else "simulation",
+                "execution_quality": quality_sc if use_real else "FAIR",
                 "fetched_at": _now_ist(),
             }))
 
@@ -1765,7 +1830,10 @@ def _scan_rsi_option_sells(cash_balance: float, settings: dict, dte: int, kite_s
                 continue
 
             strike, opt_data = best
-            premium = opt_data["premium"]
+            passed, reason, quality = execution_check(opt_data)
+            if not passed:
+                continue  # Skip illiquid options
+            premium = opt_data.get("bid", opt_data.get("premium", 0))  # SELL: use bid
 
             if premium <= 0:
                 continue
@@ -1821,6 +1889,7 @@ def _scan_rsi_option_sells(cash_balance: float, settings: dict, dte: int, kite_s
                 "rsi_signal": signal["signal"],
                 "exit_at_decay_pct": 30,  # Strategy 6B: exit at 30% decay (not 50%)
                 "price_source": "kite",
+                "execution_quality": quality,
                 "fetched_at": _now_ist(),
             }))
 
@@ -1902,7 +1971,11 @@ def _scan_calendar_spreads(cash_balance: float, settings: dict, dte: int, kite_s
             if not best_near:
                 continue
 
-            strike, opt_type, near_premium, near_opt = best_near
+            strike, opt_type, near_premium_raw, near_opt = best_near
+            passed_near, reason_near, quality_near = execution_check(near_opt)
+            if not passed_near:
+                continue  # Skip illiquid options
+            near_premium = near_opt.get("bid", near_opt.get("premium", 0))  # SELL: use bid
 
             # Find same strike in far month
             far_opt = None
@@ -1914,7 +1987,7 @@ def _scan_calendar_spreads(cash_balance: float, settings: dict, dte: int, kite_s
             if not far_opt or far_opt.get("premium", 0) <= 0:
                 continue
 
-            far_premium = far_opt["premium"]
+            far_premium = far_opt.get("ask", far_opt.get("premium", 0))  # BUY: use ask
 
             # Calendar spread: sell near, buy far — net debit
             net_debit_per_share = far_premium - near_premium
@@ -1994,6 +2067,7 @@ def _scan_calendar_spreads(cash_balance: float, settings: dict, dte: int, kite_s
                 "exit_at_profit_pct": 25,  # Strategy 4: exit at 25% profit
                 "exit_at_decay_pct": 40,   # Strategy 4: roll at 40% near decay
                 "price_source": "kite",
+                "execution_quality": quality_near,
                 "fetched_at": _now_ist(),
             }))
 
@@ -2230,6 +2304,12 @@ def scan_strategies(
         rec["risk_adjusted_return"] = round(ann_return * risk_factor, 2)
         rec["risk_factor"] = risk_factor
         rec["sentiment_note"] = SENTIMENT_NOTES.get(sentiment_signal, "")
+
+    # Add market status to each recommendation
+    from execution_filter import get_market_status
+    market_status = get_market_status()
+    for rec in all_recs:
+        rec["market_status"] = market_status
 
     # Fetch real margins from Kite for sell legs (if connected)
     if kite_is_live:

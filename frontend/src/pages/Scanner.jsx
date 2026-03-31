@@ -167,7 +167,7 @@ function RecCard({ rec, idx, expanded, onToggle }) {
     : C.muted;
 
   return (
-    <div style={{ ...cardStyle, padding: 0, overflow: 'hidden' }}>
+    <div style={{ ...cardStyle, padding: 0, overflow: 'hidden', opacity: rec.decision === 'REJECT' ? 0.5 : 1 }}>
       {/* ── Card Header (clickable) ── */}
       <div
         onClick={() => onToggle(id)}
@@ -209,7 +209,15 @@ function RecCard({ rec, idx, expanded, onToggle }) {
 
         {/* Net Premium */}
         <span style={{ fontFamily: font.mono, fontWeight: 700, fontSize: 18, color: C.emerald }}>
-          NET {fmtCur(rec.net_premium)}
+          {/* Decision badge */}
+          <span style={{
+            padding: '2px 8px', borderRadius: 4, fontSize: 10, fontWeight: 700, marginRight: 8,
+            background: rec.decision === 'GO' ? 'rgba(110,231,183,0.15)' : rec.decision === 'REJECT' ? 'rgba(248,113,113,0.15)' : 'rgba(252,211,77,0.15)',
+            color: rec.decision === 'GO' ? C.emerald : rec.decision === 'REJECT' ? C.red : C.amber,
+          }}>
+            {rec.decision || 'REVIEW'}
+          </span>
+          NET {fmtCur(rec.net_credit_adjusted || rec.net_premium || rec.premium)}
         </span>
 
         {expanded ? <ChevronUp size={18} style={{ color: C.muted }} /> : <ChevronDown size={18} style={{ color: C.muted }} />}
@@ -222,7 +230,12 @@ function RecCard({ rec, idx, expanded, onToggle }) {
         gridTemplateColumns: 'repeat(5, 1fr)',
         gap: 12,
       }}>
-        <Metric label="Net Premium" value={fmtCur(rec.net_premium)} color={C.emerald} tooltip="Total income after all charges (brokerage, STT, GST, exchange)" />
+        <Metric
+          label="Net Premium (after slippage)"
+          value={rec.net_credit_adjusted ? `${fmtCur(rec.net_credit_adjusted)} (raw: ${fmtCur(rec.net_premium)})` : fmtCur(rec.net_premium)}
+          color={C.emerald}
+          tooltip="Net income after charges and 10% slippage buffer. Raw = before slippage."
+        />
         <Metric label="Max Loss" value={fmtCur(rec.max_loss)} color={C.red} tooltip="Maximum possible loss if option expires in-the-money" />
         <Metric label="Prob OTM" value={fmtPct(rec.prob_otm)} color={C.emerald} tooltip="Probability the option expires out-of-the-money (worthless) — you keep the premium" />
         <Metric
@@ -365,6 +378,13 @@ function RecCard({ rec, idx, expanded, onToggle }) {
         </div>
       )}
 
+      {/* ── Confidence Reasons ── */}
+      {rec.confidence_reasons && rec.confidence_reasons.length > 0 && (
+        <div style={{ padding: '0 24px 8px', fontSize: 11, color: C.muted }}>
+          {rec.confidence_reasons.map((r, i) => <span key={i} style={{ marginRight: 8 }}>• {r}</span>)}
+        </div>
+      )}
+
       {/* ── Price Source (always visible) ── */}
       <div style={{ padding: '0 24px 8px', display: 'flex', gap: 12, fontSize: 11, fontFamily: font.mono, color: C.muted }}>
         <span>
@@ -375,6 +395,16 @@ function RecCard({ rec, idx, expanded, onToggle }) {
         {rec.fetched_at && (
           <span>
             Fetched: {new Date(rec.fetched_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
+          </span>
+        )}
+        {rec.bs_derived && rec.bs_derived.length > 0 && (
+          <span style={{ color: C.amber }}>
+            BS-derived: {rec.bs_derived.join(', ')}
+          </span>
+        )}
+        {rec.execution_quality && (
+          <span style={{ color: rec.execution_quality === 'GOOD' ? C.emerald : rec.execution_quality === 'FAIR' ? C.amber : C.red }}>
+            Execution: {rec.execution_quality}
           </span>
         )}
       </div>
@@ -543,6 +573,7 @@ export default function Scanner() {
   const [totalMarginRequired, setTotalMarginRequired] = useState(null);
   const [dataSource, setDataSource] = useState(null);  // "kite" or "simulation"
   const [sentiment, setSentiment] = useState(null);
+  const [marketStatus, setMarketStatus] = useState(null);
 
   /* ─── Init — only scan if no cached results ─── */
   useEffect(() => {
@@ -578,6 +609,7 @@ export default function Scanner() {
       setTotalWeeklyIncome(scanData?.total_weekly_income ?? null);
       setTotalMarginRequired(scanData?.total_margin_required ?? null);
       setDataSource(scanData?.data_source || null);
+      setMarketStatus(scanData?.market_status || null);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -693,6 +725,16 @@ export default function Scanner() {
           )}
           {!dataSource && !scanning && (
             <span style={{ fontSize: 12, color: C.muted }}>Click "Scan Now" to analyze</span>
+          )}
+          {marketStatus && (
+            <span style={{
+              fontSize: 11, fontWeight: 600, padding: '3px 10px', borderRadius: 999,
+              fontFamily: font.mono,
+              background: marketStatus.is_open ? 'rgba(110,231,183,0.12)' : 'rgba(252,211,77,0.12)',
+              color: marketStatus.is_open ? C.emerald : C.amber,
+            }}>
+              {marketStatus.message} ({marketStatus.time})
+            </span>
           )}
         </div>
 

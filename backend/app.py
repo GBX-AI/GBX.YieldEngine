@@ -1147,6 +1147,7 @@ def create_app():
             "kite_user_id": token_data.get("kite_user_id") if token_data else None,
             "sentiment": recs[0].get("sentiment_signal") if recs else None,
             "sentiment_score": recs[0].get("sentiment_score") if recs else None,
+            "market_status": recs[0].get("market_status") if recs else None,
         })
 
     @app.route("/api/recommendations", methods=["GET", "POST"])
