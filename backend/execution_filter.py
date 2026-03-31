@@ -36,13 +36,23 @@ def execution_check(option_data):
     volume = option_data.get("volume", 0)
     oi = option_data.get("oi", 0)
 
-    # No bid or ask — completely illiquid
-    if bid <= 0 and ask <= 0:
-        return False, "NO_QUOTES", "REJECT"
+    # Check if market is open
+    market_open, _ = is_market_hours()
 
-    # Use LTP as fallback if bid/ask partially missing (after hours)
+    # No bid or ask — use LTP fallback (especially after hours)
+    if bid <= 0 and ask <= 0:
+        if ltp > 0:
+            # After hours or pre-open — use LTP as estimate
+            bid = ltp * 0.98
+            ask = ltp * 1.02
+            if not market_open:
+                return True, "AFTER_HOURS (LTP-based)", "FAIR"
+        else:
+            return False, "NO_QUOTES", "REJECT"
+
+    # Use LTP as fallback if bid/ask partially missing
     if bid <= 0 and ltp > 0:
-        bid = ltp * 0.98  # Estimate bid as 2% below LTP
+        bid = ltp * 0.98
     if ask <= 0 and ltp > 0:
         ask = ltp * 1.02  # Estimate ask as 2% above LTP
 
