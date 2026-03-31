@@ -223,7 +223,9 @@ def _resolve_settings(settings: dict | None) -> dict:
     # Normalize allowed_strategies to a set
     allowed = base["allowed_strategies"]
     if isinstance(allowed, str):
-        base["allowed_strategies"] = {s.strip() for s in allowed.split(",")}
+        base["allowed_strategies"] = {s.strip() for s in allowed.split(",") if s.strip()}
+    # Auto-include strategies added after the user last saved settings
+    base["allowed_strategies"] = base["allowed_strategies"] | set(STRATEGY_TYPES)
     return base
 
 
@@ -2310,7 +2312,7 @@ def scan_strategies(
         rec["market_status"] = market_status
 
     # Fetch real margins from Kite for sell legs (if connected)
-    if kite_is_live:
+    if kite_connected:
         for rec in all_recs:
             legs = rec.get("legs", [])
             for leg in legs:
