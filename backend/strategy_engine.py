@@ -127,6 +127,18 @@ def passes_risk_filter(safety_tag: str, risk_profile: str) -> bool:
     return True  # aggressive — show everything
 
 
+def _sell_price(opt_data: dict) -> float:
+    """Best available sell price: bid > LTP > 0. Handles holidays where bid=0."""
+    bid = opt_data.get("bid", 0)
+    return bid if bid > 0 else opt_data.get("premium", 0)
+
+
+def _buy_price(opt_data: dict) -> float:
+    """Best available buy price: ask > LTP > 0. Handles holidays where ask=0."""
+    ask = opt_data.get("ask", 0)
+    return ask if ask > 0 else opt_data.get("premium", 0)
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _round_to_step(value: float, step: float) -> float:
@@ -685,7 +697,7 @@ def _scan_covered_calls(holdings: list, settings: dict, dte: int, kite_service=N
                 passed, reason, quality = execution_check(ce_data)
                 if not passed:
                     continue  # Skip illiquid options
-                premium = ce_data.get("bid", ce_data.get("premium", 0))  # SELL: use bid
+                premium = _sell_price(ce_data)
                 prob_otm = greeks["prob_otm"]
                 delta_val = greeks["delta"]
                 theta_day = greeks["theta"]
@@ -837,7 +849,7 @@ def _scan_cash_secured_puts(cash_balance: float, settings: dict, dte: int, kite_
                 passed, reason, quality = execution_check(pe_data)
                 if not passed:
                     continue  # Skip illiquid options
-                premium = pe_data.get("bid", pe_data.get("premium", 0))  # SELL: use bid
+                premium = _sell_price(pe_data)
                 prob_otm = greeks["prob_otm"]
                 delta_val = greeks["delta"]
                 theta_day = greeks["theta"]
@@ -989,7 +1001,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                 passed, reason, sell_quality = execution_check(sell_pe)
                 if not passed:
                     continue  # Skip illiquid sell leg
-                sell_premium = sell_pe.get("bid", sell_pe.get("premium", 0))  # SELL: use bid
+                sell_premium = _sell_price(sell_pe)
 
                 # Find buy strike (spread width below sell)
                 chain_map = {s["strike"]: s for s in real_chain["strikes"]}
@@ -1003,7 +1015,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                     if buy_chain and buy_chain.get("premium", 0) > 0:
                         if buy_chain.get("oi", 0) < 100:
                             continue
-                        buy_premium = buy_chain.get("ask", buy_chain.get("premium", 0))  # BUY: use ask
+                        buy_premium = _buy_price(buy_chain)
                         buy_greeks = compute_greeks(spot, buy_strike_candidate, T, RISK_FREE_RATE, iv, "PE")
                         net_credit = sell_premium - buy_premium
                         if net_credit <= 0:
@@ -1291,8 +1303,8 @@ def _scan_collars(holdings: list, settings: dict, dte: int, kite_service=None) -
                 passed_pe, reason_pe, quality_pe = execution_check(pe_data)
                 if not passed_ce or not passed_pe:
                     continue  # Skip illiquid options
-                call_premium = ce_data.get("bid", ce_data.get("premium", 0))  # SELL: use bid
-                put_premium = pe_data.get("ask", pe_data.get("premium", 0))  # BUY: use ask
+                call_premium = _sell_price(ce_data)
+                put_premium = _buy_price(pe_data)
                 use_real = True
                 if real_chain.get("dte"):
                     dte = real_chain["dte"]
@@ -1456,8 +1468,8 @@ def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_se
                 continue  # Skip illiquid options
 
             # Use bid for SELL legs
-            ce_premium_val = ce.get("bid", ce.get("premium", 0))
-            pe_premium_val = pe.get("bid", pe.get("premium", 0))
+            ce_premium_val = _sell_price(ce)
+            pe_premium_val = _sell_price(pe)
 
             # Filter: CE or PE premium >= min% of strike
             ce_pct = (ce_premium_val / ce["strike"]) * 100 if ce["strike"] else 0
@@ -1642,9 +1654,9 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                     if not passed_sc or not passed_sp or not passed_bp:
                         pass  # Fall through to BS fallback
                     else:
-                        sell_call_premium = sell_call_data.get("bid", sell_call_data.get("premium", 0))  # SELL: use bid
-                        sell_put_premium = sell_put_data.get("bid", sell_put_data.get("premium", 0))  # SELL: use bid
-                        buy_put_premium = buy_put_data.get("ask", buy_put_data.get("premium", 0))  # BUY: use ask
+                        sell_call_premium = _sell_price(sell_call_data)
+                        sell_put_premium = _sell_price(sell_put_data)
+                        buy_put_premium = _buy_price(buy_put_data)
                         use_real = True
 
                     # Update lot_size from chain
@@ -1835,7 +1847,7 @@ def _scan_rsi_option_sells(cash_balance: float, settings: dict, dte: int, kite_s
             passed, reason, quality = execution_check(opt_data)
             if not passed:
                 continue  # Skip illiquid options
-            premium = opt_data.get("bid", opt_data.get("premium", 0))  # SELL: use bid
+            premium = _sell_price(opt_data)
 
             if premium <= 0:
                 continue
@@ -1977,7 +1989,7 @@ def _scan_calendar_spreads(cash_balance: float, settings: dict, dte: int, kite_s
             passed_near, reason_near, quality_near = execution_check(near_opt)
             if not passed_near:
                 continue  # Skip illiquid options
-            near_premium = near_opt.get("bid", near_opt.get("premium", 0))  # SELL: use bid
+            near_premium = _sell_price(near_opt)
 
             # Find same strike in far month
             far_opt = None
@@ -1989,7 +2001,7 @@ def _scan_calendar_spreads(cash_balance: float, settings: dict, dte: int, kite_s
             if not far_opt or far_opt.get("premium", 0) <= 0:
                 continue
 
-            far_premium = far_opt.get("ask", far_opt.get("premium", 0))  # BUY: use ask
+            far_premium = _buy_price(far_opt)
 
             # Calendar spread: sell near, buy far — net debit
             net_debit_per_share = far_premium - near_premium
