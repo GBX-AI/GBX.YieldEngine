@@ -1567,14 +1567,13 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
     """
     Scan for Iron Condor opportunities on NIFTY and BANKNIFTY.
 
-    Strategy 5b from Trade Strategy doc:
+    A proper Iron Condor has exactly 4 legs:
     - Sell Call at spot+3%
+    - Buy Call at spot+6% (upside protection)
     - Sell Put at spot-3%
     - Buy Put at spot-6% (downside protection)
-    - Hold to expiry or roll at 50% leg decay
 
-    Max loss is capped on the downside by the protective put.
-    Upside is uncapped (no protective call — this is a jade lizard variant).
+    Max loss is bounded on both sides by the protective legs.
     """
     recs = []
     kite_connected = kite_service and kite_service.is_authenticated()
@@ -1602,9 +1601,10 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
 
             T = actual_dte / 365.0
 
-            # Strike selection: +3%, -3%, -6% from spot
+            # Strike selection: +3%/+6% calls, -3%/-6% puts
             step = INDEX_STRIKE_STEP.get(index_name, 50)
             sell_call_strike = _round_to_step(spot * 1.03, step)
+            buy_call_strike = _round_to_step(spot * 1.06, step)
             sell_put_strike = _round_to_step(spot * 0.97, step)
             buy_put_strike = _round_to_step(spot * 0.94, step)
 
@@ -1612,6 +1612,7 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
             real_chain = None
             use_real = False
             sell_call_premium = 0
+            buy_call_premium = 0
             sell_put_premium = 0
             buy_put_premium = 0
 
@@ -1619,10 +1620,6 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                 real_chain = market_data.get_option_chain_live(kite_service, index_name, expiry_date, num_strikes=20)
 
             if real_chain and real_chain.get("strikes"):
-                chain_map = {}
-                for s in real_chain["strikes"]:
-                    chain_map[s["strike"]] = s
-
                 # Find nearest strikes in chain
                 def _find_nearest(target, opt_type):
                     best = None
@@ -1640,21 +1637,32 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                     return best
 
                 sc = _find_nearest(sell_call_strike, "CE")
+                bc = _find_nearest(buy_call_strike, "CE")
                 sp = _find_nearest(sell_put_strike, "PE")
                 bp = _find_nearest(buy_put_strike, "PE")
 
-                if sc and sp and bp:
+                # All 4 legs must be found for a valid Iron Condor
+                if sc and bc and sp and bp:
                     sell_call_strike, sell_call_data = sc
+                    buy_call_strike, buy_call_data = bc
                     sell_put_strike, sell_put_data = sp
                     buy_put_strike, buy_put_data = bp
 
+                    # Ensure buy strikes are further OTM than sell strikes
+                    if buy_call_strike <= sell_call_strike:
+                        buy_call_strike = sell_call_strike + step
+                    if buy_put_strike >= sell_put_strike:
+                        buy_put_strike = sell_put_strike - step
+
                     passed_sc, reason_sc, quality_sc = execution_check(sell_call_data)
+                    passed_bc, reason_bc, quality_bc = execution_check(buy_call_data)
                     passed_sp, reason_sp, quality_sp = execution_check(sell_put_data)
                     passed_bp, reason_bp, quality_bp = execution_check(buy_put_data)
-                    if not passed_sc or not passed_sp or not passed_bp:
+                    if not passed_sc or not passed_bc or not passed_sp or not passed_bp:
                         pass  # Fall through to BS fallback
                     else:
                         sell_call_premium = _sell_price(sell_call_data)
+                        buy_call_premium = _buy_price(buy_call_data)
                         sell_put_premium = _sell_price(sell_put_data)
                         buy_put_premium = _buy_price(buy_put_data)
                         use_real = True
@@ -1666,37 +1674,41 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
             if not use_real:
                 # Black-Scholes fallback
                 sell_call_premium = compute_greeks(spot, sell_call_strike, T, RISK_FREE_RATE, iv, "CE")["price"]
+                buy_call_premium = compute_greeks(spot, buy_call_strike, T, RISK_FREE_RATE, iv, "CE")["price"]
                 sell_put_premium = compute_greeks(spot, sell_put_strike, T, RISK_FREE_RATE, iv, "PE")["price"]
                 buy_put_premium = compute_greeks(spot, buy_put_strike, T, RISK_FREE_RATE, iv, "PE")["price"]
 
-            net_premium_per_share = sell_call_premium + sell_put_premium - buy_put_premium
+            net_premium_per_share = (sell_call_premium + sell_put_premium
+                                     - buy_call_premium - buy_put_premium)
             if net_premium_per_share <= 0:
                 continue
 
             total_premium = net_premium_per_share * lot_size
 
-            # Max loss calculation:
-            # Downside: capped at (sell_put_strike - buy_put_strike - net_premium) * lot_size
-            # Upside: uncapped (no protective call) — use 2x premium as practical max
+            # Max loss: width of the wider spread minus net premium received
+            call_spread_width = buy_call_strike - sell_call_strike
             put_spread_width = sell_put_strike - buy_put_strike
-            max_loss_downside = (put_spread_width - net_premium_per_share) * lot_size
-            max_loss_upside = total_premium * 3  # Practical estimate for uncapped upside
+            wider_spread = max(call_spread_width, put_spread_width)
+            max_loss = (wider_spread - net_premium_per_share) * lot_size
 
             # BEP points
             bep_upper = sell_call_strike + net_premium_per_share
             bep_lower = sell_put_strike - net_premium_per_share
 
-            # Greeks
+            # Greeks (all 4 legs)
             sc_greeks = compute_greeks(spot, sell_call_strike, T, RISK_FREE_RATE, iv, "CE")
+            bc_greeks = compute_greeks(spot, buy_call_strike, T, RISK_FREE_RATE, iv, "CE")
             sp_greeks = compute_greeks(spot, sell_put_strike, T, RISK_FREE_RATE, iv, "PE")
             bp_greeks = compute_greeks(spot, buy_put_strike, T, RISK_FREE_RATE, iv, "PE")
 
-            net_delta = sc_greeks["delta"] + sp_greeks["delta"] - bp_greeks["delta"]
-            net_theta = (sc_greeks["theta"] + sp_greeks["theta"] - bp_greeks["theta"]) * lot_size
+            net_delta = (sc_greeks["delta"] + sp_greeks["delta"]
+                         - bc_greeks["delta"] - bp_greeks["delta"])
+            net_theta = ((sc_greeks["theta"] + sp_greeks["theta"]
+                          - bc_greeks["theta"] - bp_greeks["theta"]) * lot_size)
             prob_otm = sc_greeks["prob_otm"] * sp_greeks["prob_otm"]
 
-            # Margin: approximate as the put spread width * lot_size (defined risk on put side)
-            margin_needed = put_spread_width * lot_size * 1.2  # 20% buffer
+            # Margin: wider spread width * lot_size (defined risk on both sides)
+            margin_needed = wider_spread * lot_size * 1.2  # 20% buffer
 
             safety_tag = classify_safety(prob_otm, 0.03)  # 3% OTM on both sides
             if not passes_risk_filter(safety_tag, settings["risk_profile"]):
@@ -1707,11 +1719,17 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
             legs = [
                 _build_leg("SELL", sell_call_strike, sell_call_premium, lot_size, "CE",
                           tradingsymbol=sell_call_data.get("tradingsymbol") if use_real else None),
+                _build_leg("BUY", buy_call_strike, buy_call_premium, lot_size, "CE",
+                          tradingsymbol=buy_call_data.get("tradingsymbol") if use_real else None),
                 _build_leg("SELL", sell_put_strike, sell_put_premium, lot_size, "PE",
                           tradingsymbol=sell_put_data.get("tradingsymbol") if use_real else None),
                 _build_leg("BUY", buy_put_strike, buy_put_premium, lot_size, "PE",
                           tradingsymbol=buy_put_data.get("tradingsymbol") if use_real else None),
             ]
+
+            # Validate: Iron Condor must have exactly 4 legs
+            if len(legs) != 4:
+                continue
 
             recs.append(_enrich_recommendation({
                 "id": generate_id(),
@@ -1720,24 +1738,24 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                 "strategy_type": "IRON_CONDOR",
                 "strike": sell_call_strike,
                 "put_strike": sell_put_strike,
-                "protection_strike": buy_put_strike,
+                "call_protection_strike": buy_call_strike,
+                "put_protection_strike": buy_put_strike,
                 "option_type": "CE+PE",
                 "legs": legs,
                 "premium_income": round(total_premium, 2),
                 "margin_needed": round(margin_needed, 2),
-                "max_loss": round(max_loss_downside, 2),
-                "max_loss_upside": round(max_loss_upside, 2),
+                "max_loss": round(max_loss, 2),
                 "prob_otm": round(prob_otm, 4),
                 "delta": round(net_delta, 4),
                 "annualized_return": round(ann_return, 4),
                 "theta_per_day": round(net_theta, 2),
                 "safety_tag": safety_tag,
                 "strike_rationale": (
-                    f"IRON_CONDOR: Sell {sell_call_strike}CE + Sell {sell_put_strike}PE + "
-                    f"Buy {buy_put_strike}PE (protection). "
+                    f"IRON_CONDOR: Sell {sell_call_strike}CE / Buy {buy_call_strike}CE + "
+                    f"Sell {sell_put_strike}PE / Buy {buy_put_strike}PE. "
                     f"Net premium ₹{net_premium_per_share:.2f}/share. "
                     f"BEP: {bep_lower:.0f} — {bep_upper:.0f}. "
-                    f"Max loss (downside): ₹{max_loss_downside:.0f} (capped by protection)"
+                    f"Max loss: ₹{max_loss:.0f} (bounded on both sides)"
                 ),
                 "alternatives": {},
                 "fee_estimate": _fee_estimate(legs),
@@ -1748,6 +1766,7 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                 "bep_upper": round(bep_upper, 2),
                 "bep_lower": round(bep_lower, 2),
                 "net_premium_per_share": round(net_premium_per_share, 2),
+                "call_spread_width": call_spread_width,
                 "put_spread_width": put_spread_width,
                 "price_source": "kite" if use_real else "simulation",
                 "execution_quality": quality_sc if use_real else "FAIR",

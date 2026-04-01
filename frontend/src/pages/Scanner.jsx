@@ -121,6 +121,75 @@ const Metric = ({ label, value, color = C.text, tooltip }) => (
   </div>
 );
 
+/* ─── Strategy Leg Validation ─── */
+const EXPECTED_LEGS = {
+  IRON_CONDOR: { count: 4, required: [
+    { action: 'SELL', option_type: 'CE', label: 'Sell CE' },
+    { action: 'BUY',  option_type: 'CE', label: 'Buy CE' },
+    { action: 'SELL', option_type: 'PE', label: 'Sell PE' },
+    { action: 'BUY',  option_type: 'PE', label: 'Buy PE' },
+  ]},
+  SHORT_STRANGLE: { count: 2, required: [
+    { action: 'SELL', option_type: 'CE', label: 'Sell CE' },
+    { action: 'SELL', option_type: 'PE', label: 'Sell PE' },
+  ]},
+  PUT_CREDIT_SPREAD: { count: 2, required: [
+    { action: 'SELL', option_type: 'PE', label: 'Sell PE' },
+    { action: 'BUY',  option_type: 'PE', label: 'Buy PE' },
+  ]},
+  COLLAR: { count: 2, required: [
+    { action: 'SELL', option_type: 'CE', label: 'Sell CE' },
+    { action: 'BUY',  option_type: 'PE', label: 'Buy PE' },
+  ]},
+  CALENDAR_SPREAD: { count: 2, required: [
+    { action: 'SELL', option_type: null, label: 'Sell near-term' },
+    { action: 'BUY',  option_type: null, label: 'Buy far-term' },
+  ]},
+};
+
+function validateStrategy(rec) {
+  const stratType = rec.strategy || rec.strategy_type;
+  const spec = EXPECTED_LEGS[stratType];
+  if (!spec) return { valid: true, warnings: [] };
+
+  const legs = rec.legs || [];
+  const warnings = [];
+  let hasNakedShort = false;
+
+  if (legs.length < spec.count) {
+    const present = legs.map(l => `${l.action} ${l.option_type}`);
+    for (const req of spec.required) {
+      const match = legs.find(l =>
+        l.action === req.action && (req.option_type === null || l.option_type === req.option_type)
+      );
+      if (!match) warnings.push(`Missing ${req.label} leg`);
+    }
+  }
+
+  // Check for naked shorts: each SELL leg must have a BUY on the same side
+  for (const leg of legs) {
+    if ((leg.action || '').toUpperCase() !== 'SELL') continue;
+    const hedge = legs.find(l =>
+      (l.action || '').toUpperCase() === 'BUY' && l.option_type === leg.option_type
+    );
+    if (!hedge) {
+      hasNakedShort = true;
+      warnings.push(`Naked short ${leg.option_type} at ${leg.strike} — no protective hedge`);
+    }
+  }
+
+  // Check lot sizes match
+  const lotSizes = new Set(legs.map(l => l.quantity));
+  if (lotSizes.size > 1) warnings.push('Lot sizes do not match across legs');
+
+  return {
+    valid: warnings.length === 0,
+    warnings,
+    hasNakedShort,
+    incomplete: legs.length < (spec?.count || 0),
+  };
+}
+
 /* ─── Recommendation Card ─── */
 function RecCard({ rec, idx, expanded, onToggle }) {
   const id = rec.id || `${rec.symbol}-${rec.strike}-${idx}`;
@@ -129,6 +198,7 @@ function RecCard({ rec, idx, expanded, onToggle }) {
   const isCoveredCall = (rec.strategy || rec.strategy_type) === 'COVERED_CALL';
   const exitSug = rec.exit_suggestion;
   const charges = rec.charges_breakdown;
+  const validation = validateStrategy(rec);
 
   const [executed, setExecuted] = useState(false);
   const [executing, setExecuting] = useState(false);
@@ -199,10 +269,16 @@ function RecCard({ rec, idx, expanded, onToggle }) {
           {(rec.strategy || rec.strategy_type || '').replace(/_/g, ' ')}
         </Badge>
 
-        {/* Safety badge */}
-        <Badge color={safetyColor}>
-          {(rec.safety || rec.safety_tag || '').replace(/_/g, ' ')}
-        </Badge>
+        {/* Safety badge — override for invalid strategies */}
+        {!validation.valid ? (
+          <Badge color={C.red}>
+            {validation.incomplete ? 'INCOMPLETE' : 'INVALID'}
+          </Badge>
+        ) : (
+          <Badge color={safetyColor}>
+            {(rec.safety || rec.safety_tag || '').replace(/_/g, ' ')}
+          </Badge>
+        )}
 
         {/* Spacer */}
         <span style={{ flex: 1 }} />
@@ -236,15 +312,15 @@ function RecCard({ rec, idx, expanded, onToggle }) {
           color={C.emerald}
           tooltip="Net income after charges and 10% slippage buffer. Raw = before slippage."
         />
-        <Metric label="Max Loss" value={fmtCur(rec.max_loss)} color={C.red} tooltip="Maximum possible loss if option expires in-the-money" />
+        <Metric label="Max Loss" value={validation.hasNakedShort ? 'Unlimited' : fmtCur(rec.max_loss)} color={C.red} tooltip={validation.hasNakedShort ? 'Unbounded — naked short has unlimited risk' : 'Maximum possible loss if option expires in-the-money'} />
         <Metric label="Prob OTM" value={fmtPct(rec.prob_otm)} color={C.emerald} tooltip="Probability the option expires out-of-the-money (worthless) — you keep the premium" />
         <Metric
           label={rec.risk_adjusted_return != null && rec.risk_factor < 1 ? "Risk-Adj. Return" : "True Ann. Return"}
-          value={rec.risk_adjusted_return != null && rec.risk_factor < 1
+          value={validation.hasNakedShort ? 'N/A' : rec.risk_adjusted_return != null && rec.risk_factor < 1
             ? `${fmtPct(rec.risk_adjusted_return)} (raw: ${fmtPct(rec.annualized_return)})`
             : fmtPct(rec.annualized_return)}
-          color={C.amber}
-          tooltip={`Annualized return after charges${rec.risk_factor < 1 ? `. Adjusted by ${(rec.risk_factor * 100).toFixed(0)}% for ${rec.sentiment_signal || 'market'} sentiment` : ''}`}
+          color={validation.hasNakedShort ? C.red : C.amber}
+          tooltip={validation.hasNakedShort ? 'Cannot compute — naked short has unlimited risk' : `Annualized return after charges${rec.risk_factor < 1 ? `. Adjusted by ${(rec.risk_factor * 100).toFixed(0)}% for ${rec.sentiment_signal || 'market'} sentiment` : ''}`}
         />
         <Metric label="Expiry" value={rec.expiry_display ? `${rec.expiry_display} (${rec.dte}d)` : rec.dte ? `${rec.dte}d` : '—'} color={C.muted} tooltip="Option expiry date from NSE (includes holiday adjustments)" />
       </div>
@@ -269,8 +345,37 @@ function RecCard({ rec, idx, expanded, onToggle }) {
             {rec.delta_impact === 'REDUCES_DELTA' ? 'Reduces' : rec.delta_impact === 'ADDS_DELTA' ? 'Adds' : rec.delta_impact || '—'}
           </Badge>
         </div>
-        <Metric label="R:R Ratio" value={rec.risk_reward_ratio != null ? `1:${Number(rec.risk_reward_ratio).toFixed(1)}` : '—'} color={C.text} tooltip="Risk to reward — ratio of max profit to max loss" />
+        <Metric label="R:R Ratio" value={validation.hasNakedShort ? 'N/A' : rec.risk_reward_ratio != null ? `1:${Number(rec.risk_reward_ratio).toFixed(1)}` : '—'} color={validation.hasNakedShort ? C.red : C.text} tooltip={validation.hasNakedShort ? 'Cannot compute — naked short has unlimited risk' : 'Risk to reward — ratio of max profit to max loss'} />
       </div>
+
+      {/* ── Validation Warnings ── */}
+      {!validation.valid && (
+        <div style={{ padding: '0 24px 12px' }}>
+          {validation.hasNakedShort && (
+            <div style={{
+              padding: '10px 16px', borderRadius: 10, marginBottom: 8,
+              background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)',
+              fontSize: 13, color: C.red, fontWeight: 600,
+            }}>
+              NAKED SHORT DETECTED — Unlimited risk. Do not execute without hedge.
+            </div>
+          )}
+          {validation.warnings.map((w, i) => (
+            <div key={i} style={{
+              padding: '6px 16px', borderRadius: 8, marginBottom: 4,
+              background: 'rgba(251,191,36,0.08)', border: '1px solid rgba(251,191,36,0.2)',
+              fontSize: 12, color: C.amber,
+            }}>
+              {w}
+            </div>
+          ))}
+          {validation.incomplete && (
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 4, fontStyle: 'italic' }}>
+              Max loss, R:R ratio, and risk-adjusted return are unreliable for incomplete strategies.
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── Trade Legs (always visible) ── */}
       {rec.legs && rec.legs.length > 0 && (
@@ -346,7 +451,8 @@ function RecCard({ rec, idx, expanded, onToggle }) {
         </div>
       )}
 
-      {/* ── Mark as Executed ── */}
+      {/* ── Mark as Executed (hidden for invalid strategies) ── */}
+      {validation.valid && (
       <div style={{ padding: '0 24px 16px' }}>
         <label style={{
           display: 'inline-flex', alignItems: 'center', gap: 10, cursor: executed ? 'default' : 'pointer',
@@ -366,6 +472,7 @@ function RecCard({ rec, idx, expanded, onToggle }) {
           {executed ? 'Executed — Tracking this trade' : executing ? 'Saving...' : 'I executed this trade'}
         </label>
       </div>
+      )}
 
       {/* ── Sentiment Note (per card) ── */}
       {rec.sentiment_note && (
