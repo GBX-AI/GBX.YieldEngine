@@ -450,8 +450,8 @@ def _enrich_recommendation(rec: dict) -> dict:
 
     # ── 1. Compute charges (Prompt 1) ──
     legs = rec.get("legs", [])
-    lot_size = rec.get("lot_size", 1)
-    lots = rec.get("lots", 1)
+    lot_size = rec.get("lot_size") or 1
+    lots = rec.get("lots") or 1
 
     # Calculate gross premium: sum(premium * qty) for SELL legs - sum(premium * qty) for BUY legs
     gross_premium = 0
@@ -527,17 +527,21 @@ def _enrich_recommendation(rec: dict) -> dict:
     elif strategy == "COLLAR":
         call_strike = rec.get("strike", 0)
         put_strike = rec.get("put_strike", 0)
-        rec["max_profit"] = round(net, 2) if net > 0 else 0
-        rec["max_loss"] = round((rec.get("spot", 0) - put_strike) * qty, 2) if put_strike else 0
+        spot = rec.get("spot", 0)
+        net_per_share = net / qty if qty else 0
+        rec["max_profit"] = round((call_strike - spot + net_per_share) * qty, 2)
+        rec["max_loss"] = round((spot - put_strike - net_per_share) * qty, 2) if put_strike else 0
         rec["max_loss_point"] = put_strike
         rec["max_profit_point"] = call_strike
 
     elif strategy == "IRON_CONDOR":
         rec["max_profit"] = round(net, 2)
-        # Downside capped by protective put
+        # Max loss = wider spread width × lot_size - net premium
+        call_width = rec.get("call_spread_width", 0)
         put_width = rec.get("put_spread_width", 0)
-        rec["max_loss"] = round((put_width * qty) - net, 2) if put_width else round(rec.get("max_loss", 0), 2)
-        rec["max_loss_point"] = rec.get("protection_strike", 0)
+        wider_width = max(call_width, put_width)
+        rec["max_loss"] = round((wider_width * qty) - net, 2) if wider_width else round(rec.get("max_loss", 0), 2)
+        rec["max_loss_point"] = rec.get("put_protection_strike", rec.get("call_protection_strike", 0))
         rec["max_profit_point"] = rec.get("strike", 0)  # Both sell strikes
 
     elif strategy == "CALENDAR_SPREAD":
@@ -545,9 +549,25 @@ def _enrich_recommendation(rec: dict) -> dict:
         rec["max_loss"] = round(rec.get("net_debit_per_share", 0) * qty, 2)  # Net debit paid
         rec["max_loss_point"] = rec.get("strike", 0)  # ATM = max risk
 
+    elif strategy == "RSI_OPTION_SELL":
+        rec["max_profit"] = round(net, 2)
+        opt_type = rec.get("option_type", "")
+        strike = rec.get("strike", 0)
+        if opt_type == "CE":
+            # Naked short call — unlimited upside risk
+            rec["max_loss"] = float("inf")
+            rec["unlimited_risk"] = True
+        else:
+            # Naked short put — max loss if stock goes to 0
+            rec["max_loss"] = round((strike * qty) - net, 2)
+        rec["max_loss_point"] = 0 if opt_type == "CE" else strike
+        rec["max_profit_point"] = strike
+
     elif strategy in ("SHORT_STRANGLE", "ATM_SHORT_STRANGLE"):
         rec["max_profit"] = round(net, 2)
-        # Strangle max loss is theoretically unlimited
+        # Strangle max loss is theoretically unlimited (naked shorts on both sides)
+        rec["max_loss"] = float("inf")
+        rec["unlimited_risk"] = True
         rec["max_loss_point"] = 0
         rec["max_profit_point"] = rec.get("strike", 0)
 
@@ -555,22 +575,36 @@ def _enrich_recommendation(rec: dict) -> dict:
         rec["max_profit"] = round(max(net, 0), 2)
         rec["max_loss"] = round(rec.get("max_loss", 0), 2)
 
+    # Handle unlimited risk: convert inf to JSON-safe representation
+    unlimited = rec.get("unlimited_risk", False)
+    if rec.get("max_loss") == float("inf"):
+        rec["max_loss"] = -1  # Sentinel: -1 means unlimited
+        rec["unlimited_risk"] = True
+        unlimited = True
+
     # Risk/reward ratio
     max_loss = rec.get("max_loss", 0)
     max_profit = rec.get("max_profit", 0)
-    rec["risk_reward_ratio"] = round(max_profit / max_loss, 4) if max_loss > 0 else 0
-    rec["loss_as_pct_of_margin"] = round((max_loss / rec.get("margin_needed", 1)) * 100, 1) if rec.get("margin_needed") else 0
+    if unlimited:
+        rec["risk_reward_ratio"] = 0
+        rec["loss_as_pct_of_margin"] = 0
+    else:
+        rec["risk_reward_ratio"] = round(max_profit / max_loss, 4) if max_loss > 0 else 0
+        rec["loss_as_pct_of_margin"] = round((max_loss / rec.get("margin_needed", 1)) * 100, 1) if rec.get("margin_needed") else 0
 
     # Re-classify safety with risk/reward awareness
-    original_tag = rec.get("safety_tag", "MODERATE")
-    adjusted_tag = classify_safety(
-        prob_otm=rec.get("prob_otm", 0.5),
-        otm_pct=abs(rec.get("strike", 0) - rec.get("spot", 0)) / rec.get("spot", 1) if rec.get("spot") else 0,
-        risk_reward_ratio=rec["risk_reward_ratio"],
-        max_loss=max_loss,
-        net_premium=net,
-    )
-    rec["safety_tag"] = adjusted_tag
+    if unlimited:
+        # Unlimited risk strategies are never SAFE or VERY_SAFE
+        rec["safety_tag"] = "AGGRESSIVE"
+    else:
+        adjusted_tag = classify_safety(
+            prob_otm=rec.get("prob_otm", 0.5),
+            otm_pct=abs(rec.get("strike", 0) - rec.get("spot", 0)) / rec.get("spot", 1) if rec.get("spot") else 0,
+            risk_reward_ratio=rec["risk_reward_ratio"],
+            max_loss=max_loss,
+            net_premium=net,
+        )
+        rec["safety_tag"] = adjusted_tag
 
     # ── 3. Exit suggestion (Prompt 3) ──
     exit_data = _calculate_exit_suggestion(rec)
@@ -1083,6 +1117,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                             "fee_estimate": fees,
                             "dte": dte,
                             "lots": lots,
+                            "lot_size": lot_size,
                             "spot": spot,
                             "spread_width": actual_width,
                             "price_source": "kite" if use_real else "simulation",
@@ -1168,6 +1203,7 @@ def _scan_put_credit_spreads(cash_balance: float, settings: dict, dte: int, kite
                     "fee_estimate": fees,
                     "dte": dte,
                     "lots": lots,
+                    "lot_size": lot_size,
                     "spot": spot,
                     "spread_width": actual_width,
                     "price_source": "simulation",
@@ -1529,7 +1565,8 @@ def _scan_short_strangles(cash_balance: float, settings: dict, dte: int, kite_se
                 "legs": legs,
                 "premium_income": round(total_premium, 2),
                 "margin_needed": round(margin_needed, 2),
-                "max_loss": round(margin_needed * 2, 2),  # Undefined for strangle, estimate
+                "max_loss": -1,  # Unlimited risk (naked shorts on both sides)
+                "unlimited_risk": True,
                 "prob_otm": round(prob_otm_combined, 4),
                 "delta": round(net_delta, 4),
                 "annualized_return": round(ann_return, 4),
@@ -1901,7 +1938,8 @@ def _scan_rsi_option_sells(cash_balance: float, settings: dict, dte: int, kite_s
                 "legs": legs,
                 "premium_income": round(total_premium, 2),
                 "margin_needed": round(margin_needed, 2),
-                "max_loss": round(strike * lot_size, 2) if opt_type == "PE" else round(total_premium * 3, 2),
+                "max_loss": round((strike * lot_size) - total_premium, 2) if opt_type == "PE" else -1,
+                "unlimited_risk": opt_type == "CE",  # Naked call = unlimited risk
                 "prob_otm": round(greeks["prob_otm"], 4),
                 "delta": round(greeks["delta"], 4),
                 "annualized_return": round(ann_return, 4),

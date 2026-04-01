@@ -312,15 +312,15 @@ function RecCard({ rec, idx, expanded, onToggle }) {
           color={C.emerald}
           tooltip="Net income after charges and 10% slippage buffer. Raw = before slippage."
         />
-        <Metric label="Max Loss" value={validation.hasNakedShort ? 'Unlimited' : fmtCur(rec.max_loss)} color={C.red} tooltip={validation.hasNakedShort ? 'Unbounded — naked short has unlimited risk' : 'Maximum possible loss if option expires in-the-money'} />
+        <Metric label="Max Loss" value={validation.hasNakedShort || rec.unlimited_risk || rec.max_loss === -1 ? 'Unlimited' : fmtCur(rec.max_loss)} color={C.red} tooltip={validation.hasNakedShort || rec.unlimited_risk ? 'Unbounded — naked short has unlimited risk' : 'Maximum possible loss if option expires in-the-money'} />
         <Metric label="Prob OTM" value={fmtPct(rec.prob_otm)} color={C.emerald} tooltip="Probability the option expires out-of-the-money (worthless) — you keep the premium" />
         <Metric
           label={rec.risk_adjusted_return != null && rec.risk_factor < 1 ? "Risk-Adj. Return" : "True Ann. Return"}
-          value={validation.hasNakedShort ? 'N/A' : rec.risk_adjusted_return != null && rec.risk_factor < 1
+          value={validation.hasNakedShort || rec.unlimited_risk ? 'N/A' : rec.risk_adjusted_return != null && rec.risk_factor < 1
             ? `${fmtPct(rec.risk_adjusted_return)} (raw: ${fmtPct(rec.annualized_return)})`
             : fmtPct(rec.annualized_return)}
-          color={validation.hasNakedShort ? C.red : C.amber}
-          tooltip={validation.hasNakedShort ? 'Cannot compute — naked short has unlimited risk' : `Annualized return after charges${rec.risk_factor < 1 ? `. Adjusted by ${(rec.risk_factor * 100).toFixed(0)}% for ${rec.sentiment_signal || 'market'} sentiment` : ''}`}
+          color={validation.hasNakedShort || rec.unlimited_risk ? C.red : C.amber}
+          tooltip={validation.hasNakedShort || rec.unlimited_risk ? 'Cannot compute — naked short has unlimited risk' : `Annualized return after charges${rec.risk_factor < 1 ? `. Adjusted by ${(rec.risk_factor * 100).toFixed(0)}% for ${rec.sentiment_signal || 'market'} sentiment` : ''}`}
         />
         <Metric label="Expiry" value={rec.expiry_display ? `${rec.expiry_display} (${rec.dte}d)` : rec.dte ? `${rec.dte}d` : '—'} color={C.muted} tooltip="Option expiry date from NSE (includes holiday adjustments)" />
       </div>
@@ -345,8 +345,21 @@ function RecCard({ rec, idx, expanded, onToggle }) {
             {rec.delta_impact === 'REDUCES_DELTA' ? 'Reduces' : rec.delta_impact === 'ADDS_DELTA' ? 'Adds' : rec.delta_impact || '—'}
           </Badge>
         </div>
-        <Metric label="R:R Ratio" value={validation.hasNakedShort ? 'N/A' : rec.risk_reward_ratio != null ? `1:${Number(rec.risk_reward_ratio).toFixed(1)}` : '—'} color={validation.hasNakedShort ? C.red : C.text} tooltip={validation.hasNakedShort ? 'Cannot compute — naked short has unlimited risk' : 'Risk to reward — ratio of max profit to max loss'} />
+        <Metric label="R:R Ratio" value={validation.hasNakedShort || rec.unlimited_risk ? 'N/A' : rec.risk_reward_ratio != null ? `1:${Number(rec.risk_reward_ratio).toFixed(1)}` : '—'} color={validation.hasNakedShort || rec.unlimited_risk ? C.red : C.text} tooltip={validation.hasNakedShort || rec.unlimited_risk ? 'Cannot compute — naked short has unlimited risk' : 'Risk to reward — ratio of max profit to max loss'} />
       </div>
+
+      {/* ── Unlimited Risk Warning (from backend) ── */}
+      {rec.unlimited_risk && validation.valid && (
+        <div style={{ padding: '0 24px 12px' }}>
+          <div style={{
+            padding: '10px 16px', borderRadius: 10,
+            background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)',
+            fontSize: 13, color: C.red, fontWeight: 600,
+          }}>
+            UNLIMITED RISK — This strategy has naked short option(s). Max loss is theoretically unbounded.
+          </div>
+        </div>
+      )}
 
       {/* ── Validation Warnings ── */}
       {!validation.valid && (
