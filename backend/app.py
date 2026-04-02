@@ -1119,9 +1119,52 @@ def create_app():
 
         total_margin = sum(r.get("margin_needed", 0) for r in recs)
         total_net_premium = sum(r.get("net_premium", r.get("premium_income", 0)) for r in recs if r.get("net_premium", r.get("premium_income", 0)) > 0)
+        sentiment_signal = recs[0].get("sentiment_signal") if recs else None
+
+        # When RED sentiment: compute income at minimum lots (1 lot per strategy)
+        min_lots_income = None
+        if sentiment_signal == "RED":
+            min_lots_income = 0
+            for r in recs:
+                net = r.get("net_premium", r.get("premium_income", 0))
+                lots = r.get("lots", 1) or 1
+                if net > 0 and lots > 0:
+                    min_lots_income += net / lots  # scale to 1 lot
+            min_lots_income = round(min_lots_income, 2)
 
         # VIX from first rec (all have same vix_at_scan)
         vix_data = recs[0].get("vix_signal", {}) if recs else {}
+
+        # Regime override: suppress VIX "rich premiums" enthusiasm when RED + event risk
+        if sentiment_signal == "RED" and vix_data:
+            has_imminent_event = False
+            try:
+                import us_events
+                event_warnings = us_events.get_event_warnings()
+                if event_warnings and event_warnings.get("warnings"):
+                    for w in event_warnings["warnings"]:
+                        if w.get("level") in ("RED", "YELLOW"):
+                            has_imminent_event = True
+                            break
+            except Exception:
+                pass
+            if has_imminent_event:
+                vix_val = vix_data.get("value", 0)
+                vix_data = {
+                    **vix_data,
+                    "label": f"VIX {vix_val:.1f} — Premiums rich but event risk elevated",
+                    "color": "amber",
+                    "signal": "EVENT_OVERRIDE",
+                    "recommendation": "Premiums are rich BUT event risk overrides. Wait for the event to pass before entering new positions.",
+                }
+            elif vix_data.get("signal") == "HIGH":
+                vix_val = vix_data.get("value", 0)
+                vix_data = {
+                    **vix_data,
+                    "label": f"VIX {vix_val:.1f} — Rich premiums (elevated risk)",
+                    "color": "amber",
+                    "recommendation": "Premiums are rich but market sentiment is RED. Use minimum lot sizes and wider strikes.",
+                }
 
         # Portfolio risk summary
         import portfolio_risk as pr
@@ -1140,6 +1183,7 @@ def create_app():
             "scanned_at": _get_user_state(user_id)["last_scan"],
             "total_margin_required": round(total_margin, 2),
             "total_weekly_income": round(total_net_premium, 2),
+            "min_lots_weekly_income": min_lots_income,
             "vix": vix_data,
             "portfolio_risk": risk_summary,
             "data_source": data_source,

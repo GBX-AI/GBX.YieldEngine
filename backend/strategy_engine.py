@@ -1743,12 +1743,21 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                          - bc_greeks["delta"] - bp_greeks["delta"])
             net_theta = ((sc_greeks["theta"] + sp_greeks["theta"]
                           - bc_greeks["theta"] - bp_greeks["theta"]) * lot_size)
-            prob_otm = sc_greeks["prob_otm"] * sp_greeks["prob_otm"]
+
+            # Per-leg prob OTM and OTM distances
+            prob_otm_call = sc_greeks["prob_otm"]
+            prob_otm_put = sp_greeks["prob_otm"]
+            prob_otm = prob_otm_call * prob_otm_put
+            otm_pct_call = (sell_call_strike - spot) / spot if spot else 0
+            otm_pct_put = (spot - sell_put_strike) / spot if spot else 0
+            closer_otm_pct = min(otm_pct_call, otm_pct_put)
+            asymmetry_ratio = max(otm_pct_call, otm_pct_put) / closer_otm_pct if closer_otm_pct > 0 else 1
 
             # Margin: wider spread width * lot_size (defined risk on both sides)
             margin_needed = wider_spread * lot_size * 1.2  # 20% buffer
 
-            safety_tag = classify_safety(prob_otm, 0.03)  # 3% OTM on both sides
+            # Use closer-side OTM% for safety (not hardcoded 3%)
+            safety_tag = classify_safety(prob_otm, closer_otm_pct)
             if not passes_risk_filter(safety_tag, settings["risk_profile"]):
                 continue
 
@@ -1784,6 +1793,11 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                 "margin_needed": round(margin_needed, 2),
                 "max_loss": round(max_loss, 2),
                 "prob_otm": round(prob_otm, 4),
+                "prob_otm_call": round(prob_otm_call, 4),
+                "prob_otm_put": round(prob_otm_put, 4),
+                "otm_pct_call": round(otm_pct_call, 4),
+                "otm_pct_put": round(otm_pct_put, 4),
+                "asymmetry_ratio": round(asymmetry_ratio, 2),
                 "delta": round(net_delta, 4),
                 "annualized_return": round(ann_return, 4),
                 "theta_per_day": round(net_theta, 2),
@@ -1793,7 +1807,8 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                     f"Sell {sell_put_strike}PE / Buy {buy_put_strike}PE. "
                     f"Net premium ₹{net_premium_per_share:.2f}/share. "
                     f"BEP: {bep_lower:.0f} — {bep_upper:.0f}. "
-                    f"Max loss: ₹{max_loss:.0f} (bounded on both sides)"
+                    f"Max loss: ₹{max_loss:.0f} (bounded). "
+                    f"Call {otm_pct_call*100:.1f}% OTM | Put {otm_pct_put*100:.1f}% OTM"
                 ),
                 "alternatives": {},
                 "fee_estimate": _fee_estimate(legs),
@@ -1806,6 +1821,7 @@ def _scan_iron_condors(cash_balance: float, settings: dict, dte: int, kite_servi
                 "net_premium_per_share": round(net_premium_per_share, 2),
                 "call_spread_width": call_spread_width,
                 "put_spread_width": put_spread_width,
+                "skew_ratio": round(call_spread_width / put_spread_width, 2) if put_spread_width > 0 else 1,
                 "price_source": "kite" if use_real else "simulation",
                 "execution_quality": quality_sc if use_real else "FAIR",
                 "fetched_at": _now_ist(),

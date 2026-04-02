@@ -80,6 +80,7 @@ const VIX_COLORS = {
   NORMAL: C.amber,
   HIGH: C.orange,
   EXTREME: C.red,
+  EVENT_OVERRIDE: C.amber,
 };
 
 const DELTA_BIAS_LABELS = {
@@ -439,6 +440,40 @@ function RecCard({ rec, idx, expanded, onToggle }) {
         </div>
       )}
 
+      {/* ── Iron Condor Asymmetry Indicator ── */}
+      {rec.prob_otm_call != null && rec.prob_otm_put != null && (
+        <div style={{ padding: '0 24px 12px' }}>
+          <div style={{
+            display: 'flex', gap: 16, padding: '10px 16px', borderRadius: 10,
+            background: 'rgba(148,163,184,0.04)', border: `1px solid ${C.border}`,
+            fontSize: 12, fontFamily: font.mono,
+          }}>
+            <span>
+              Call: <span style={{ color: rec.otm_pct_call < rec.otm_pct_put ? C.amber : C.emerald, fontWeight: 600 }}>
+                {(rec.otm_pct_call * 100).toFixed(1)}% OTM
+              </span>
+              {rec.otm_pct_call < rec.otm_pct_put && <span style={{ color: C.amber, marginLeft: 4 }}>Higher risk</span>}
+            </span>
+            <span>
+              Put: <span style={{ color: rec.otm_pct_put < rec.otm_pct_call ? C.amber : C.emerald, fontWeight: 600 }}>
+                {(rec.otm_pct_put * 100).toFixed(1)}% OTM
+              </span>
+              {rec.otm_pct_put < rec.otm_pct_call && <span style={{ color: C.amber, marginLeft: 4 }}>Higher risk</span>}
+            </span>
+            {rec.asymmetry_ratio > 1.5 && (
+              <span style={{ color: rec.asymmetry_ratio > 3 ? C.red : C.amber, fontWeight: 600 }}>
+                Asymmetry: {rec.asymmetry_ratio}x
+              </span>
+            )}
+            {rec.skew_ratio != null && rec.skew_ratio !== 1 && (
+              <span style={{ color: C.muted }}>
+                Spread skew: {rec.skew_ratio}x
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* ── Exit Guidance (always visible) ── */}
       {exitSug && (
         <div style={{ padding: '0 24px 16px' }}>
@@ -690,6 +725,7 @@ export default function Scanner() {
 
   // Summary
   const [totalWeeklyIncome, setTotalWeeklyIncome] = useState(null);
+  const [minLotsWeeklyIncome, setMinLotsWeeklyIncome] = useState(null);
   const [totalMarginRequired, setTotalMarginRequired] = useState(null);
   const [dataSource, setDataSource] = useState(null);  // "kite" or "simulation"
   const [sentiment, setSentiment] = useState(null);
@@ -727,6 +763,7 @@ export default function Scanner() {
       setVix(scanData?.vix || null);
       setPortfolioRisk(scanData?.portfolio_risk || null);
       setTotalWeeklyIncome(scanData?.total_weekly_income ?? null);
+      setMinLotsWeeklyIncome(scanData?.min_lots_weekly_income ?? null);
       setTotalMarginRequired(scanData?.total_margin_required ?? null);
       setDataSource(scanData?.data_source || null);
       setMarketStatus(scanData?.market_status || null);
@@ -916,10 +953,23 @@ export default function Scanner() {
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 28 }}>
           {/* Safe Weekly Income */}
           <div style={cardStyle}>
-            <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>Safe Weekly Income (Net)</div>
-            <div style={{ fontSize: 22, fontWeight: 700, fontFamily: font.mono, color: C.emerald }}>
-              {totalWeeklyIncome != null ? fmtCur(totalWeeklyIncome) : '—'}
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+              {minLotsWeeklyIncome != null ? 'Weekly Income (Min Lots)' : 'Safe Weekly Income (Net)'}
             </div>
+            {minLotsWeeklyIncome != null ? (
+              <>
+                <div style={{ fontSize: 22, fontWeight: 700, fontFamily: font.mono, color: C.amber }}>
+                  {fmtCur(minLotsWeeklyIncome)}
+                </div>
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 4, fontFamily: font.mono }}>
+                  Full lots: <span style={{ textDecoration: 'line-through' }}>{fmtCur(totalWeeklyIncome)}</span>
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize: 22, fontWeight: 700, fontFamily: font.mono, color: C.emerald }}>
+                {totalWeeklyIncome != null ? fmtCur(totalWeeklyIncome) : '—'}
+              </div>
+            )}
           </div>
 
           {/* Margin Required */}
