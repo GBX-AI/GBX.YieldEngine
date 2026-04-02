@@ -493,8 +493,9 @@ def _enrich_recommendation(rec: dict) -> dict:
         rec["true_annualized_return"] = round(rec.get("annualized_return", 0) * 100, 2) if rec.get("annualized_return", 0) < 1 else rec.get("annualized_return", 0)
 
     # ── 2. Risk profile (Prompt 2) ──
+    # Use slippage-adjusted premium for conservative max_loss and R:R calculations
     strategy = rec.get("strategy_type", "")
-    net = rec.get("net_premium", 0)
+    net = rec.get("net_credit_adjusted", rec.get("net_premium", 0))
     qty = lot_size * lots
 
     if strategy == "PUT_CREDIT_SPREAD":
@@ -2394,6 +2395,18 @@ def scan_strategies(
                     if real_margin:
                         rec["margin_needed"] = real_margin
                         rec["margin_source"] = "kite"
+                        # Recalculate annualized return with real margin
+                        net_prem = rec.get("net_credit_adjusted", rec.get("net_premium", 0))
+                        dte = rec.get("dte", 7)
+                        if real_margin > 0 and dte > 0:
+                            rec["annualized_return"] = round(
+                                (net_prem / real_margin) * (365.0 / dte) * 100, 2
+                            )
+                            rec["true_annualized_return"] = rec["annualized_return"]
+                            # Update risk-adjusted return too
+                            rec["risk_adjusted_return"] = round(
+                                rec["annualized_return"] * rec.get("risk_factor", 0.7), 2
+                            )
                     break  # Only need margin for the first sell leg
 
     # Capital utilization + portfolio delta (Prompt 6)
